@@ -99,6 +99,52 @@ for hit in result.hits:
     if hit.element_name.startswith("mirror_"):
         print(f"  {hit.element_name}: {hit.interaction:12s}  intensity={hit.intensity:.4f}")
 
+# ── Merit function evaluation ─────────────────────────────────────────────────
+
+print("\n── Merit function (D65 white balance) ──")
+
+from apollo14.merit import MeritConfig, evaluate_merit, D65_WEIGHTS, DEFAULT_WAVELENGTHS
+
+merit_config = MeritConfig(
+    wavelengths=DEFAULT_WAVELENGTHS,   # R=630nm, G=525nm, B=460nm microLED peaks
+    d65_weights=D65_WEIGHTS,
+    target_efficiency=0.10,            # 10% of projector light to pupil
+    pupil_nx=3, pupil_ny=3,            # 3x3 pupil sample grid
+    angle_nx=3, angle_ny=3,            # 3x3 angular samples within FOV
+)
+
+# Use a beam that fits through the aperture
+merit_proj = Projector.uniform(
+    position=config.light.position,
+    direction=config.light.direction,
+    beam_width=config.aperture.width * 0.8,
+    beam_height=config.aperture.height * 0.8,
+    wavelength=config.light.wavelength,
+    nx=3, ny=3,
+)
+
+mse, simulated, target = evaluate_merit(
+    system, merit_proj,
+    config.pupil.center, config.pupil.normal, config.pupil.radius,
+    x_fov=config.light.x_fov, y_fov=config.light.y_fov,
+    config=merit_config,
+)
+
+print(f"MSE: {mse:.6f}")
+print(f"Target efficiency: {merit_config.target_efficiency}")
+print(f"D65 weights (R/G/B): {D65_WEIGHTS}")
+print(f"Simulated intensity (summed): {float(simulated.sum()):.4f}")
+print(f"Target intensity (summed): {float(target.sum()):.4f}")
+
+# Per-color breakdown at center pupil, on-axis
+center_py, center_px = merit_config.pupil_ny // 2, merit_config.pupil_nx // 2
+center_ay, center_ax = merit_config.angle_ny // 2, merit_config.angle_nx // 2
+sim_center = simulated[center_py, center_px, center_ay, center_ax, :]
+tgt_center = target[center_py, center_px, center_ay, center_ax, :]
+print(f"\nCenter pupil, on-axis:")
+for ci, color in enumerate(["Red (630nm)", "Green (525nm)", "Blue (460nm)"]):
+    print(f"  {color}: simulated={float(sim_center[ci]):.4f}  target={float(tgt_center[ci]):.4f}")
+
 # ── Visualize ─────────────────────────────────────────────────────────────────
 
 print("\n── Rendering 3D view ──")
