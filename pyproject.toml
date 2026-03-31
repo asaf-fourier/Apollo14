@@ -1,0 +1,25 @@
+[project]
+name = "apollo14"
+version = "0.1.0"
+description = "JAX-based optical combiner simulation engine for AR glasses"
+requires-python = ">=3.14"
+dependencies = [
+    "jax[cpu]",
+    "jaxlib",
+    "matplotlib",
+    "numpy",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-xdist",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
