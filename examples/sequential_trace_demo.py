@@ -17,17 +17,18 @@ from apollo14.visualizer import plot_system
 from apollo14.units import nm
 
 
-def _sequential_ray_coords(results: list[TraceResult], pupil_center):
+def _sequential_ray_coords(results: list[TraceResult], pupil_center, pupil_normal):
     """Build line coords from sequential (flat) trace results.
 
     Returns two sets of coords:
       - primary path (transmitted/refracted segments connecting mirrors)
-      - reflected rays (from each mirror hit to the pupil center)
+      - reflected rays (from mirror hit to where the reflected ray intersects the pupil plane)
     """
     px, py, pz = [], [], []  # primary path
     rx, ry, rz = [], [], []  # reflected rays to pupil
 
-    pupil = np.array(pupil_center)
+    p_center = np.array(pupil_center)
+    p_normal = np.array(pupil_normal)
 
     for tr in results:
         # Primary path: connect consecutive non-reflected hits
@@ -37,13 +38,25 @@ def _sequential_ray_coords(results: list[TraceResult], pupil_center):
             py.extend([float(path_pts[i][1]), float(path_pts[i + 1][1]), None])
             pz.extend([float(path_pts[i][2]), float(path_pts[i + 1][2]), None])
 
-        # Reflected rays: draw from mirror hit point to pupil center
+        # Reflected rays: compute actual reflected direction, intersect pupil plane
         for h in tr.hits:
             if h.interaction == Interaction.REFLECTED:
                 pt = np.array(h.point)
-                rx.extend([float(pt[0]), float(pupil[0]), None])
-                ry.extend([float(pt[1]), float(pupil[1]), None])
-                rz.extend([float(pt[2]), float(pupil[2]), None])
+                normal = np.array(h.normal)
+                d_in = np.array(h.direction)
+                # Reflect incoming direction off the mirror normal
+                d_refl = d_in - 2 * np.dot(d_in, normal) * normal
+                # Intersect with pupil plane: t = dot(p_center - pt, p_normal) / dot(d_refl, p_normal)
+                denom = np.dot(d_refl, p_normal)
+                if abs(denom) < 1e-12:
+                    continue
+                t = np.dot(p_center - pt, p_normal) / denom
+                if t < 0:
+                    continue
+                hit_pt = pt + t * d_refl
+                rx.extend([float(pt[0]), float(hit_pt[0]), None])
+                ry.extend([float(pt[1]), float(hit_pt[1]), None])
+                rz.extend([float(pt[2]), float(hit_pt[2]), None])
 
     return (px, py, pz), (rx, ry, rz)
 
@@ -207,7 +220,7 @@ for iy in range(num_y):
             ))
 
         (px, py, pz), (rx, ry, rz) = _sequential_ray_coords(
-            angle_results, config.pupil.center,
+            angle_results, config.pupil.center, config.pupil.normal,
         )
         ax_deg = float(viz_scan_angles[iy, ix, 0]) * 180 / np.pi
         ay_deg = float(viz_scan_angles[iy, ix, 1]) * 180 / np.pi
@@ -261,5 +274,6 @@ fig.update_layout(
     )],
 )
 
+fig.show()
 fig.write_html("examples/sequential_trace_demo.html")
 print("Saved: examples/sequential_trace_demo.html")
