@@ -233,6 +233,131 @@ def plot_pupil_fill(system: OpticalSystem, projector, pupil_element,
     return fig
 
 
+def plot_jax_pupil_fill(projector, params, n_glass,
+                        x_fov, y_fov, num_x_angles, num_y_angles,
+                        pixel_size=0.5, show=True):
+    """Plot pupil intensity heatmaps using the JAX tracer, with an angle slider.
+
+    Traces a beam at each scan angle using ``trace_beam``, bins pupil hits
+    into a 2D spatial grid, and renders one heatmap per angle with a Plotly
+    slider.
+
+    Args:
+        projector: Projector instance (beam geometry for tracing).
+        params: CombinerParams from ``params_from_config()``.
+        n_glass: Refractive index of chassis glass at trace wavelength.
+        x_fov: Horizontal field of view (radians).
+        y_fov: Vertical field of view (radians).
+        num_x_angles: Number of horizontal scan steps.
+        num_y_angles: Number of vertical scan steps.
+        pixel_size: Bin size on the pupil plane (mm). Default 0.5.
+        show: Whether to call ``fig.show()``. Default True.
+
+    Returns:
+        Plotly Figure.
+    """
+    import jax.numpy as jnp
+    from apollo14.jax_tracer import trace_beam, CombinerParams
+    from apollo14.projector import scan_directions
+
+    pupil_r = float(params.pupil_radius)
+    pupil_center = params.pupil_center
+    pupil_lx = params.pupil_local_x
+    pupil_ly = params.pupil_local_y
+
+    n_bins = int(np.ceil(2 * pupil_r / pixel_size))
+    bin_edges = np.linspace(-pupil_r, pupil_r, n_bins + 1)
+    bin_centers_x = (bin_edges[:-1] + bin_edges[1:]) / 2
+    bin_centers_y = (bin_edges[:-1] + bin_edges[1:]) / 2
+
+    scan_dirs, scan_angles = scan_directions(
+        projector.direction, x_fov, y_fov, num_x_angles, num_y_angles,
+    )
+
+    grids = []
+    labels = []
+
+    for iy in range(num_y_angles):
+        for ix in range(num_x_angles):
+            d = scan_dirs[iy, ix]
+            ray_origins, _, _, _ = projector.generate_rays(direction=d)
+
+            pts, ints, valid = trace_beam(ray_origins, d, n_glass, params)
+
+            grid = np.zeros((n_bins, n_bins))
+            for ri in range(pts.shape[0]):
+                for mi in range(pts.shape[1]):
+                    if not valid[ri, mi]:
+                        continue
+                    delta = pts[ri, mi] - pupil_center
+                    px = float(jnp.dot(delta, pupil_lx))
+                    py = float(jnp.dot(delta, pupil_ly))
+                    bx = np.searchsorted(bin_edges, px) - 1
+                    by = np.searchsorted(bin_edges, py) - 1
+                    if 0 <= bx < n_bins and 0 <= by < n_bins:
+                        grid[by, bx] += float(ints[ri, mi])
+
+            grids.append(grid)
+            a_x = float(scan_angles[iy, ix, 0]) * 180 / np.pi
+            a_y = float(scan_angles[iy, ix, 1]) * 180 / np.pi
+            labels.append(f"({a_x:.1f}, {a_y:.1f}) deg")
+
+    vmax = max(g.max() for g in grids) if grids else 1.0
+    if vmax == 0:
+        vmax = 1.0
+
+    # Pupil boundary circle
+    theta = np.linspace(0, 2 * np.pi, 100)
+    circle_x = (pupil_r * np.cos(theta)).tolist()
+    circle_y = (pupil_r * np.sin(theta)).tolist()
+
+    fig = go.Figure()
+
+    for i, (grid, label) in enumerate(zip(grids, labels)):
+        fig.add_trace(go.Heatmap(
+            z=grid,
+            x=bin_centers_x.tolist(),
+            y=bin_centers_y.tolist(),
+            zmin=0, zmax=vmax,
+            colorscale='Viridis',
+            name=label,
+            visible=(i == 0),
+            colorbar=dict(title="Intensity"),
+        ))
+
+    fig.add_trace(go.Scatter(
+        x=circle_x + [circle_x[0]],
+        y=circle_y + [circle_y[0]],
+        mode='lines',
+        line=dict(color='red', dash='dash', width=1),
+        name='Pupil boundary',
+        visible=True,
+    ))
+
+    n_heatmaps = len(grids)
+    steps = []
+    for i, label in enumerate(labels):
+        vis = [False] * n_heatmaps + [True]
+        vis[i] = True
+        steps.append(dict(args=[{'visible': vis}], label=label, method='restyle'))
+
+    fig.update_layout(
+        title='Pupil fill per scan angle (JAX tracer)',
+        xaxis_title='mm',
+        yaxis_title='mm',
+        yaxis_scaleanchor='x',
+        sliders=[dict(
+            pad=dict(b=10, t=60), len=0.9, x=0.1, y=0,
+            steps=steps,
+            currentvalue=dict(prefix="Angle: "),
+        )] if steps else None,
+    )
+
+    if show:
+        fig.show()
+    return fig
+
+
 # ── element renderers ────────────────────────────────────────────────────────
 
 def _add_glass_block(traces, block: GlassBlock):
