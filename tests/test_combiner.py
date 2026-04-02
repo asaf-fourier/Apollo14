@@ -5,14 +5,15 @@ from apollo14.tracer import trace_nonsequential, trace_mirrors_sequential
 from apollo14.elements.surface import PartialMirror
 from apollo14.elements.glass_block import GlassBlock
 from apollo14.elements.pupil import Pupil
+from apollo14.elements.boundary import BoundaryPlane
 
 
 def test_default_config_creates_system():
     config = CombinerConfig.default()
     system = build_system(config)
 
-    # Should have: 1 chassis + 1 aperture + 6 mirrors + 1 pupil = 9 elements
-    assert len(system.elements) == 9
+    # 1 chassis + 1 aperture + 6 mirrors + 1 pupil + 6 boundary planes = 15
+    assert len(system.elements) == 15
 
     mirrors = [e for e in system.elements if isinstance(e, PartialMirror)]
     assert len(mirrors) == 6
@@ -22,6 +23,9 @@ def test_default_config_creates_system():
 
     pupils = [e for e in system.elements if isinstance(e, Pupil)]
     assert len(pupils) == 1
+
+    boundaries = [e for e in system.elements if isinstance(e, BoundaryPlane)]
+    assert len(boundaries) == 6
 
 
 def test_trace_on_axis_ray():

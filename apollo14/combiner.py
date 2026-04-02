@@ -136,8 +136,13 @@ class CombinerConfig:
         )
 
 
-def build_system(config: CombinerConfig) -> OpticalSystem:
-    """Build an OpticalSystem from a CombinerConfig."""
+def build_system(config: CombinerConfig, stage_margin: float = 10.0) -> OpticalSystem:
+    """Build an OpticalSystem from a CombinerConfig.
+
+    Args:
+        stage_margin: Margin around the system elements for the Stage
+            boundary. Set to 0 to skip adding a stage.
+    """
     system = OpticalSystem(env_material=air)
 
     # Chassis (glass block)
@@ -192,5 +197,11 @@ def build_system(config: CombinerConfig) -> OpticalSystem:
         normal=config.pupil.normal,
         radius=config.pupil.radius,
     ))
+
+    # Stage boundary
+    if stage_margin > 0:
+        from apollo14.stage import Stage
+        stage = Stage.from_system(system, margin=stage_margin)
+        stage.add_to_system(system)
 
     return system

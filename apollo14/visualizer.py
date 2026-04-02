@@ -8,6 +8,7 @@ from apollo14.elements.surface import PartialMirror
 from apollo14.elements.glass_block import GlassBlock, GlassFace
 from apollo14.elements.aperture import RectangularAperture
 from apollo14.elements.pupil import Pupil
+from apollo14.elements.boundary import BoundaryPlane
 from apollo14.tracer import TraceResult
 from apollo14.geometry import compute_local_axes
 
@@ -31,7 +32,9 @@ def plot_system(system: OpticalSystem, trace_results: list[TraceResult] = None,
 
     # ── static element traces ────────────────────────────────────────────
     for elem in system.elements:
-        if isinstance(elem, GlassBlock):
+        if isinstance(elem, BoundaryPlane):
+            pass  # infinite planes — not rendered, but they catch stray rays
+        elif isinstance(elem, GlassBlock):
             _add_glass_block(static_traces, elem)
         elif isinstance(elem, PartialMirror):
             _add_mirror(static_traces, elem)

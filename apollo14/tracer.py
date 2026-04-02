@@ -55,6 +55,8 @@ def trace_nonsequential(system: OpticalSystem, origin, direction, wavelength,
 
     Use ``result.flat_hits()`` to iterate all nodes in the tree.
 
+    Add a Stage to the system to catch stray rays at the simulation boundary.
+
     For the sequential optimization path, use trace_mirrors_sequential instead.
     """
     result = TraceResult()
