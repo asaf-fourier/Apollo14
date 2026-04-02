@@ -2,14 +2,11 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from apollo14.combiner import CombinerConfig, build_system
-from apollo14.interaction import Interaction
+from apollo14.combiner import CombinerConfig
 from apollo14.jax_tracer import (
     trace_ray, trace_batch, trace_beam, params_from_config,
     _box_entry, _box_exit, _plane_t,
 )
-from apollo14.tracer import trace_mirrors_sequential
-from apollo14.units import nm
 
 
 @pytest.fixture
@@ -103,25 +100,6 @@ class TestTraceRay:
                     jnp.dot(delta, params.pupil_local_y) ** 2)
                 assert float(r) <= float(params.pupil_radius) + 1e-3
 
-    def test_matches_sequential_tracer_intensities(self, default_setup):
-        """JAX tracer reflected intensities should match trace_mirrors_sequential."""
-        config, params, n_glass = default_setup
-        system = build_system(config)
-
-        # JAX tracer
-        _, jax_ints, _ = trace_ray(
-            config.light.position, config.light.direction, n_glass, params)
-
-        # Sequential tracer
-        result = trace_mirrors_sequential(
-            system, config.light.position, config.light.direction,
-            config.light.wavelength)
-        seq_ints = [float(h.intensity)
-                    for h in result.hits if h.interaction == Interaction.REFLECTED]
-
-        assert len(seq_ints) == 6
-        for i in range(6):
-            assert float(jax_ints[i]) == pytest.approx(seq_ints[i], abs=1e-3)
 
 
 # ── Batched tracing ─────────────────────────────────────────────────────────

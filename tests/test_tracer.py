@@ -8,7 +8,7 @@ from apollo14.elements.glass_block import GlassBlock
 from apollo14.elements.aperture import RectangularAperture
 from apollo14.elements.pupil import Pupil
 from apollo14.interaction import Interaction
-from apollo14.tracer import trace_nonsequential, trace_mirrors_sequential
+from apollo14.tracer import trace_nonsequential
 from apollo14.combiner import CombinerConfig, build_system
 from apollo14.units import mm, nm
 
@@ -178,47 +178,6 @@ class TestTraceSequential:
         assert result.pupil_hit is not None
 
 
-# ── trace_mirrors_sequential tests ────────────────────────────────────────────
-
-class TestTraceMirrorsSequential:
-
-    def test_follows_transmitted_path(self, two_mirror_system):
-        origin = jnp.array([0.0, 0.0, 5.0])
-        direction = jnp.array([0.0, 0.0, -1.0])
-        result = trace_mirrors_sequential(two_mirror_system, origin, direction, 550 * nm)
-        # Should record hits on both mirrors (transmitted path goes through both)
-        m0 = [h for h in result.flat_hits() if h.element_name == "mirror_0"]
-        m1 = [h for h in result.flat_hits() if h.element_name == "mirror_1"]
-        assert len(m0) > 0
-        assert len(m1) > 0
-
-    def test_no_branching(self, two_mirror_system):
-        """Sequential tracer should not branch — fewer hits than full DFS."""
-        origin = jnp.array([0.0, 0.0, 5.0])
-        direction = jnp.array([0.0, 0.0, -1.0])
-        seq = trace_mirrors_sequential(two_mirror_system, origin, direction, 550 * nm)
-        full = trace_nonsequential(two_mirror_system, origin, direction, 550 * nm)
-        assert len(seq.hits) <= len(full.flat_hits())
-
-    def test_records_reflected_intensities(self, two_mirror_system):
-        origin = jnp.array([0.0, 0.0, 5.0])
-        direction = jnp.array([0.0, 0.0, -1.0])
-        result = trace_mirrors_sequential(two_mirror_system, origin, direction, 550 * nm)
-        reflected = [h for h in result.flat_hits() if h.interaction == Interaction.REFLECTED]
-        assert len(reflected) >= 1
-        for h in reflected:
-            assert float(h.intensity) > 0
-
-    def test_transmitted_intensity_decreases(self, two_mirror_system):
-        origin = jnp.array([0.0, 0.0, 5.0])
-        direction = jnp.array([0.0, 0.0, -1.0])
-        result = trace_mirrors_sequential(two_mirror_system, origin, direction, 550 * nm)
-        transmitted = [h for h in result.flat_hits() if h.interaction == Interaction.TRANSMITTED]
-        # Each transmission should have less intensity than the previous
-        for i in range(1, len(transmitted)):
-            assert float(transmitted[i].intensity) < float(transmitted[i - 1].intensity)
-
-
 # ── Combiner integration tests ────────────────────────────────────────────────
 
 class TestCombinerTracing:
@@ -239,51 +198,6 @@ class TestCombinerTracing:
             config.light.wavelength,
         )
         assert result.pupil_hit is not None
-
-    def test_sequential_records_all_mirrors(self, combiner_system):
-        config, system = combiner_system
-        result = trace_mirrors_sequential(
-            system, config.light.position, config.light.direction,
-            config.light.wavelength,
-        )
-        mirror_names = {h.element_name for h in result.flat_hits() if h.element_name.startswith("mirror_")}
-        assert len(mirror_names) == 6
-
-    def test_equal_reflection_per_mirror(self, combiner_system):
-        """Each mirror should reflect the same global fraction (0.05)."""
-        config, system = combiner_system
-        result = trace_mirrors_sequential(
-            system, config.light.position, config.light.direction,
-            config.light.wavelength,
-        )
-        reflected = [h for h in result.flat_hits()
-                     if h.element_name.startswith("mirror_") and h.interaction == Interaction.REFLECTED]
-        for h in reflected:
-            assert float(h.intensity) == pytest.approx(0.05, abs=1e-4)
-
-    def test_total_reflected_intensity(self, combiner_system):
-        """6 mirrors * 0.05 = 0.30 total reflected."""
-        config, system = combiner_system
-        result = trace_mirrors_sequential(
-            system, config.light.position, config.light.direction,
-            config.light.wavelength,
-        )
-        reflected = [h for h in result.flat_hits()
-                     if h.element_name.startswith("mirror_") and h.interaction == Interaction.REFLECTED]
-        total = sum(float(h.intensity) for h in reflected)
-        assert total == pytest.approx(0.30, abs=1e-3)
-
-    def test_remaining_transmitted_intensity(self, combiner_system):
-        """After 6 mirrors at 0.05 each: 1.0 - 6*0.05 = 0.70 transmitted."""
-        config, system = combiner_system
-        result = trace_mirrors_sequential(
-            system, config.light.position, config.light.direction,
-            config.light.wavelength,
-        )
-        transmitted = [h for h in result.flat_hits()
-                       if h.element_name.startswith("mirror_") and h.interaction == Interaction.TRANSMITTED]
-        last = transmitted[-1]
-        assert float(last.intensity) == pytest.approx(0.70, abs=1e-3)
 
     def test_chassis_refraction_occurs(self, combiner_system):
         config, system = combiner_system

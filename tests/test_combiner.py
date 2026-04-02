@@ -1,7 +1,7 @@
 import jax.numpy as jnp
 
 from apollo14.combiner import CombinerConfig, build_system
-from apollo14.tracer import trace_nonsequential, trace_mirrors_sequential
+from apollo14.tracer import trace_nonsequential
 from apollo14.elements.surface import PartialMirror
 from apollo14.elements.glass_block import GlassBlock
 from apollo14.elements.pupil import Pupil
@@ -44,12 +44,14 @@ def test_trace_on_axis_ray():
     assert len(mirror_hits) > 0, "Ray should hit at least one mirror"
 
 
-def test_sequential_trace():
+def test_jax_trace():
+    from apollo14.jax_tracer import trace_ray, params_from_config
+
     config = CombinerConfig.default()
-    system = build_system(config)
+    params = params_from_config(config)
+    n_glass = float(config.chassis.material.n(config.light.wavelength))
 
-    origin = config.light.position
-    direction = config.light.direction
-
-    result = trace_mirrors_sequential(system, origin, direction, config.light.wavelength)
-    assert len(result.hits) > 0
+    pts, ints, valid = trace_ray(
+        config.light.position, config.light.direction, n_glass, params)
+    assert ints.shape == (6,)
+    assert jnp.any(valid)

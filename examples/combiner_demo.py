@@ -9,7 +9,7 @@ import jax.numpy as jnp
 
 from apollo14.combiner import CombinerConfig, build_system
 from apollo14.projector import Projector, scan_directions
-from apollo14.tracer import trace_nonsequential, trace_mirrors_sequential, TraceResult
+from apollo14.tracer import trace_nonsequential, TraceResult
 from apollo14.visualizer import plot_system, plot_pupil_fill
 from apollo14.units import mm, nm, deg
 
@@ -85,19 +85,20 @@ if pupil_hits:
     avg_intensity = sum(float(h.intensity) for h in pupil_hits) / len(pupil_hits)
     print(f"Average pupil hit intensity: {avg_intensity:.4f}")
 
-# ── Per-mirror reflectance summary ───────────────────────────────────────────
+# ── Per-mirror reflectance summary (JAX tracer) ─────────────────────────────
 
 print("\n── Per-mirror reflectance (on-axis, single ray) ──")
-result = trace_mirrors_sequential(
-    system,
-    origin=config.light.position,
-    direction=config.light.direction,
-    wavelength=config.light.wavelength,
+from apollo14.jax_tracer import trace_ray, params_from_config
+
+params = params_from_config(config)
+n_glass = float(config.chassis.material.n(config.light.wavelength))
+pupil_pts, pupil_ints, pupil_valid = trace_ray(
+    config.light.position, config.light.direction, n_glass, params,
 )
 
-for hit in result.hits:
-    if hit.element_name.startswith("mirror_"):
-        print(f"  {hit.element_name}: {hit.interaction.value:12s}  intensity={hit.intensity:.4f}")
+for i in range(config.num_mirrors):
+    status = "hit pupil" if pupil_valid[i] else "missed"
+    print(f"  mirror_{i}: reflected={float(pupil_ints[i]):.4f}  {status}")
 
 # ── Merit function evaluation ─────────────────────────────────────────────────
 
