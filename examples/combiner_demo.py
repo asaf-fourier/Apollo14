@@ -97,7 +97,7 @@ result = trace_mirrors_sequential(
 
 for hit in result.hits:
     if hit.element_name.startswith("mirror_"):
-        print(f"  {hit.element_name}: {hit.interaction:12s}  intensity={hit.intensity:.4f}")
+        print(f"  {hit.element_name}: {hit.interaction.value:12s}  intensity={hit.intensity:.4f}")
 
 # ── Merit function evaluation ─────────────────────────────────────────────────
 

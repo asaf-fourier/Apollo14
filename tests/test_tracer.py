@@ -7,6 +7,7 @@ from apollo14.elements.surface import PartialMirror
 from apollo14.elements.glass_block import GlassBlock
 from apollo14.elements.aperture import RectangularAperture
 from apollo14.elements.pupil import Pupil
+from apollo14.interaction import Interaction
 from apollo14.tracer import trace_nonsequential, trace_mirrors_sequential
 from apollo14.combiner import CombinerConfig, build_system
 from apollo14.units import mm, nm
@@ -83,8 +84,8 @@ class TestTraceSequential:
         direction = jnp.array([0.0, 1.0, 0.0])
         result = trace_nonsequential(simple_mirror_system, origin, direction, 550 * nm)
         interactions = {h.interaction for h in result.flat_hits() if h.element_name == "mirror"}
-        assert "reflected" in interactions
-        assert "transmitted" in interactions
+        assert Interaction.REFLECTED in interactions
+        assert Interaction.TRANSMITTED in interactions
 
     def test_intensity_conservation_at_mirror(self, simple_mirror_system):
         origin = jnp.array([0.0, -5.0, 0.0])
@@ -152,7 +153,7 @@ class TestTraceSequential:
         origin = jnp.array([5.0, 0.0, 5.0])
         direction = jnp.array([0.0, 0.0, -1.0])
         result = trace_nonsequential(system, origin, direction, 550 * nm)
-        assert any(h.element_name == "aperture" and h.interaction == "absorbed"
+        assert any(h.element_name == "aperture" and h.interaction == Interaction.ABSORBED
                    for h in result.flat_hits())
         assert result.pupil_hit is None
 
@@ -203,7 +204,7 @@ class TestTraceMirrorsSequential:
         origin = jnp.array([0.0, 0.0, 5.0])
         direction = jnp.array([0.0, 0.0, -1.0])
         result = trace_mirrors_sequential(two_mirror_system, origin, direction, 550 * nm)
-        reflected = [h for h in result.flat_hits() if h.interaction == "reflected"]
+        reflected = [h for h in result.flat_hits() if h.interaction == Interaction.REFLECTED]
         assert len(reflected) >= 1
         for h in reflected:
             assert float(h.intensity) > 0
@@ -212,7 +213,7 @@ class TestTraceMirrorsSequential:
         origin = jnp.array([0.0, 0.0, 5.0])
         direction = jnp.array([0.0, 0.0, -1.0])
         result = trace_mirrors_sequential(two_mirror_system, origin, direction, 550 * nm)
-        transmitted = [h for h in result.flat_hits() if h.interaction == "transmitted"]
+        transmitted = [h for h in result.flat_hits() if h.interaction == Interaction.TRANSMITTED]
         # Each transmission should have less intensity than the previous
         for i in range(1, len(transmitted)):
             assert float(transmitted[i].intensity) < float(transmitted[i - 1].intensity)
@@ -256,7 +257,7 @@ class TestCombinerTracing:
             config.light.wavelength,
         )
         reflected = [h for h in result.flat_hits()
-                     if h.element_name.startswith("mirror_") and h.interaction == "reflected"]
+                     if h.element_name.startswith("mirror_") and h.interaction == Interaction.REFLECTED]
         for h in reflected:
             assert float(h.intensity) == pytest.approx(0.05, abs=1e-4)
 
@@ -268,7 +269,7 @@ class TestCombinerTracing:
             config.light.wavelength,
         )
         reflected = [h for h in result.flat_hits()
-                     if h.element_name.startswith("mirror_") and h.interaction == "reflected"]
+                     if h.element_name.startswith("mirror_") and h.interaction == Interaction.REFLECTED]
         total = sum(float(h.intensity) for h in reflected)
         assert total == pytest.approx(0.30, abs=1e-3)
 
@@ -280,7 +281,7 @@ class TestCombinerTracing:
             config.light.wavelength,
         )
         transmitted = [h for h in result.flat_hits()
-                       if h.element_name.startswith("mirror_") and h.interaction == "transmitted"]
+                       if h.element_name.startswith("mirror_") and h.interaction == Interaction.TRANSMITTED]
         last = transmitted[-1]
         assert float(last.intensity) == pytest.approx(0.70, abs=1e-3)
 
@@ -293,7 +294,7 @@ class TestCombinerTracing:
         chassis_hits = [h for h in result.flat_hits() if h.element_name == "chassis"]
         assert len(chassis_hits) > 0
         interactions = {h.interaction for h in chassis_hits}
-        assert "entering" in interactions or "exiting" in interactions
+        assert Interaction.ENTERING in interactions or Interaction.EXITING in interactions
 
     def test_hit_points_are_finite(self, combiner_system):
         config, system = combiner_system

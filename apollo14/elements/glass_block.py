@@ -4,6 +4,7 @@ from typing import List, Optional
 import jax.numpy as jnp
 import numpy as np
 
+from apollo14.interaction import Interaction
 from apollo14.geometry import (
     normalize, ray_plane_intersection, compute_local_axes,
     point_in_polygon_2d, reflect, snell_refract,
@@ -99,7 +100,7 @@ class GlassBlock:
             normal_for_snell = -face_normal
 
         new_dir, is_tir = snell_refract(direction, normal_for_snell, n1, n2)
-        interaction = "tir" if is_tir else ("entering" if is_entering else "exiting")
+        interaction = Interaction.TIR if is_tir else (Interaction.ENTERING if is_entering else Interaction.EXITING)
         return [(hit, new_dir, intensity, interaction)]
 
     @classmethod

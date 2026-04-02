@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 import jax.numpy as jnp
 
+from apollo14.interaction import Interaction
 from apollo14.geometry import (
     normalize, ray_plane_intersection, compute_local_axes, point_in_rect, reflect,
 )
@@ -48,10 +49,10 @@ class PartialMirror:
         children = []
 
         if self.transmission_ratio > 0:
-            children.append((hit, direction, intensity * self.transmission_ratio, "transmitted"))
+            children.append((hit, direction, intensity * self.transmission_ratio, Interaction.TRANSMITTED))
 
         if self.reflection_ratio > 0:
             refl_dir = reflect(direction, hit_normal)
-            children.append((hit, refl_dir, intensity * self.reflection_ratio, "reflected"))
+            children.append((hit, refl_dir, intensity * self.reflection_ratio, Interaction.REFLECTED))
 
         return children

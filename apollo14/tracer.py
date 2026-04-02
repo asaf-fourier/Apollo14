@@ -7,6 +7,7 @@ from apollo14.system import OpticalSystem
 from apollo14.elements.surface import PartialMirror
 from apollo14.elements.glass_block import GlassBlock
 from apollo14.elements.pupil import Pupil
+from apollo14.interaction import Interaction
 from apollo14.units import EPSILON
 
 
@@ -18,7 +19,7 @@ class TraceHit:
     normal: jnp.ndarray      # (3,)
     direction: jnp.ndarray   # (3,) incoming ray direction
     intensity: float
-    interaction: str          # "reflected", "transmitted", "refracted", "absorbed", etc.
+    interaction: Interaction
     children: List['TraceHit'] = field(default_factory=list)
 
 
@@ -75,7 +76,7 @@ def trace_nonsequential(system: OpticalSystem, origin, direction, wavelength,
         if isinstance(elem, Pupil):
             hit = TraceHit(
                 element_name=elem.name, point=hit_point, normal=hit_normal,
-                direction=d, intensity=inten, interaction="absorbed",
+                direction=d, intensity=inten, interaction=Interaction.ABSORBED,
             )
             if result.pupil_hit is None:
                 result.pupil_hit = hit
@@ -89,7 +90,7 @@ def trace_nonsequential(system: OpticalSystem, origin, direction, wavelength,
         if not children:
             return [TraceHit(
                 element_name=elem.name, point=hit_point, normal=hit_normal,
-                direction=d, intensity=inten, interaction="absorbed",
+                direction=d, intensity=inten, interaction=Interaction.ABSORBED,
             )]
 
         nodes = []
@@ -133,7 +134,7 @@ def trace_mirrors_sequential(system: OpticalSystem, origin, direction, wavelengt
         if isinstance(elem, Pupil):
             result.hits.append(TraceHit(
                 element_name=elem.name, point=hit_point, normal=hit_normal,
-                direction=d, intensity=inten, interaction="absorbed",
+                direction=d, intensity=inten, interaction=Interaction.ABSORBED,
             ))
             break
 
@@ -155,7 +156,7 @@ def trace_mirrors_sequential(system: OpticalSystem, origin, direction, wavelengt
                     element_name=elem.name, point=hit_point, normal=hit_normal,
                     direction=d, intensity=child_intensity, interaction=interaction,
                 ))
-                if interaction == "transmitted":
+                if interaction == Interaction.TRANSMITTED:
                     # Follow the transmitted ray (primary path)
                     org, d, inten = child_origin, child_dir, child_intensity
 
@@ -163,7 +164,7 @@ def trace_mirrors_sequential(system: OpticalSystem, origin, direction, wavelengt
             # Aperture or other absorbing element
             result.hits.append(TraceHit(
                 element_name=elem.name, point=hit_point, normal=hit_normal,
-                direction=d, intensity=inten, interaction="absorbed",
+                direction=d, intensity=inten, interaction=Interaction.ABSORBED,
             ))
             break
 
