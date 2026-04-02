@@ -6,7 +6,7 @@ requires-python = ">=3.14"
 dependencies = [
     "jax[cpu]",
     "jaxlib",
-    "matplotlib",
+    "plotly",
     "numpy",
 ]
 

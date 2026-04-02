@@ -14,7 +14,7 @@ import jax.numpy as jnp
 
 from apollo14.system import OpticalSystem
 from apollo14.projector import Projector, scan_directions
-from apollo14.tracer import trace_sequential
+from apollo14.tracer import trace_nonsequential
 from apollo14.geometry import normalize, compute_local_axes
 from apollo14.units import nm
 
@@ -110,7 +110,7 @@ def simulate_pupil_response(system: OpticalSystem, projector: Projector,
                 wl = config.wavelengths[wi]
 
                 for ri in range(origins.shape[0]):
-                    tr = trace_sequential(
+                    tr = trace_nonsequential(
                         system, origins[ri], directions[ri], wl,
                         intensity=float(intensities[ri]),
                     )

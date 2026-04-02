@@ -29,7 +29,7 @@ Apollo14 is a rewrite of Apollo13 — a simulation engine for designing **compou
 
 - **JAX everywhere** in the ray tracing math — arrays, not scalar dataclasses. This is critical for future differentiability.
 - **Clean API** — the system definition and tracer should be usable as a library by the optimization project.
-- **Matplotlib/pyplot for visualization** — 3D renders of the system so you can see what's happening.
+- **Plotly for visualization** — interactive 3D renders of the system with slider to step through scan angles.
 - **Sequential tracer first** — fast path for optimization. Non-sequential tracer for detailed analysis after.
 
 ## Target System (Talos)
@@ -51,5 +51,5 @@ Apollo13 used numpy-based scalar ray tracing with custom Vector3D/Ray frozen dat
 
 - Python >= 3.14
 - JAX (core computation)
-- Matplotlib (visualization)
+- Plotly (visualization)
 - NumPy (interop where needed)

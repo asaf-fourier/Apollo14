@@ -7,7 +7,7 @@ from apollo14.elements.surface import PartialMirror
 from apollo14.elements.glass_block import GlassBlock
 from apollo14.elements.aperture import RectangularAperture
 from apollo14.elements.pupil import Pupil
-from apollo14.tracer import trace_sequential, trace_mirrors_sequential
+from apollo14.tracer import trace_nonsequential, trace_mirrors_sequential
 from apollo14.combiner import CombinerConfig, build_system
 from apollo14.units import mm, nm
 
@@ -67,30 +67,30 @@ def combiner_system():
     return config, build_system(config)
 
 
-# ── trace_sequential tests ────────────────────────────────────────────────────
+# ── trace_nonsequential tests ────────────────────────────────────────────────────
 
 class TestTraceSequential:
 
     def test_ray_hits_mirror(self, simple_mirror_system):
         origin = jnp.array([0.0, -5.0, 0.0])
         direction = jnp.array([0.0, 1.0, 0.0])
-        result = trace_sequential(simple_mirror_system, origin, direction, 550 * nm)
-        mirror_hits = [h for h in result.hits if h.element_name == "mirror"]
+        result = trace_nonsequential(simple_mirror_system, origin, direction, 550 * nm)
+        mirror_hits = [h for h in result.flat_hits() if h.element_name == "mirror"]
         assert len(mirror_hits) > 0
 
     def test_mirror_splits_ray(self, simple_mirror_system):
         origin = jnp.array([0.0, -5.0, 0.0])
         direction = jnp.array([0.0, 1.0, 0.0])
-        result = trace_sequential(simple_mirror_system, origin, direction, 550 * nm)
-        interactions = {h.interaction for h in result.hits if h.element_name == "mirror"}
+        result = trace_nonsequential(simple_mirror_system, origin, direction, 550 * nm)
+        interactions = {h.interaction for h in result.flat_hits() if h.element_name == "mirror"}
         assert "reflected" in interactions
         assert "transmitted" in interactions
 
     def test_intensity_conservation_at_mirror(self, simple_mirror_system):
         origin = jnp.array([0.0, -5.0, 0.0])
         direction = jnp.array([0.0, 1.0, 0.0])
-        result = trace_sequential(simple_mirror_system, origin, direction, 550 * nm)
-        mirror_hits = [h for h in result.hits if h.element_name == "mirror"]
+        result = trace_nonsequential(simple_mirror_system, origin, direction, 550 * nm)
+        mirror_hits = [h for h in result.flat_hits() if h.element_name == "mirror"]
         total = sum(float(h.intensity) for h in mirror_hits)
         assert abs(total - 1.0) < 1e-5
 
@@ -99,7 +99,7 @@ class TestTraceSequential:
         But transmitted ray continues up and should reach the pupil."""
         origin = jnp.array([0.0, -5.0, 0.0])
         direction = jnp.array([0.0, 1.0, 0.0])
-        result = trace_sequential(simple_mirror_system, origin, direction, 550 * nm)
+        result = trace_nonsequential(simple_mirror_system, origin, direction, 550 * nm)
         assert result.pupil_hit is not None
         assert result.pupil_hit.element_name == "pupil"
         assert float(result.pupil_hit.intensity) == pytest.approx(0.5, abs=1e-5)
@@ -107,30 +107,30 @@ class TestTraceSequential:
     def test_ray_misses_everything(self, simple_mirror_system):
         origin = jnp.array([100.0, -5.0, 0.0])
         direction = jnp.array([0.0, 1.0, 0.0])
-        result = trace_sequential(simple_mirror_system, origin, direction, 550 * nm)
-        assert len(result.hits) == 0
+        result = trace_nonsequential(simple_mirror_system, origin, direction, 550 * nm)
+        assert len(result.flat_hits()) == 0
         assert result.pupil_hit is None
 
     def test_max_depth_limits_tracing(self, two_mirror_system):
         origin = jnp.array([0.0, 0.0, 5.0])
         direction = jnp.array([0.0, 0.0, -1.0])
-        result = trace_sequential(two_mirror_system, origin, direction, 550 * nm, max_depth=1)
+        result = trace_nonsequential(two_mirror_system, origin, direction, 550 * nm, max_depth=1)
         # With max_depth=1, should only process first interaction's children
-        assert len(result.hits) <= 3
+        assert len(result.flat_hits()) <= 3
 
     def test_min_intensity_stops_tracing(self, simple_mirror_system):
         origin = jnp.array([0.0, -5.0, 0.0])
         direction = jnp.array([0.0, 1.0, 0.0])
-        result = trace_sequential(simple_mirror_system, origin, direction, 550 * nm,
+        result = trace_nonsequential(simple_mirror_system, origin, direction, 550 * nm,
                                   intensity=1e-8)
-        assert len(result.hits) == 0
+        assert len(result.flat_hits()) == 0
 
     def test_two_mirrors_both_split(self, two_mirror_system):
         origin = jnp.array([0.0, 0.0, 5.0])
         direction = jnp.array([0.0, 0.0, -1.0])
-        result = trace_sequential(two_mirror_system, origin, direction, 550 * nm)
-        m0_hits = [h for h in result.hits if h.element_name == "mirror_0"]
-        m1_hits = [h for h in result.hits if h.element_name == "mirror_1"]
+        result = trace_nonsequential(two_mirror_system, origin, direction, 550 * nm)
+        m0_hits = [h for h in result.flat_hits() if h.element_name == "mirror_0"]
+        m1_hits = [h for h in result.flat_hits() if h.element_name == "mirror_1"]
         assert len(m0_hits) > 0
         assert len(m1_hits) > 0
 
@@ -151,9 +151,9 @@ class TestTraceSequential:
         # Ray outside the aperture opening → absorbed
         origin = jnp.array([5.0, 0.0, 5.0])
         direction = jnp.array([0.0, 0.0, -1.0])
-        result = trace_sequential(system, origin, direction, 550 * nm)
+        result = trace_nonsequential(system, origin, direction, 550 * nm)
         assert any(h.element_name == "aperture" and h.interaction == "absorbed"
-                   for h in result.hits)
+                   for h in result.flat_hits())
         assert result.pupil_hit is None
 
     def test_aperture_passes_inside_rays(self):
@@ -173,7 +173,7 @@ class TestTraceSequential:
         # Ray through the opening → reaches pupil
         origin = jnp.array([0.0, 0.0, 5.0])
         direction = jnp.array([0.0, 0.0, -1.0])
-        result = trace_sequential(system, origin, direction, 550 * nm)
+        result = trace_nonsequential(system, origin, direction, 550 * nm)
         assert result.pupil_hit is not None
 
 
@@ -186,8 +186,8 @@ class TestTraceMirrorsSequential:
         direction = jnp.array([0.0, 0.0, -1.0])
         result = trace_mirrors_sequential(two_mirror_system, origin, direction, 550 * nm)
         # Should record hits on both mirrors (transmitted path goes through both)
-        m0 = [h for h in result.hits if h.element_name == "mirror_0"]
-        m1 = [h for h in result.hits if h.element_name == "mirror_1"]
+        m0 = [h for h in result.flat_hits() if h.element_name == "mirror_0"]
+        m1 = [h for h in result.flat_hits() if h.element_name == "mirror_1"]
         assert len(m0) > 0
         assert len(m1) > 0
 
@@ -196,14 +196,14 @@ class TestTraceMirrorsSequential:
         origin = jnp.array([0.0, 0.0, 5.0])
         direction = jnp.array([0.0, 0.0, -1.0])
         seq = trace_mirrors_sequential(two_mirror_system, origin, direction, 550 * nm)
-        full = trace_sequential(two_mirror_system, origin, direction, 550 * nm)
-        assert len(seq.hits) <= len(full.hits)
+        full = trace_nonsequential(two_mirror_system, origin, direction, 550 * nm)
+        assert len(seq.hits) <= len(full.flat_hits())
 
     def test_records_reflected_intensities(self, two_mirror_system):
         origin = jnp.array([0.0, 0.0, 5.0])
         direction = jnp.array([0.0, 0.0, -1.0])
         result = trace_mirrors_sequential(two_mirror_system, origin, direction, 550 * nm)
-        reflected = [h for h in result.hits if h.interaction == "reflected"]
+        reflected = [h for h in result.flat_hits() if h.interaction == "reflected"]
         assert len(reflected) >= 1
         for h in reflected:
             assert float(h.intensity) > 0
@@ -212,7 +212,7 @@ class TestTraceMirrorsSequential:
         origin = jnp.array([0.0, 0.0, 5.0])
         direction = jnp.array([0.0, 0.0, -1.0])
         result = trace_mirrors_sequential(two_mirror_system, origin, direction, 550 * nm)
-        transmitted = [h for h in result.hits if h.interaction == "transmitted"]
+        transmitted = [h for h in result.flat_hits() if h.interaction == "transmitted"]
         # Each transmission should have less intensity than the previous
         for i in range(1, len(transmitted)):
             assert float(transmitted[i].intensity) < float(transmitted[i - 1].intensity)
@@ -224,16 +224,16 @@ class TestCombinerTracing:
 
     def test_on_axis_hits_all_mirrors(self, combiner_system):
         config, system = combiner_system
-        result = trace_sequential(
+        result = trace_nonsequential(
             system, config.light.position, config.light.direction,
             config.light.wavelength,
         )
-        mirror_names = {h.element_name for h in result.hits if h.element_name.startswith("mirror_")}
+        mirror_names = {h.element_name for h in result.flat_hits() if h.element_name.startswith("mirror_")}
         assert len(mirror_names) == 6
 
     def test_on_axis_reaches_pupil(self, combiner_system):
         config, system = combiner_system
-        result = trace_sequential(
+        result = trace_nonsequential(
             system, config.light.position, config.light.direction,
             config.light.wavelength,
         )
@@ -245,7 +245,7 @@ class TestCombinerTracing:
             system, config.light.position, config.light.direction,
             config.light.wavelength,
         )
-        mirror_names = {h.element_name for h in result.hits if h.element_name.startswith("mirror_")}
+        mirror_names = {h.element_name for h in result.flat_hits() if h.element_name.startswith("mirror_")}
         assert len(mirror_names) == 6
 
     def test_equal_reflection_per_mirror(self, combiner_system):
@@ -255,7 +255,7 @@ class TestCombinerTracing:
             system, config.light.position, config.light.direction,
             config.light.wavelength,
         )
-        reflected = [h for h in result.hits
+        reflected = [h for h in result.flat_hits()
                      if h.element_name.startswith("mirror_") and h.interaction == "reflected"]
         for h in reflected:
             assert float(h.intensity) == pytest.approx(0.05, abs=1e-4)
@@ -267,7 +267,7 @@ class TestCombinerTracing:
             system, config.light.position, config.light.direction,
             config.light.wavelength,
         )
-        reflected = [h for h in result.hits
+        reflected = [h for h in result.flat_hits()
                      if h.element_name.startswith("mirror_") and h.interaction == "reflected"]
         total = sum(float(h.intensity) for h in reflected)
         assert total == pytest.approx(0.30, abs=1e-3)
@@ -279,28 +279,28 @@ class TestCombinerTracing:
             system, config.light.position, config.light.direction,
             config.light.wavelength,
         )
-        transmitted = [h for h in result.hits
+        transmitted = [h for h in result.flat_hits()
                        if h.element_name.startswith("mirror_") and h.interaction == "transmitted"]
         last = transmitted[-1]
         assert float(last.intensity) == pytest.approx(0.70, abs=1e-3)
 
     def test_chassis_refraction_occurs(self, combiner_system):
         config, system = combiner_system
-        result = trace_sequential(
+        result = trace_nonsequential(
             system, config.light.position, config.light.direction,
             config.light.wavelength,
         )
-        chassis_hits = [h for h in result.hits if h.element_name == "chassis"]
+        chassis_hits = [h for h in result.flat_hits() if h.element_name == "chassis"]
         assert len(chassis_hits) > 0
         interactions = {h.interaction for h in chassis_hits}
         assert "entering" in interactions or "exiting" in interactions
 
     def test_hit_points_are_finite(self, combiner_system):
         config, system = combiner_system
-        result = trace_sequential(
+        result = trace_nonsequential(
             system, config.light.position, config.light.direction,
             config.light.wavelength,
         )
-        for hit in result.hits:
+        for hit in result.flat_hits():
             assert jnp.all(jnp.isfinite(hit.point))
             assert jnp.all(jnp.isfinite(hit.direction))

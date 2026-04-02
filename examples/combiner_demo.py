@@ -9,8 +9,8 @@ import jax.numpy as jnp
 
 from apollo14.combiner import CombinerConfig, build_system
 from apollo14.projector import Projector, scan_directions
-from apollo14.tracer import trace_sequential, trace_mirrors_sequential, TraceResult
-from apollo14.visualizer import plot_system
+from apollo14.tracer import trace_nonsequential, trace_mirrors_sequential, TraceResult
+from apollo14.visualizer import plot_system, plot_pupil_fill
 from apollo14.units import mm, nm, deg
 
 # ── Build the system ──────────────────────────────────────────────────────────
@@ -41,7 +41,7 @@ origins, directions, intensities, pixels = projector.generate_rays()
 
 results: list[TraceResult] = []
 for i in range(origins.shape[0]):
-    result = trace_sequential(
+    result = trace_nonsequential(
         system, origins[i], directions[i], config.light.wavelength,
         intensity=float(intensities[i]),
     )
@@ -72,7 +72,7 @@ for iy in range(scan_dirs.shape[0]):
         origins, directions, intensities, pixels = projector.generate_rays(direction=d)
 
         for i in range(origins.shape[0]):
-            result = trace_sequential(
+            result = trace_nonsequential(
                 system, origins[i], directions[i], config.light.wavelength,
                 intensity=float(intensities[i]),
             )
@@ -145,12 +145,11 @@ print(f"\nCenter pupil, on-axis:")
 for ci, color in enumerate(["Red (630nm)", "Green (525nm)", "Blue (460nm)"]):
     print(f"  {color}: simulated={float(sim_center[ci]):.4f}  target={float(tgt_center[ci]):.4f}")
 
-# ── Visualize ─────────────────────────────────────────────────────────────────
+# ── Visualize 3D with angular slider ────────────────────────────────────────
 
-print("\n── Rendering 3D view ──")
+print("\n── Rendering 3D view (Plotly) ──")
 
-# Trace a sparse set of rays for visualization
-viz_results = []
+# Trace rays for all scan angles for the interactive slider
 viz_proj = Projector.uniform(
     position=config.light.position,
     direction=config.light.direction,
@@ -159,17 +158,54 @@ viz_proj = Projector.uniform(
     wavelength=config.light.wavelength,
     nx=3, ny=3,
 )
-origins, directions, intensities, _ = viz_proj.generate_rays()
-for i in range(origins.shape[0]):
-    viz_results.append(trace_sequential(
-        system, origins[i], directions[i], config.light.wavelength,
-        intensity=float(intensities[i]),
-    ))
 
-fig, ax = plot_system(system, trace_results=viz_results)
-ax.set_title("Combiner — 6 cascaded partial mirrors")
+viz_scan_dirs, viz_scan_angles = scan_directions(
+    config.light.direction,
+    x_fov=config.light.x_fov,
+    y_fov=config.light.y_fov,
+    num_x=config.light.num_x_steps,
+    num_y=config.light.num_y_steps,
+)
 
-import matplotlib.pyplot as plt
-fig.savefig("examples/combiner_demo.png", dpi=150, bbox_inches='tight')
-print("Saved: examples/combiner_demo.png")
-plt.show()
+viz_results: list[TraceResult] = []
+for iy in range(viz_scan_dirs.shape[0]):
+    for ix in range(viz_scan_dirs.shape[1]):
+        d = viz_scan_dirs[iy, ix]
+        origins, directions, intensities, _ = viz_proj.generate_rays(direction=d)
+        for i in range(origins.shape[0]):
+            viz_results.append(trace_nonsequential(
+                system, origins[i], directions[i], config.light.wavelength,
+                intensity=float(intensities[i]),
+            ))
+
+fig = plot_system(system, trace_results=viz_results, scan_angles=viz_scan_angles)
+fig.write_html("examples/combiner_demo.html")
+print("Saved: examples/combiner_demo.html")
+
+# ── Pupil fill per scan angle ─────────────────────────────────────────────────
+
+print("\n── Pupil fill heatmaps ──")
+from apollo14.elements.pupil import Pupil as PupilElement
+
+pupil_elem = [e for e in system.elements if isinstance(e, PupilElement)][0]
+
+fill_proj = Projector.uniform(
+    position=config.light.position,
+    direction=config.light.direction,
+    beam_width=config.aperture.width * 0.8,
+    beam_height=config.aperture.height * 0.8,
+    wavelength=config.light.wavelength,
+    nx=5, ny=5,
+)
+
+fig2 = plot_pupil_fill(
+    system, fill_proj, pupil_elem,
+    x_fov=config.light.x_fov,
+    y_fov=config.light.y_fov,
+    num_x_angles=5,
+    num_y_angles=5,
+    wavelength=config.light.wavelength,
+    pixel_size=0.5,
+)
+fig2.write_html("examples/pupil_fill.html")
+print("Saved: examples/pupil_fill.html")
