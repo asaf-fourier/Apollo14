@@ -1,9 +1,15 @@
-"""JAX-native combiner tracer for differentiable optimization.
+"""JAX-native path-based tracer for differentiable optimization.
 
-Traces rays through the mirror stack in a single vectorized pass.
-At each mirror, computes the reflected ray's path through chassis exit
-refraction to the pupil plane. All operations are pure JAX — no Python
-control flow on array values, no dataclasses in the hot path.
+Traces rays through predefined optical paths — sequences of surfaces with
+specified interactions (refraction, partial reflection, target). The path
+is defined as data, making the tracer general-purpose while remaining
+fully JIT-compatible.
+
+The generic entry point is ``trace_path``, which takes a sequence of
+``PathStep`` surfaces. For the combiner system, ``build_combiner_paths``
+constructs the appropriate paths from ``CombinerParams``, and convenience
+functions (``trace_ray``, ``trace_batch``, ``trace_beam``) handle the
+full workflow including chassis entry refraction.
 
 Usage::
 
@@ -30,6 +36,36 @@ from apollo14.geometry import normalize, reflect, snell_refract, compute_local_a
 from apollo14.units import EPSILON
 
 
+# ── Interaction types ────────────────────────────────────────────────────────
+
+REFRACT = 0   # Snell's law refraction at a surface
+PARTIAL = 1   # Partial reflection: splits intensity, reflects a branch
+TARGET = 2    # Target surface: record hit point, check bounds
+
+
+# ── Data structures ──────────────────────────────────────────────────────────
+
+class PathStep(NamedTuple):
+    """One surface interaction in a traced optical path.
+
+    All fields are JAX arrays. When stacked into a path, each field
+    gains a leading dimension: (N,) for N steps, or (M, B) for
+    M main steps x B branch steps.
+    """
+    position: jnp.ndarray       # (3,) surface center point
+    normal: jnp.ndarray         # (3,) surface normal
+    half_width: jnp.ndarray     # scalar, rectangular bounds
+    half_height: jnp.ndarray    # scalar, rectangular bounds
+    local_x: jnp.ndarray        # (3,) local x-axis for bounds check
+    local_y: jnp.ndarray        # (3,) local y-axis for bounds check
+    interaction: jnp.ndarray    # int scalar: REFRACT, PARTIAL, or TARGET
+    n1: jnp.ndarray             # scalar, refractive index (incoming side)
+    n2: jnp.ndarray             # scalar, refractive index (outgoing side)
+    reflectance: jnp.ndarray    # (3,) per-color [R,G,B] reflectance
+    use_circular: jnp.ndarray   # bool scalar, use radius instead of rect
+    radius: jnp.ndarray         # scalar, circular bounds radius
+
+
 class CombinerParams(NamedTuple):
     """JAX-compatible system parameters for the combiner tracer.
 
@@ -38,7 +74,7 @@ class CombinerParams(NamedTuple):
     """
     mirror_positions: jnp.ndarray    # (M, 3)
     mirror_normals: jnp.ndarray      # (M, 3)
-    mirror_reflectances: jnp.ndarray # (M, 3) per-mirror, per-color [R,G,B] reflection ratio
+    mirror_reflectances: jnp.ndarray # (M, 3) per-mirror, per-color [R,G,B]
     mirror_half_widths: jnp.ndarray  # (M,)
     mirror_half_heights: jnp.ndarray # (M,)
     mirror_local_x: jnp.ndarray     # (M, 3) local x-axis per mirror
@@ -52,7 +88,7 @@ class CombinerParams(NamedTuple):
     pupil_local_y: jnp.ndarray      # (3,)
 
 
-# ── Internal helpers ──────────────────────────────────────────────────────────
+# ── Internal helpers ─────────────────────────────────────────────────────────
 
 def _safe_inv(x):
     """Reciprocal avoiding division by zero."""
@@ -68,8 +104,8 @@ def _box_entry(origin, direction, box_min, box_max):
     t_enter = jnp.max(t_near)
 
     axis = jnp.argmax(t_near)
-    # Entering through min face (dir>0) → outward normal is -axis;
-    # through max face (dir<0) → outward normal is +axis.
+    # Entering through min face (dir>0) -> outward normal is -axis;
+    # through max face (dir<0) -> outward normal is +axis.
     sign = jnp.where(direction[axis] > 0, -1.0, 1.0)
     normal = jnp.where(jnp.arange(3) == axis, sign, 0.0)
     return t_enter, normal
@@ -101,156 +137,254 @@ def _plane_t(origin, direction, normal, point):
     )
 
 
-# ── Main tracer ──────────────────────────────────────────────────────────────
+# ── Generic path tracer ─────────────────────────────────────────────────────
+
+def trace_path(origin, direction, intensity, main_steps, branch_steps,
+               color_idx=0):
+    """Trace a ray through a predefined optical path with branches.
+
+    The ray traverses ``main_steps`` in sequence. At each step the ray
+    interacts with a planar surface:
+
+    - **PARTIAL** — splits intensity: the transmitted ray continues along
+      the main path, while the reflected ray is traced through the
+      corresponding ``branch_steps`` (e.g., through an exit face to a
+      pupil plane).
+    - **REFRACT** — applies Snell's law, changing the ray direction.
+    - **TARGET** — records the hit point (no direction/intensity change).
+
+    All operations are pure JAX — no Python control flow on array values.
+    The main path uses ``jax.lax.scan``; each branch is a nested scan.
+
+    Args:
+        origin: (3,) start position (typically after entry refraction)
+        direction: (3,) initial direction inside the medium
+        intensity: scalar, initial intensity
+        main_steps: PathStep with (M,) arrays — M surfaces in sequence
+        branch_steps: PathStep with (M, B) arrays — B branch steps per
+            main surface (used when a PARTIAL interaction splits the ray)
+        color_idx: int, selects reflectance channel [0=R, 1=G, 2=B]
+
+    Returns:
+        branch_endpoints: (M, 3) where each branch ray ends up
+        branch_intensities: (M,) reflected intensity per main step
+        branch_valid: (M,) whether each branch reached its target
+    """
+
+    def _branch_step(carry, step):
+        """Trace one step of a branch path (exit refraction, pupil, etc.)."""
+        pos, d, inten, valid = carry
+
+        t = _plane_t(pos, d, step.normal, step.position)
+        hit = pos + jnp.maximum(t, 0.0) * d
+
+        # Bounds check (rectangular or circular)
+        delta = hit - step.position
+        rect_ok = ((jnp.abs(jnp.dot(delta, step.local_x)) <= step.half_width) &
+                   (jnp.abs(jnp.dot(delta, step.local_y)) <= step.half_height))
+        circ_ok = (jnp.dot(delta, step.local_x) ** 2 +
+                   jnp.dot(delta, step.local_y) ** 2) <= step.radius ** 2
+        in_bounds = jnp.where(step.use_circular, circ_ok, rect_ok) & (t > 0)
+
+        # Refraction (always computed; selected via interaction type)
+        facing = jnp.where(jnp.dot(d, step.normal) < 0,
+                           step.normal, -step.normal)
+        d_refr, is_tir = snell_refract(d, facing, step.n1, step.n2)
+
+        is_refract = step.interaction == REFRACT
+        new_d = jnp.where(is_refract, d_refr, d)
+        new_valid = valid & in_bounds & jnp.where(is_refract, ~is_tir, True)
+
+        return (hit, new_d, inten, new_valid), None
+
+    def _main_step(carry, step_and_branch):
+        """Process one main-path surface (mirror / interface)."""
+        step, branch = step_and_branch
+        pos, d, inten = carry
+
+        # Intersect surface
+        t = _plane_t(pos, d, step.normal, step.position)
+        hit = pos + jnp.maximum(t, 0.0) * d
+
+        # Bounds check
+        delta = hit - step.position
+        in_bounds = ((jnp.abs(jnp.dot(delta, step.local_x)) <= step.half_width) &
+                     (jnp.abs(jnp.dot(delta, step.local_y)) <= step.half_height) &
+                     (t > 0))
+
+        # Direction computations
+        facing = jnp.where(jnp.dot(d, step.normal) < 0,
+                           step.normal, -step.normal)
+        d_refl = reflect(d, facing)
+        d_refr, is_tir = snell_refract(d, facing, step.n1, step.n2)
+
+        # Intensity split (PARTIAL only)
+        refl = step.reflectance[color_idx]
+        is_partial = step.interaction == PARTIAL
+        refl_int = jnp.where(is_partial & in_bounds, inten * refl, 0.0)
+        trans_int = jnp.where(is_partial & in_bounds,
+                              inten * (1.0 - refl), inten)
+
+        # Trace branch (reflected ray through branch steps)
+        branch_init = (hit, d_refl, refl_int, in_bounds)
+        (branch_end, _, _, branch_valid), _ = jax.lax.scan(
+            _branch_step, branch_init, branch)
+
+        # Update main-path carry
+        is_refract = step.interaction == REFRACT
+        new_d = jnp.where(is_refract & in_bounds, d_refr, d)
+        new_inten = jnp.where(is_partial, trans_int, inten)
+        new_pos = jnp.where(in_bounds, hit, pos)
+
+        return (new_pos, new_d, new_inten), (branch_end, refl_int, branch_valid)
+
+    init = (origin, direction, intensity)
+    _, (endpoints, intensities, valids) = jax.lax.scan(
+        _main_step, init, (main_steps, branch_steps))
+
+    return endpoints, intensities, valids
+
+
+# ── Combiner path builder ───────────────────────────────────────────────────
+
+def build_combiner_paths(params, n_glass, direction):
+    """Build main and branch optical paths for the combiner system.
+
+    Precomputes path data from system geometry and ray direction. The
+    returned paths encode the full combiner topology as data::
+
+        Main path:  mirror_0 (PARTIAL) -> mirror_1 -> ... -> mirror_M-1
+        Branch per mirror:  chassis exit (REFRACT) -> pupil (TARGET)
+
+    Direction-dependent quantities (reflected directions, exit faces,
+    air refractions) are baked into the path data. When used with
+    ``trace_beam``, this precomputation happens once for the shared
+    direction — the ``trace_beam`` optimization falls out naturally.
+
+    Args:
+        params: CombinerParams with system geometry
+        n_glass: refractive index of chassis glass
+        direction: (3,) ray direction in air (before entry refraction)
+
+    Returns:
+        entry_normal: (3,) outward normal of the chassis entry face
+        d_glass: (3,) refracted direction inside the chassis
+        main_steps: PathStep with (M,) arrays
+        branch_steps: PathStep with (M, 2) arrays
+    """
+    box_center = (params.chassis_min + params.chassis_max) / 2
+
+    # Determine entry face and refract into glass
+    _, entry_normal = _box_entry(box_center, direction,
+                                 params.chassis_min, params.chassis_max)
+    d_glass, _ = snell_refract(direction, entry_normal, 1.0, n_glass)
+
+    m = params.mirror_positions.shape[0]
+
+    # ── Main steps: M partial mirrors ────────────────────────────────────
+    main_steps = PathStep(
+        position=params.mirror_positions,
+        normal=params.mirror_normals,
+        half_width=params.mirror_half_widths,
+        half_height=params.mirror_half_heights,
+        local_x=params.mirror_local_x,
+        local_y=params.mirror_local_y,
+        interaction=jnp.full(m, PARTIAL, dtype=jnp.int32),
+        n1=jnp.ones(m),
+        n2=jnp.ones(m),
+        reflectance=params.mirror_reflectances,
+        use_circular=jnp.zeros(m, dtype=bool),
+        radius=jnp.zeros(m),
+    )
+
+    # ── Branch steps: [exit refraction, pupil target] per mirror ─────────
+
+    def _compute_exit(mirror_normal):
+        """Determine chassis exit face for a mirror's reflected ray."""
+        facing = jnp.where(jnp.dot(d_glass, mirror_normal) < 0,
+                           mirror_normal, -mirror_normal)
+        d_refl = reflect(d_glass, facing)
+        _, exit_normal = _box_exit(box_center, d_refl,
+                                   params.chassis_min, params.chassis_max)
+        # A point on the exit face plane (only the axis-aligned component
+        # matters for _plane_t, so the other coords are irrelevant)
+        face_point = jnp.where(exit_normal > 0, params.chassis_max,
+                     jnp.where(exit_normal < 0, params.chassis_min,
+                               params.chassis_max))
+        exit_lx, exit_ly = compute_local_axes(exit_normal)
+        return face_point, exit_normal, exit_lx, exit_ly
+
+    face_points, exit_normals, exit_lxs, exit_lys = jax.vmap(
+        _compute_exit)(params.mirror_normals)
+
+    # Exit refraction steps (M,)
+    exit_steps = PathStep(
+        position=face_points,
+        normal=exit_normals,
+        half_width=jnp.full(m, 1e6),
+        half_height=jnp.full(m, 1e6),
+        local_x=exit_lxs,
+        local_y=exit_lys,
+        interaction=jnp.full(m, REFRACT, dtype=jnp.int32),
+        n1=jnp.full(m, n_glass),
+        n2=jnp.ones(m),
+        reflectance=jnp.zeros((m, 3)),
+        use_circular=jnp.zeros(m, dtype=bool),
+        radius=jnp.zeros(m),
+    )
+
+    # Pupil target steps (M,) — same pupil geometry tiled
+    pupil_steps = PathStep(
+        position=jnp.tile(params.pupil_center, (m, 1)),
+        normal=jnp.tile(params.pupil_normal, (m, 1)),
+        half_width=jnp.full(m, 1e6),
+        half_height=jnp.full(m, 1e6),
+        local_x=jnp.tile(params.pupil_local_x, (m, 1)),
+        local_y=jnp.tile(params.pupil_local_y, (m, 1)),
+        interaction=jnp.full(m, TARGET, dtype=jnp.int32),
+        n1=jnp.ones(m),
+        n2=jnp.ones(m),
+        reflectance=jnp.zeros((m, 3)),
+        use_circular=jnp.ones(m, dtype=bool),
+        radius=jnp.full(m, float(params.pupil_radius)),
+    )
+
+    # Stack into (M, 2) branch steps
+    branch_steps = jax.tree.map(
+        lambda a, b: jnp.stack([a, b], axis=1),
+        exit_steps, pupil_steps,
+    )
+
+    return entry_normal, d_glass, main_steps, branch_steps
+
+
+# ── Combiner convenience functions ──────────────────────────────────────────
 
 def trace_ray(origin, direction, n_glass, params, color_idx=0):
     """Trace one ray through the combiner mirror stack.
 
-    The ray path through the combiner::
-
-        projector
-            |  ray in air
-            v
-        ┌─────────────────────────── chassis (glass) ──┐
-        │   entry refraction (air → glass, Snell's law) │
-        │       |                                        │
-        │       v  d_glass (refracted direction)         │
-        │   ┌─mirror_0─┐                                │
-        │   │ split:    │──reflected──→ box exit ──→ pupil
-        │   │transmitted│                                │
-        │       |                                        │
-        │       v                                        │
-        │   ┌─mirror_1─┐                                │
-        │   │ split:    │──reflected──→ box exit ──→ pupil
-        │   │transmitted│                                │
-        │       |                                        │
-        │      ...  (repeat for all M mirrors)           │
-        │       |                                        │
-        │       v                                        │
-        │   ┌─mirror_5─┐                                │
-        │   │ split:    │──reflected──→ box exit ──→ pupil
-        │   │transmitted│                                │
-        │       |                                        │
-        └───────|────────────────────────────────────────┘
-                v  (transmitted beam exits chassis)
-
-    Each mirror's reflected ray follows a 3-step sub-path:
-      1. Travel through glass to the chassis wall (_box_exit)
-      2. Refract glass → air at the wall (snell_refract)
-      3. Travel through air to the pupil plane (_plane_t)
-
-    The scan carry propagates (position, intensity) along the transmitted
-    path. Intensity decreases at each mirror by the reflection ratio.
-    If a ray misses a mirror (out of bounds), intensity passes through
-    unchanged and no reflected contribution is recorded.
+    Handles chassis entry refraction, then delegates to ``trace_path``
+    with combiner-specific paths built by ``build_combiner_paths``.
 
     Args:
         origin: (3,) ray start position (outside the chassis)
         direction: (3,) ray direction (normalized)
         n_glass: refractive index of chassis glass at trace wavelength
         params: CombinerParams with system geometry
-        color_idx: color channel index (0=R, 1=G, 2=B) to select
-            reflectance from the (M, 3) mirror_reflectances array
+        color_idx: color channel index (0=R, 1=G, 2=B)
 
     Returns:
         pupil_points: (M, 3) where each reflected ray hits the pupil plane
         pupil_intensities: (M,) reflected intensity per mirror
         pupil_valid: (M,) bool — True if the reflection reaches the pupil
     """
-    # ── Step 1: Entry refraction (air → glass) ───────────────────────────
-    # Find where the ray hits the chassis box (AABB intersection).
-    # entry_normal points outward, toward the incoming ray — this is the
-    # convention snell_refract expects (normal toward the n1 medium).
-    t_entry, entry_normal = _box_entry(origin, direction,
-                                       params.chassis_min, params.chassis_max)
+    _, d_glass, main_steps, branch_steps = build_combiner_paths(
+        params, n_glass, direction)
+    t_entry, _ = _box_entry(origin, direction,
+                            params.chassis_min, params.chassis_max)
     entry_point = origin + t_entry * direction
-    # Refract into glass. d_glass is constant for the entire mirror stack
-    # because the thin mirrors don't refract the transmitted beam.
-    d_glass, _ = snell_refract(direction, entry_normal, 1.0, n_glass)
-
-    # ── Step 2: Scan through mirrors (jax.lax.scan) ──────────────────────
-    # carry = (position along transmitted path, remaining intensity)
-    # At each mirror:
-    #   - Intersect the transmitted ray with the mirror plane
-    #   - Check if the hit point is within the mirror rectangle
-    #   - Split intensity: reflected portion goes to pupil, rest continues
-    #   - Trace the reflected ray: box exit → refraction → pupil plane
-    #   - Record (pupil_point, reflected_intensity, valid) as output
-
-    def step(carry, mirror):
-        pos, intensity = carry
-        m_pos, m_normal, m_refl_rgb, m_hw, m_hh, m_lx, m_ly = mirror
-        m_refl = m_refl_rgb[color_idx]
-
-        # ── 2a: Intersect transmitted ray with mirror plane ──────────
-        t = _plane_t(pos, d_glass, m_normal, m_pos)
-        hit = pos + jnp.maximum(t, 0.0) * d_glass
-
-        # ── 2b: Check if hit is within mirror bounds ─────────────────
-        # Project hit-to-center vector onto mirror's local axes and
-        # compare against half-width/height. Also reject negative t
-        # (mirror is behind the ray).
-        delta = hit - m_pos
-        in_bounds = ((jnp.abs(jnp.dot(delta, m_lx)) <= m_hw) &
-                     (jnp.abs(jnp.dot(delta, m_ly)) <= m_hh) &
-                     (t > 0))
-
-        # ── 2c: Compute reflected direction ──────────────────────────
-        # Flip the mirror normal to face the incoming ray if needed.
-        facing = jnp.where(jnp.dot(d_glass, m_normal) < 0, m_normal, -m_normal)
-        d_refl = reflect(d_glass, facing)
-
-        # ── 2d: Split intensity ──────────────────────────────────────
-        # If the ray missed the mirror (in_bounds=False), reflected
-        # intensity is 0 and transmitted intensity is unchanged.
-        refl_int = jnp.where(in_bounds, intensity * m_refl, 0.0)
-        trans_int = jnp.where(in_bounds, intensity * (1.0 - m_refl), intensity)
-
-        # ── 2e: Trace reflected ray to pupil (3-step sub-path) ───────
-
-        # Sub-step i: Find where reflected ray exits the chassis box.
-        t_exit, exit_normal = _box_exit(hit, d_refl,
-                                        params.chassis_min, params.chassis_max)
-        exit_pt = hit + t_exit * d_refl
-
-        # Sub-step ii: Refract glass → air at the chassis wall.
-        # Negate exit_normal so it points inward (toward glass = n1 medium).
-        d_air, is_tir = snell_refract(d_refl, -exit_normal, n_glass, 1.0)
-
-        # Sub-step iii: Intersect refracted ray with pupil plane.
-        t_pupil = _plane_t(exit_pt, d_air, params.pupil_normal, params.pupil_center)
-        pupil_pt = exit_pt + t_pupil * d_air
-
-        # ── 2f: Check if the reflected ray actually reaches the pupil ─
-        # Must be: within mirror bounds, within pupil circle,
-        # pupil is in front (t > 0), and no total internal reflection.
-        p_delta = pupil_pt - params.pupil_center
-        p_r2 = (jnp.dot(p_delta, params.pupil_local_x) ** 2 +
-                jnp.dot(p_delta, params.pupil_local_y) ** 2)
-        on_pupil = p_r2 <= params.pupil_radius ** 2
-
-        valid = in_bounds & on_pupil & (t_pupil > 0) & ~is_tir
-
-        # ── 2g: Advance the transmitted ray ──────────────────────────
-        # If the ray hit the mirror, advance position to the hit point.
-        # If it missed, keep the current position for the next mirror.
-        new_pos = jnp.where(in_bounds, hit, pos)
-        return (new_pos, trans_int), (pupil_pt, refl_int, valid)
-
-    mirror_data = (
-        params.mirror_positions,
-        params.mirror_normals,
-        params.mirror_reflectances,
-        params.mirror_half_widths,
-        params.mirror_half_heights,
-        params.mirror_local_x,
-        params.mirror_local_y,
-    )
-
-    init = (entry_point, jnp.array(1.0))
-    _, (pupil_pts, pupil_ints, pupil_valids) = jax.lax.scan(step, init, mirror_data)
-
-    return pupil_pts, pupil_ints, pupil_valids
+    return trace_path(entry_point, d_glass, jnp.array(1.0),
+                      main_steps, branch_steps, color_idx)
 
 
 def trace_batch(origins, directions, n_glass, params, color_idx=0):
@@ -262,157 +396,45 @@ def trace_batch(origins, directions, n_glass, params, color_idx=0):
 
         origins:    (N, 3)
         directions: (N, 3)
-        → pupil_points (N, M, 3), intensities (N, M), valid (N, M)
+        -> pupil_points (N, M, 3), intensities (N, M), valid (N, M)
     """
     return jax.vmap(
         lambda o, d: trace_ray(o, d, n_glass, params, color_idx)
     )(origins, directions)
 
 
-# ── Beam tracer (shared direction) ───────────────────────────────────────────
-
 def trace_beam(origins, direction, n_glass, params, color_idx=0):
     """Trace a beam of rays that share the same direction.
 
-    Optimized for the common case of a projector beam: many parallel rays
-    (different origins) all traveling in the same direction. Since the
-    direction is shared, several quantities are computed once and reused::
-
-        Precomputed once (direction-dependent):
-          - d_glass:  refracted direction inside the chassis
-          - d_refl_i: reflected direction at each mirror
-          - d_air_i:  refracted direction after chassis exit, per mirror
-          - is_tir_i: whether total internal reflection occurs, per mirror
-
-        Computed per ray (position-dependent only):
-          - Entry point on the chassis box (different per origin)
-          - Hit point on each mirror plane
-          - Bounds check (is the hit within the mirror rectangle?)
-          - Chassis exit point for reflected ray
-          - Pupil plane intersection point
-
-    Compared to trace_batch (which recomputes all directions per ray),
-    this avoids redundant Snell/reflect calls. The speedup is modest on
-    CPU (~1.1x) but the API is cleaner for beam tracing.
+    Optimized for the common case of a projector beam: since all rays
+    share the same direction, ``build_combiner_paths`` is called once
+    outside the vmap. The path data (reflected directions, exit faces,
+    air refractions) is precomputed and reused for all ray origins.
 
     Args:
         origins: (N, 3) ray start positions
         direction: (3,) shared ray direction (normalized)
         n_glass: refractive index of chassis glass at trace wavelength
         params: CombinerParams with system geometry
-        color_idx: color channel index (0=R, 1=G, 2=B) to select
-            reflectance from the (M, 3) mirror_reflectances array
+        color_idx: color channel index (0=R, 1=G, 2=B)
 
     Returns:
         pupil_points: (N, M, 3) hit positions on pupil plane
         pupil_intensities: (N, M) reflected intensity per mirror per ray
         pupil_valid: (N, M) bool mask
     """
-    # ── Precompute shared direction quantities (once for all rays) ────────
+    # Build paths once (shared direction) — the beam optimization
+    _, d_glass, main_steps, branch_steps = build_combiner_paths(
+        params, n_glass, direction)
 
-    # Entry refraction: all rays in a coherent beam enter through the same
-    # chassis face, so the entry normal and refracted direction are shared.
-    _, entry_normal = _box_entry(origins[0], direction,
-                                 params.chassis_min, params.chassis_max)
-    d_glass, _ = snell_refract(direction, entry_normal, 1.0, n_glass)
-
-    # Per-mirror precomputation: reflected direction, chassis exit face,
-    # and refracted air direction. These depend only on d_glass and the
-    # mirror normals, not on ray position.
-    M = params.mirror_positions.shape[0]
-
-    def precompute_mirror(mirror):
-        m_normal = mirror[1]
-        facing = jnp.where(jnp.dot(d_glass, m_normal) < 0, m_normal, -m_normal)
-        d_refl = reflect(d_glass, facing)
-
-        # Exit face for this reflected direction. We approximate by using
-        # the box center as origin — valid because all reflected rays from
-        # one mirror travel in the same direction and exit through the
-        # same face regardless of position within the chassis.
-        _, exit_normal = _box_exit(params.chassis_min * 0.5 + params.chassis_max * 0.5,
-                                   d_refl, params.chassis_min, params.chassis_max)
-        d_air, is_tir = snell_refract(d_refl, -exit_normal, n_glass, 1.0)
-        return d_refl, exit_normal, d_air, is_tir
-
-    mirror_data = (
-        params.mirror_positions,
-        params.mirror_normals,
-        params.mirror_reflectances,
-        params.mirror_half_widths,
-        params.mirror_half_heights,
-        params.mirror_local_x,
-        params.mirror_local_y,
-    )
-
-    # vmap precompute_mirror over the M mirrors
-    d_refls, exit_normals, d_airs, is_tirs = jax.vmap(
-        precompute_mirror)(mirror_data)
-    # d_refls: (M, 3), d_airs: (M, 3), is_tirs: (M,)
-
-    # ── Per-ray scan (only position-dependent math) ──────────────────────
-    # This inner function is vmapped over all ray origins. It uses the
-    # same scan-over-mirrors structure as trace_ray, but indexes into
-    # the precomputed arrays instead of recomputing directions.
-
-    def trace_single_origin(origin):
+    def _trace_single(origin):
         t_entry, _ = _box_entry(origin, direction,
                                 params.chassis_min, params.chassis_max)
         entry_point = origin + t_entry * direction
+        return trace_path(entry_point, d_glass, jnp.array(1.0),
+                          main_steps, branch_steps, color_idx)
 
-        def step(carry, idx):
-            pos, intensity = carry
-            # Index into per-mirror arrays (precomputed + params)
-            m_pos = params.mirror_positions[idx]
-            m_refl = params.mirror_reflectances[idx, color_idx]
-            m_hw = params.mirror_half_widths[idx]
-            m_hh = params.mirror_half_heights[idx]
-            m_lx = params.mirror_local_x[idx]
-            m_ly = params.mirror_local_y[idx]
-            m_normal = params.mirror_normals[idx]
-            d_refl = d_refls[idx]       # precomputed
-            d_air = d_airs[idx]         # precomputed
-            is_tir = is_tirs[idx]       # precomputed
-
-            # Intersect, bounds check, split — same as trace_ray
-            t = _plane_t(pos, d_glass, m_normal, m_pos)
-            hit = pos + jnp.maximum(t, 0.0) * d_glass
-
-            delta = hit - m_pos
-            in_bounds = ((jnp.abs(jnp.dot(delta, m_lx)) <= m_hw) &
-                         (jnp.abs(jnp.dot(delta, m_ly)) <= m_hh) &
-                         (t > 0))
-
-            refl_int = jnp.where(in_bounds, intensity * m_refl, 0.0)
-            trans_int = jnp.where(in_bounds, intensity * (1.0 - m_refl), intensity)
-
-            # Reflected ray: exit point is position-dependent, but
-            # direction (d_refl) and air refraction (d_air) are shared.
-            t_exit, _ = _box_exit(hit, d_refl,
-                                  params.chassis_min, params.chassis_max)
-            exit_pt = hit + t_exit * d_refl
-
-            t_pupil = _plane_t(exit_pt, d_air,
-                               params.pupil_normal, params.pupil_center)
-            pupil_pt = exit_pt + t_pupil * d_air
-
-            p_delta = pupil_pt - params.pupil_center
-            p_r2 = (jnp.dot(p_delta, params.pupil_local_x) ** 2 +
-                    jnp.dot(p_delta, params.pupil_local_y) ** 2)
-            on_pupil = p_r2 <= params.pupil_radius ** 2
-
-            valid = in_bounds & on_pupil & (t_pupil > 0) & ~is_tir
-
-            new_pos = jnp.where(in_bounds, hit, pos)
-            return (new_pos, trans_int), (pupil_pt, refl_int, valid)
-
-        init = (entry_point, jnp.array(1.0))
-        _, (pupil_pts, pupil_ints, pupil_valids) = jax.lax.scan(
-            step, init, jnp.arange(M))
-
-        return pupil_pts, pupil_ints, pupil_valids
-
-    return jax.vmap(trace_single_origin)(origins)
+    return jax.vmap(_trace_single)(origins)
 
 
 # ── Reflectance helpers ─────────────────────────────────────────────────────
@@ -473,20 +495,20 @@ def params_from_config(config) -> CombinerParams:
     mirror_offset_y = config.chassis.distance_between_mirrors / config.mirror.normal[1]
     mirror_offset = jnp.array([0.0, float(mirror_offset_y), 0.0])
 
-    M = config.num_mirrors
-    positions = jnp.stack([first_pos - i * mirror_offset for i in range(M)])
-    normals = jnp.tile(config.mirror.normal, (M, 1))
+    m = config.num_mirrors
+    positions = jnp.stack([first_pos - i * mirror_offset for i in range(m)])
+    normals = jnp.tile(config.mirror.normal, (m, 1))
 
     # Per-mirror, per-color reflectances (compensated for upstream loss)
-    reflectances = compensated_reflectances(config.mirror.reflection_ratio, M)  # (M, 3)
+    reflectances = compensated_reflectances(config.mirror.reflection_ratio, m)
 
-    half_widths = jnp.full(M, config.mirror.x_width / 2)
-    half_heights = jnp.full(M, config.mirror.y_width / 2)
+    half_widths = jnp.full(m, config.mirror.x_width / 2)
+    half_heights = jnp.full(m, config.mirror.y_width / 2)
 
     # Local axes per mirror (all mirrors share the same normal)
     lx, ly = compute_local_axes(config.mirror.normal)
-    local_x = jnp.tile(lx, (M, 1))
-    local_y = jnp.tile(ly, (M, 1))
+    local_x = jnp.tile(lx, (m, 1))
+    local_y = jnp.tile(ly, (m, 1))
 
     # Pupil local axes
     plx, ply = compute_local_axes(config.pupil.normal)
