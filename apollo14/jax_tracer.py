@@ -38,7 +38,7 @@ class CombinerParams(NamedTuple):
     """
     mirror_positions: jnp.ndarray    # (M, 3)
     mirror_normals: jnp.ndarray      # (M, 3)
-    mirror_reflectances: jnp.ndarray # (M,) per-mirror reflection ratio
+    mirror_reflectances: jnp.ndarray # (M, 3) per-mirror, per-color [R,G,B] reflection ratio
     mirror_half_widths: jnp.ndarray  # (M,)
     mirror_half_heights: jnp.ndarray # (M,)
     mirror_local_x: jnp.ndarray     # (M, 3) local x-axis per mirror
@@ -103,7 +103,7 @@ def _plane_t(origin, direction, normal, point):
 
 # ── Main tracer ──────────────────────────────────────────────────────────────
 
-def trace_ray(origin, direction, n_glass, params):
+def trace_ray(origin, direction, n_glass, params, color_idx=0):
     """Trace one ray through the combiner mirror stack.
 
     The ray path through the combiner::
@@ -149,6 +149,8 @@ def trace_ray(origin, direction, n_glass, params):
         direction: (3,) ray direction (normalized)
         n_glass: refractive index of chassis glass at trace wavelength
         params: CombinerParams with system geometry
+        color_idx: color channel index (0=R, 1=G, 2=B) to select
+            reflectance from the (M, 3) mirror_reflectances array
 
     Returns:
         pupil_points: (M, 3) where each reflected ray hits the pupil plane
@@ -177,7 +179,8 @@ def trace_ray(origin, direction, n_glass, params):
 
     def step(carry, mirror):
         pos, intensity = carry
-        m_pos, m_normal, m_refl, m_hw, m_hh, m_lx, m_ly = mirror
+        m_pos, m_normal, m_refl_rgb, m_hw, m_hh, m_lx, m_ly = mirror
+        m_refl = m_refl_rgb[color_idx]
 
         # ── 2a: Intersect transmitted ray with mirror plane ──────────
         t = _plane_t(pos, d_glass, m_normal, m_pos)
@@ -250,23 +253,25 @@ def trace_ray(origin, direction, n_glass, params):
     return pupil_pts, pupil_ints, pupil_valids
 
 
-trace_batch = jax.vmap(trace_ray, in_axes=(0, 0, None, None))
-"""Batched version of trace_ray: vmap over (origin, direction).
+def trace_batch(origins, directions, n_glass, params, color_idx=0):
+    """Batched version of trace_ray: vmap over (origin, direction).
 
-Each ray gets its own origin and direction. The glass refractive index
-and system params are shared across all rays. Useful when tracing rays
-with different directions (e.g. angular scan across the FOV).
+    Each ray gets its own origin and direction. The glass refractive index,
+    system params, and color_idx are shared across all rays. Useful when
+    tracing rays with different directions (e.g. angular scan across the FOV).
 
-    trace_batch(origins, directions, n_glass, params)
         origins:    (N, 3)
         directions: (N, 3)
         → pupil_points (N, M, 3), intensities (N, M), valid (N, M)
-"""
+    """
+    return jax.vmap(
+        lambda o, d: trace_ray(o, d, n_glass, params, color_idx)
+    )(origins, directions)
 
 
 # ── Beam tracer (shared direction) ───────────────────────────────────────────
 
-def trace_beam(origins, direction, n_glass, params):
+def trace_beam(origins, direction, n_glass, params, color_idx=0):
     """Trace a beam of rays that share the same direction.
 
     Optimized for the common case of a projector beam: many parallel rays
@@ -295,6 +300,8 @@ def trace_beam(origins, direction, n_glass, params):
         direction: (3,) shared ray direction (normalized)
         n_glass: refractive index of chassis glass at trace wavelength
         params: CombinerParams with system geometry
+        color_idx: color channel index (0=R, 1=G, 2=B) to select
+            reflectance from the (M, 3) mirror_reflectances array
 
     Returns:
         pupil_points: (N, M, 3) hit positions on pupil plane
@@ -357,7 +364,7 @@ def trace_beam(origins, direction, n_glass, params):
             pos, intensity = carry
             # Index into per-mirror arrays (precomputed + params)
             m_pos = params.mirror_positions[idx]
-            m_refl = params.mirror_reflectances[idx]
+            m_refl = params.mirror_reflectances[idx, color_idx]
             m_hw = params.mirror_half_widths[idx]
             m_hh = params.mirror_half_heights[idx]
             m_lx = params.mirror_local_x[idx]
@@ -420,18 +427,26 @@ def compensated_reflectances(ratio, num_mirrors):
         r[i] = ratio / (1 - i * ratio)
 
     This is the JAX-differentiable equivalent of the Python loop in
-    ``build_system()``.  Gradients flow from the output (M,) array back
-    to the scalar ``ratio``.
+    ``build_system()``.  Gradients flow from the output array back
+    to ``ratio``.
 
     Args:
         ratio: Target fraction of original intensity reflected by each mirror.
+            Either a scalar (same for all colors) or a (3,) array [R,G,B].
         num_mirrors: Number of mirrors (M).
 
     Returns:
-        (M,) array of per-mirror reflectances.
+        (M, 3) array of per-mirror, per-color reflectances.
+        If ratio is scalar, all three color columns are identical.
     """
-    i = jnp.arange(num_mirrors)
-    return ratio / (1.0 - i * ratio)
+    ratio = jnp.atleast_1d(jnp.asarray(ratio))
+    if ratio.shape == ():
+        ratio = jnp.broadcast_to(ratio, (3,))
+    elif ratio.shape == (1,):
+        ratio = jnp.broadcast_to(ratio, (3,))
+    # ratio is now (3,) — one value per color channel
+    i = jnp.arange(num_mirrors)[:, None]  # (M, 1)
+    return ratio[None, :] / (1.0 - i * ratio[None, :])  # (M, 3)
 
 
 # ── Config conversion ────────────────────────────────────────────────────────
@@ -462,8 +477,8 @@ def params_from_config(config) -> CombinerParams:
     positions = jnp.stack([first_pos - i * mirror_offset for i in range(M)])
     normals = jnp.tile(config.mirror.normal, (M, 1))
 
-    # Per-mirror reflectances (compensated for upstream loss)
-    reflectances = compensated_reflectances(config.mirror.reflection_ratio, M)
+    # Per-mirror, per-color reflectances (compensated for upstream loss)
+    reflectances = compensated_reflectances(config.mirror.reflection_ratio, M)  # (M, 3)
 
     half_widths = jnp.full(M, config.mirror.x_width / 2)
     half_heights = jnp.full(M, config.mirror.y_width / 2)

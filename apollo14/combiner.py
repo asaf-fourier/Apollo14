@@ -17,7 +17,7 @@ class MirrorConfig:
     angle_with_horizon: float
     x_width: float
     y_width: float
-    reflection_ratio: float
+    reflection_ratio: jnp.ndarray  # (3,) per-color [R,G,B] target reflection ratio
 
 
 @dataclass
@@ -112,7 +112,7 @@ class CombinerConfig:
             angle_with_horizon=mirror_angle,
             x_width=float(chassis_dims[0]),
             y_width=float(chassis_dims[2] / jnp.cos(mirror_angle)),
-            reflection_ratio=0.05,
+            reflection_ratio=jnp.array([0.05, 0.05, 0.05]),
         )
 
         light_config = LightConfig(
@@ -172,7 +172,8 @@ def build_system(config: CombinerConfig, stage_margin: float = 10.0) -> OpticalS
     mirror_offset_y = config.chassis.distance_between_mirrors / config.mirror.normal[1]
     mirror_offset = jnp.array([0.0, float(mirror_offset_y), 0.0])
 
-    global_refl = config.mirror.reflection_ratio
+    # Non-sequential tracer uses scalar reflectance (mean across colors)
+    global_refl = float(jnp.mean(config.mirror.reflection_ratio))
     transmitted_light = 1.0
 
     for i in range(config.num_mirrors):

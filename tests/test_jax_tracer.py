@@ -176,7 +176,7 @@ class TestTraceBeam:
             return jnp.sum(jnp.where(valid, ints, 0.0))
 
         grads = jax.grad(total_intensity)(params.mirror_reflectances)
-        assert grads.shape == (6,)
+        assert grads.shape == (6, 3)
         assert jnp.all(jnp.isfinite(grads))
 
 
@@ -196,7 +196,7 @@ class TestDifferentiability:
 
         grad_fn = jax.grad(total_intensity)
         grads = grad_fn(params.mirror_reflectances)
-        assert grads.shape == (6,)
+        assert grads.shape == (6, 3)
         assert jnp.all(jnp.isfinite(grads))
 
     def test_grad_wrt_positions(self, default_setup):

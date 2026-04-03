@@ -103,8 +103,8 @@ def total_intensity_independent(reflectances):
 
 
 grad_independent = jax.grad(total_intensity_independent)(params.mirror_reflectances)
-print(f"  Reflectances:  {[f'{float(r):.4f}' for r in params.mirror_reflectances]}")
-print(f"  Gradients:     {[f'{float(g):.4f}' for g in grad_independent]}")
+print(f"  Reflectances (color 0):  {[f'{float(r):.4f}' for r in params.mirror_reflectances[:, 0]]}")
+print(f"  Gradients (color 0):     {[f'{float(g):.4f}' for g in grad_independent[:, 0]]}")
 
 # ── 4b. Gradient — single reflection ratio (coupled) ────────────────────────
 
@@ -121,10 +121,10 @@ def total_intensity_coupled(ratio):
     return jnp.where(valid, ints, 0.0).sum()
 
 
-ratio = jnp.array(config.mirror.reflection_ratio)
+ratio = jnp.array(config.mirror.reflection_ratio)  # (3,) R, G, B
 grad_coupled = jax.grad(total_intensity_coupled)(ratio)
-print(f"  Ratio: {float(ratio):.4f}")
-print(f"  d(total)/d(ratio): {float(grad_coupled):.4f}")
+print(f"  Ratio: {[f'{float(r):.4f}' for r in ratio]}")
+print(f"  d(total)/d(ratio): {[f'{float(g):.4f}' for g in grad_coupled]}")
 
 # ── 5. Visualize JAX-traced rays on the 3D system ───────────────────────────
 

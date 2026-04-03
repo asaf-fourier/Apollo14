@@ -211,7 +211,7 @@ class TestEvaluateMerit:
             angle_with_horizon=config_high.mirror.angle_with_horizon,
             x_width=config_high.mirror.x_width,
             y_width=config_high.mirror.y_width,
-            reflection_ratio=0.15,  # 3x the default
+            reflection_ratio=jnp.array([0.15, 0.15, 0.15]),  # 3x the default
         )
 
         system_low = build_system(config_low)
