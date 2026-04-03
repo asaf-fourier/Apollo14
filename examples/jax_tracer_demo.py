@@ -13,7 +13,10 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from apollo14.combiner import CombinerConfig, build_system
-from apollo14.jax_tracer import trace_ray, trace_batch, trace_beam, params_from_config
+from apollo14.jax_tracer import (
+    trace_ray, trace_batch, trace_beam, params_from_config,
+    compensated_reflectances,
+)
 from apollo14.projector import Projector, scan_directions
 from apollo14.visualizer import plot_system, plot_jax_pupil_fill
 from apollo14.units import mm
@@ -85,13 +88,13 @@ beam_hits = int(beam_valid.sum())
 print(f"  Beam rays: {beam_origins.shape[0]}, Pupil hits: {beam_hits}")
 print(f"  Total pupil intensity: {beam_total:.4f}")
 
-# ── 4. Gradient demo — d(intensity)/d(mirror_spacing) ───────────────────────
+# ── 4a. Gradient — per-mirror reflectances (independent) ─────────────────────
 
-print("\n── Gradient: d(total_pupil_intensity)/d(reflectances) ──")
+print("\n── Gradient: d(total_intensity)/d(reflectance_i) — independent ──")
 
 
-def total_intensity_from_reflectances(reflectances):
-    """Trace a single ray with custom per-mirror reflectances."""
+def total_intensity_independent(reflectances):
+    """Trace with M independent reflectances — each mirror is a free variable."""
     new_params = params._replace(mirror_reflectances=reflectances)
     pts, ints, valid = trace_ray(
         config.light.position, config.light.direction, n_glass, new_params,
@@ -99,12 +102,29 @@ def total_intensity_from_reflectances(reflectances):
     return jnp.where(valid, ints, 0.0).sum()
 
 
-grad_fn = jax.grad(total_intensity_from_reflectances)
-current_refl = params.mirror_reflectances
-grad_val = grad_fn(current_refl)
-print(f"  Current reflectances: {[f'{float(r):.4f}' for r in current_refl]}")
-print(f"  Gradients (d_total/d_refl_i): {[f'{float(g):.4f}' for g in grad_val]}")
-print(f"  (Shows how each mirror's reflectance affects total pupil intensity)")
+grad_independent = jax.grad(total_intensity_independent)(params.mirror_reflectances)
+print(f"  Reflectances:  {[f'{float(r):.4f}' for r in params.mirror_reflectances]}")
+print(f"  Gradients:     {[f'{float(g):.4f}' for g in grad_independent]}")
+
+# ── 4b. Gradient — single reflection ratio (coupled) ────────────────────────
+
+print("\n── Gradient: d(total_intensity)/d(ratio) — coupled ──")
+
+
+def total_intensity_coupled(ratio):
+    """Trace with compensated reflectances derived from a single ratio."""
+    refls = compensated_reflectances(ratio, config.num_mirrors)
+    new_params = params._replace(mirror_reflectances=refls)
+    pts, ints, valid = trace_ray(
+        config.light.position, config.light.direction, n_glass, new_params,
+    )
+    return jnp.where(valid, ints, 0.0).sum()
+
+
+ratio = jnp.array(config.mirror.reflection_ratio)
+grad_coupled = jax.grad(total_intensity_coupled)(ratio)
+print(f"  Ratio: {float(ratio):.4f}")
+print(f"  d(total)/d(ratio): {float(grad_coupled):.4f}")
 
 # ── 5. Visualize JAX-traced rays on the 3D system ───────────────────────────
 

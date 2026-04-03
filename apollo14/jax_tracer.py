@@ -408,6 +408,32 @@ def trace_beam(origins, direction, n_glass, params):
     return jax.vmap(trace_single_origin)(origins)
 
 
+# ── Reflectance helpers ─────────────────────────────────────────────────────
+
+def compensated_reflectances(ratio, num_mirrors):
+    """Compute per-mirror reflectances compensated for upstream losses.
+
+    Each mirror reflects ``ratio`` of the *original* beam intensity. Because
+    earlier mirrors absorb light, later mirrors need a higher local
+    reflectance to achieve the same absolute reflected amount::
+
+        r[i] = ratio / (1 - i * ratio)
+
+    This is the JAX-differentiable equivalent of the Python loop in
+    ``build_system()``.  Gradients flow from the output (M,) array back
+    to the scalar ``ratio``.
+
+    Args:
+        ratio: Target fraction of original intensity reflected by each mirror.
+        num_mirrors: Number of mirrors (M).
+
+    Returns:
+        (M,) array of per-mirror reflectances.
+    """
+    i = jnp.arange(num_mirrors)
+    return ratio / (1.0 - i * ratio)
+
+
 # ── Config conversion ────────────────────────────────────────────────────────
 
 def params_from_config(config) -> CombinerParams:
@@ -437,13 +463,7 @@ def params_from_config(config) -> CombinerParams:
     normals = jnp.tile(config.mirror.normal, (M, 1))
 
     # Per-mirror reflectances (compensated for upstream loss)
-    global_refl = config.mirror.reflection_ratio
-    refl_list = []
-    transmitted = 1.0
-    for _ in range(M):
-        refl_list.append(global_refl / transmitted)
-        transmitted -= global_refl
-    reflectances = jnp.array(refl_list)
+    reflectances = compensated_reflectances(config.mirror.reflection_ratio, M)
 
     half_widths = jnp.full(M, config.mirror.x_width / 2)
     half_heights = jnp.full(M, config.mirror.y_width / 2)
