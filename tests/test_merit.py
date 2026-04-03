@@ -3,7 +3,7 @@ import pytest
 
 from apollo14.combiner import CombinerConfig, MirrorConfig, build_system
 from apollo14.projector import Projector
-from apollo14.merit import (
+from helios.merit import (
     MeritConfig, D65_WEIGHTS, DEFAULT_WAVELENGTHS,
     pupil_sample_grid, build_target, merit_mse,
     simulate_pupil_response, evaluate_merit,

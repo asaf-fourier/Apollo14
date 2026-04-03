@@ -104,7 +104,7 @@ for i in range(config.num_mirrors):
 
 print("\n── Merit function (D65 white balance) ──")
 
-from apollo14.merit import MeritConfig, evaluate_merit, D65_WEIGHTS, DEFAULT_WAVELENGTHS
+from helios.merit import MeritConfig, evaluate_merit, D65_WEIGHTS, DEFAULT_WAVELENGTHS
 
 merit_config = MeritConfig(
     wavelengths=DEFAULT_WAVELENGTHS,   # R=630nm, G=525nm, B=460nm microLED peaks
