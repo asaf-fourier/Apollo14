@@ -89,10 +89,10 @@ class CombinerConfig:
         eye_relief = 15.0 * mm
         pupil_config = PupilConfig(
             normal=jnp.array([0.0, 0.0, -1.0]),
-            center=jnp.array([chassis_center[0], chassis_center[1],
+            center=jnp.array([chassis_center[0], chassis_center[1] - 2 * mm,
                               eye_relief + chassis_dims[2]]),
             eye_relief=eye_relief,
-            radius=4.0 * mm,
+            radius=5.0 * mm,
         )
 
         chassis_config = ChassisConfig(

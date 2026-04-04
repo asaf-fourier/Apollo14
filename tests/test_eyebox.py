@@ -7,7 +7,7 @@ from apollo14.jax_tracer import params_from_config
 from apollo14.units import mm
 
 from helios.eyebox import (
-    EyeboxConfig, eyebox_sample_points,
+    EyeboxConfig, eyebox_sample_points, eyebox_grid_points,
     compute_eyebox_response, eyebox_merit, visible_fov,
 )
 
@@ -51,6 +51,27 @@ class TestEyeboxSampling:
         corner_dists = jnp.linalg.norm(samples[1:] - center, axis=1)
         assert jnp.allclose(corner_dists, corner_dists[0], atol=1e-5)
 
+    def test_grid_shape(self):
+        center = jnp.array([7.0, 20.0, 17.0])
+        normal = jnp.array([0.0, 0.0, -1.0])
+        grid = eyebox_grid_points(center, normal, radius=4.0, nx=5, ny=5)
+        assert grid.shape == (25, 3)
+
+    def test_grid_center_at_center(self):
+        center = jnp.array([7.0, 20.0, 17.0])
+        normal = jnp.array([0.0, 0.0, -1.0])
+        grid = eyebox_grid_points(center, normal, radius=4.0, nx=3, ny=3)
+        # Center of a 3x3 grid is index 4
+        assert jnp.allclose(grid[4], center, atol=1e-5)
+
+    def test_grid_within_radius(self):
+        center = jnp.array([0.0, 0.0, 0.0])
+        normal = jnp.array([0.0, 0.0, 1.0])
+        radius = 5.0
+        grid = eyebox_grid_points(center, normal, radius, nx=5, ny=5)
+        dists = jnp.linalg.norm(grid - center, axis=1)
+        assert jnp.all(dists <= radius * jnp.sqrt(2.0) + 1e-5)
+
 
 # ── Response computation ────────────────────────────────────────────────────
 
@@ -58,60 +79,68 @@ class TestEyeboxResponse:
 
     def test_response_shape(self, default_setup):
         config, params, n_glass = default_setup
-        samples = eyebox_sample_points(
-            config.pupil.center, config.pupil.normal, config.pupil.radius)
+        grid = eyebox_grid_points(
+            config.pupil.center, config.pupil.normal, config.pupil.radius,
+            nx=3, ny=3)
         mc = EyeboxConfig(n_fov_x=3, n_fov_y=3)
 
         response, dirs = compute_eyebox_response(
             params, n_glass,
             config.light.position, config.light.direction,
+            config.light.beam_width, config.light.beam_height,
             config.light.x_fov, config.light.y_fov,
-            samples, mc,
+            grid, mc,
         )
-        assert response.shape == (5, 9, 3)  # 5 samples, 3x3 angles, 3 colors
+        assert response.shape == (9, 9, 3)  # 3x3 grid, 3x3 angles, 3 colors
         assert dirs.shape == (9, 3)
 
     def test_response_nonnegative(self, default_setup):
         config, params, n_glass = default_setup
-        samples = eyebox_sample_points(
-            config.pupil.center, config.pupil.normal, config.pupil.radius)
+        grid = eyebox_grid_points(
+            config.pupil.center, config.pupil.normal, config.pupil.radius,
+            nx=3, ny=3)
         mc = EyeboxConfig(n_fov_x=3, n_fov_y=3)
 
         response, _ = compute_eyebox_response(
             params, n_glass,
             config.light.position, config.light.direction,
+            config.light.beam_width, config.light.beam_height,
             config.light.x_fov, config.light.y_fov,
-            samples, mc,
+            grid, mc,
         )
         assert jnp.all(response >= 0)
 
     def test_center_has_intensity(self, default_setup):
         """Center eyebox sample with on-axis ray should get some light."""
         config, params, n_glass = default_setup
-        samples = eyebox_sample_points(
-            config.pupil.center, config.pupil.normal, config.pupil.radius)
+        grid = eyebox_grid_points(
+            config.pupil.center, config.pupil.normal, config.pupil.radius,
+            nx=3, ny=3)
         mc = EyeboxConfig(n_fov_x=1, n_fov_y=1)
 
         response, _ = compute_eyebox_response(
             params, n_glass,
             config.light.position, config.light.direction,
+            config.light.beam_width, config.light.beam_height,
             0.0, 0.0,  # on-axis only
-            samples, mc,
+            grid, mc,
         )
-        # Center sample (index 0) should have nonzero intensity
-        assert float(response[0].sum()) > 0
+        # Center of 3x3 grid (index 4) should have nonzero intensity
+        assert float(response[4].sum()) > 0
 
 
 # ── Merit function ──────────────────────────────────────────────────────────
 
 class TestEyeboxMerit:
 
-    def test_uniform_at_d65_target_is_zero(self):
-        """Perfectly uniform response at D65 target should give zero merit."""
-        mc = EyeboxConfig(target_intensity=0.03)
+    def test_uniform_at_d65_target_is_near_zero(self):
+        """Perfectly uniform response at D65 target should give near-zero merit.
+        Not exactly zero due to coverage sigmoid, but uniformity and intensity
+        terms should be zero."""
+        mc = EyeboxConfig(target_intensity=0.03, w_coverage=0.0)
         target = mc.target_per_color  # (3,) D65-weighted
         response = jnp.broadcast_to(target, (5, 9, 3))
-        assert float(eyebox_merit(response, mc)) == pytest.approx(0.0, abs=1e-10)
+        assert float(eyebox_merit(response, mc)) == pytest.approx(0.0, abs=1e-6)
 
     def test_merit_positive_for_wrong_intensity(self):
         """Uniform response at wrong intensity should have nonzero merit."""
@@ -184,8 +213,9 @@ class TestEyeboxDifferentiability:
     def test_grad_wrt_reflectances(self, default_setup):
         """Gradient of eyebox merit w.r.t. mirror reflectances."""
         config, params, n_glass = default_setup
-        samples = eyebox_sample_points(
-            config.pupil.center, config.pupil.normal, config.pupil.radius)
+        grid = eyebox_grid_points(
+            config.pupil.center, config.pupil.normal, config.pupil.radius,
+            nx=3, ny=3)
         mc = EyeboxConfig(n_fov_x=3, n_fov_y=3)
 
         def loss(reflectances):
@@ -193,8 +223,9 @@ class TestEyeboxDifferentiability:
             response, _ = compute_eyebox_response(
                 p, n_glass,
                 config.light.position, config.light.direction,
+                config.light.beam_width, config.light.beam_height,
                 config.light.x_fov, config.light.y_fov,
-                samples, mc,
+                grid, mc,
             )
             return eyebox_merit(response, mc)
 

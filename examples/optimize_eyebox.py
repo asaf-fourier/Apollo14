@@ -19,7 +19,7 @@ from apollo14.jax_tracer import params_from_config
 from apollo14.units import mm
 
 from helios.eyebox import (
-    EyeboxConfig, eyebox_sample_points,
+    EyeboxConfig, eyebox_grid_points,
     compute_eyebox_response, eyebox_merit, visible_fov,
 )
 
@@ -39,16 +39,22 @@ base_params = params_from_config(config)
 n_glass = float(config.chassis.material.n(config.light.wavelength))
 M = config.num_mirrors
 
-eyebox_pts = eyebox_sample_points(
-    config.pupil.center, config.pupil.normal, config.pupil.radius)
+eyebox_radius = 3.0 * mm  # 6x6 mm eyebox
+eyebox_nx, eyebox_ny = 5, 5
+
+eyebox_pts = eyebox_grid_points(
+    config.pupil.center, config.pupil.normal, eyebox_radius,
+    nx=eyebox_nx, ny=eyebox_ny)
 
 mc = EyeboxConfig(
-    target_intensity=0.06,
-    n_fov_x=5,
-    n_fov_y=5,
-    sigma=2.0,
+    target_intensity=0.07,
+    n_fov_x=7,
+    n_fov_y=7,
+    n_beam_x=5,
+    n_beam_y=5,
     w_uniformity=1.0,
     w_intensity=10.0,
+    w_coverage=1.0,
 )
 
 # Precompute the offset direction (mirrors step along -y, scaled by normal)
@@ -89,6 +95,7 @@ def loss_fn(v):
     response, _ = compute_eyebox_response(
         params, n_glass,
         config.light.position, config.light.direction,
+        config.light.beam_width, config.light.beam_height,
         config.light.x_fov, config.light.y_fov,
         eyebox_pts, mc,
     )
@@ -190,9 +197,7 @@ print(f"Loss at step 300: {float(loss_history[-1]):.6f}")
 
 # ── FOV diagnostic ──────────────────────────────────────────────────────────
 
-print("\n── Visible FOV Diagnostic ──\n")
-
-sample_labels = ["center", "corner_1", "corner_2", "corner_3", "corner_4"]
+print("\n── Visible FOV Diagnostic (5x5 eyebox grid) ──\n")
 
 
 def compute_fov(v):
@@ -200,6 +205,7 @@ def compute_fov(v):
     response, _ = compute_eyebox_response(
         params, n_glass,
         config.light.position, config.light.direction,
+        config.light.beam_width, config.light.beam_height,
         config.light.x_fov, config.light.y_fov,
         eyebox_pts, mc,
     )
@@ -209,9 +215,19 @@ def compute_fov(v):
 init_fov = compute_fov(init_vars)
 final_fov = compute_fov(final_vars)
 
-print(f"  {'Sample':<10} {'Initial':>10} {'Final':>10}")
-for i, label in enumerate(sample_labels):
-    print(f"  {label:<10} {float(init_fov[i]):>9.1%} {float(final_fov[i]):>9.1%}")
+# Show as grid maps
+init_grid = init_fov.reshape(eyebox_ny, eyebox_nx)
+final_grid = final_fov.reshape(eyebox_ny, eyebox_nx)
+
+print("Initial FOV coverage (rows=Y, cols=X):")
+for row in range(eyebox_ny):
+    print("  " + " ".join(f"{float(init_grid[row, c]):5.0%}" for c in range(eyebox_nx)))
+
+print("\nFinal FOV coverage:")
+for row in range(eyebox_ny):
+    print("  " + " ".join(f"{float(final_grid[row, c]):5.0%}" for c in range(eyebox_nx)))
+
+print(f"\nMean FOV: {float(init_fov.mean()):.1%} → {float(final_fov.mean()):.1%}")
 
 
 # ── Save results to JSON ──────────────────────────────────────────────────
@@ -231,8 +247,10 @@ results = {
     },
     "loss_history": [float(l) for l in loss_history],
     "visible_fov": {
-        label: {"initial": float(init_fov[i]), "final": float(final_fov[i])}
-        for i, label in enumerate(sample_labels)
+        "initial_grid": [[float(init_grid[r, c]) for c in range(eyebox_nx)] for r in range(eyebox_ny)],
+        "final_grid": [[float(final_grid[r, c]) for c in range(eyebox_nx)] for r in range(eyebox_ny)],
+        "mean_initial": float(init_fov.mean()),
+        "mean_final": float(final_fov.mean()),
     },
 }
 
