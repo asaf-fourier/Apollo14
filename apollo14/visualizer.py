@@ -7,7 +7,7 @@ from apollo14.system import OpticalSystem
 from apollo14.elements.surface import PartialMirror
 from apollo14.elements.glass_block import GlassBlock, GlassFace
 from apollo14.elements.aperture import RectangularAperture
-from apollo14.elements.pupil import Pupil
+from apollo14.elements.pupil import Pupil, RectangularPupil
 from apollo14.elements.boundary import BoundaryPlane
 from apollo14.tracer import TraceResult
 from apollo14.geometry import compute_local_axes
@@ -40,7 +40,7 @@ def plot_system(system: OpticalSystem, trace_results: list[TraceResult] = None,
             _add_mirror(static_traces, elem)
         elif isinstance(elem, RectangularAperture):
             _add_aperture(static_traces, elem)
-        elif isinstance(elem, Pupil):
+        elif isinstance(elem, (Pupil, RectangularPupil)):
             _add_pupil(static_traces, elem)
 
     # ── dynamic ray traces (grouped per angle) ───────────────────────────
@@ -260,11 +260,13 @@ def plot_jax_pupil_fill(projector, params, n_glass,
     from apollo14.jax_tracer import trace_beam, CombinerParams
     from apollo14.projector import scan_directions
 
-    pupil_r = float(params.pupil_radius)
+    pupil_hw = float(params.pupil_half_width)
+    pupil_hh = float(params.pupil_half_height)
     pupil_center = params.pupil_center
     pupil_lx = params.pupil_local_x
     pupil_ly = params.pupil_local_y
 
+    pupil_r = max(pupil_hw, pupil_hh)
     n_bins = int(np.ceil(2 * pupil_r / pixel_size))
     bin_edges = np.linspace(-pupil_r, pupil_r, n_bins + 1)
     bin_centers_x = (bin_edges[:-1] + bin_edges[1:]) / 2
@@ -441,42 +443,66 @@ def _add_aperture(traces, aperture: RectangularAperture):
     ))
 
 
-def _add_pupil(traces, pupil: Pupil):
+def _add_pupil(traces, pupil):
+    from apollo14.elements.pupil import RectangularPupil
+
     pos = np.array(pupil.position)
     lx, ly = compute_local_axes(pupil.normal)
     lx, ly = np.array(lx), np.array(ly)
 
-    num_steps = 32
-    x_coords = [pos[0]]
-    y_coords = [pos[1]]
-    z_coords = [pos[2]]
+    if isinstance(pupil, RectangularPupil):
+        hw, hh = pupil.width / 2, pupil.height / 2
+        corners = [
+            pos - hw * lx - hh * ly,
+            pos + hw * lx - hh * ly,
+            pos + hw * lx + hh * ly,
+            pos - hw * lx + hh * ly,
+        ]
+        x_coords = [float(c[0]) for c in corners]
+        y_coords = [float(c[1]) for c in corners]
+        z_coords = [float(c[2]) for c in corners]
 
-    for i in range(num_steps):
-        angle = (i / num_steps) * 2 * np.pi
-        pt = pos + pupil.radius * (np.cos(angle) * lx + np.sin(angle) * ly)
-        x_coords.append(float(pt[0]))
-        y_coords.append(float(pt[1]))
-        z_coords.append(float(pt[2]))
+        traces.append(go.Mesh3d(
+            x=x_coords, y=y_coords, z=z_coords,
+            i=[0, 0], j=[1, 2], k=[2, 3],
+            name=pupil.name,
+            opacity=0.6,
+            color='darkslateblue',
+            hoverinfo='name+x+y+z',
+        ))
+        scale = max(hw, hh) * 0.5
+    else:
+        num_steps = 32
+        x_coords = [pos[0]]
+        y_coords = [pos[1]]
+        z_coords = [pos[2]]
 
-    i_idx, j_idx, k_idx = [], [], []
-    for i in range(num_steps):
-        i_idx.append(0)
-        j_idx.append(i + 1)
-        k_idx.append((i + 1) % num_steps + 1)
+        for i in range(num_steps):
+            angle = (i / num_steps) * 2 * np.pi
+            pt = pos + pupil.radius * (np.cos(angle) * lx + np.sin(angle) * ly)
+            x_coords.append(float(pt[0]))
+            y_coords.append(float(pt[1]))
+            z_coords.append(float(pt[2]))
 
-    traces.append(go.Mesh3d(
-        x=x_coords, y=y_coords, z=z_coords,
-        i=i_idx, j=j_idx, k=k_idx,
-        name=pupil.name,
-        opacity=0.6,
-        color='darkslateblue',
-        hoverinfo='name+x+y+z',
-    ))
+        i_idx, j_idx, k_idx = [], [], []
+        for i in range(num_steps):
+            i_idx.append(0)
+            j_idx.append(i + 1)
+            k_idx.append((i + 1) % num_steps + 1)
+
+        traces.append(go.Mesh3d(
+            x=x_coords, y=y_coords, z=z_coords,
+            i=i_idx, j=j_idx, k=k_idx,
+            name=pupil.name,
+            opacity=0.6,
+            color='darkslateblue',
+            hoverinfo='name+x+y+z',
+        ))
+        scale = pupil.radius * 0.5
 
     # Normal vector
     n = np.array(pupil.normal)
     n = n / np.linalg.norm(n)
-    scale = pupil.radius * 0.5
     tip = pos + n * scale
     traces.append(go.Scatter3d(
         x=[pos[0], tip[0]], y=[pos[1], tip[1]], z=[pos[2], tip[2]],

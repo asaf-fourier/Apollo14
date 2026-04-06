@@ -126,7 +126,7 @@ merit_proj = Projector.uniform(
 
 mse, simulated, target = evaluate_merit(
     system, merit_proj,
-    config.pupil.center, config.pupil.normal, config.pupil.radius,
+    config.pupil.center, config.pupil.normal, config.pupil.width / 2,
     x_fov=config.light.x_fov, y_fov=config.light.y_fov,
     config=merit_config,
 )

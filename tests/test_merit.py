@@ -131,7 +131,7 @@ class TestSimulatePupilResponse:
         proj = _make_projector(config, nx=2, ny=2)
         result = simulate_pupil_response(
             system, proj,
-            config.pupil.center, config.pupil.normal, config.pupil.radius,
+            config.pupil.center, config.pupil.normal, config.pupil.width / 2,
             mc, x_fov=config.light.x_fov, y_fov=config.light.y_fov,
         )
         assert result.shape == (2, 2, 2, 2, 3)
@@ -143,7 +143,7 @@ class TestSimulatePupilResponse:
         proj = _make_projector(config, nx=3, ny=3)
         result = simulate_pupil_response(
             system, proj,
-            config.pupil.center, config.pupil.normal, config.pupil.radius,
+            config.pupil.center, config.pupil.normal, config.pupil.width / 2,
             mc, x_fov=0.0, y_fov=0.0,
         )
         assert float(result.sum()) > 0, "On-axis rays should reach the pupil"
@@ -155,7 +155,7 @@ class TestSimulatePupilResponse:
         proj = _make_projector(config, nx=3, ny=3)
         result = simulate_pupil_response(
             system, proj,
-            config.pupil.center, config.pupil.normal, config.pupil.radius,
+            config.pupil.center, config.pupil.normal, config.pupil.width / 2,
             mc, x_fov=0.0, y_fov=0.0,
         )
         for ci in range(3):
@@ -167,7 +167,7 @@ class TestSimulatePupilResponse:
         proj = _make_projector(config, nx=3, ny=3)
         result = simulate_pupil_response(
             system, proj,
-            config.pupil.center, config.pupil.normal, config.pupil.radius,
+            config.pupil.center, config.pupil.normal, config.pupil.width / 2,
             mc, x_fov=0.0, y_fov=0.0,
         )
         # Total per-ray intensity at pupil should not exceed input
@@ -183,7 +183,7 @@ class TestEvaluateMerit:
         proj = _make_projector(config, nx=3, ny=3)
         mse, simulated, target = evaluate_merit(
             system, proj,
-            config.pupil.center, config.pupil.normal, config.pupil.radius,
+            config.pupil.center, config.pupil.normal, config.pupil.width / 2,
             x_fov=0.0, y_fov=0.0, config=mc,
         )
         assert isinstance(mse, float)
@@ -197,7 +197,7 @@ class TestEvaluateMerit:
         proj = _make_projector(config, nx=3, ny=3)
         mse, _, _ = evaluate_merit(
             system, proj,
-            config.pupil.center, config.pupil.normal, config.pupil.radius,
+            config.pupil.center, config.pupil.normal, config.pupil.width / 2,
             x_fov=0.0, y_fov=0.0, config=mc,
         )
         assert mse > 0
@@ -222,12 +222,12 @@ class TestEvaluateMerit:
 
         mse_low, sim_low, _ = evaluate_merit(
             system_low, proj,
-            config_low.pupil.center, config_low.pupil.normal, config_low.pupil.radius,
+            config_low.pupil.center, config_low.pupil.normal, config_low.pupil.width / 2,
             x_fov=0.0, y_fov=0.0, config=mc,
         )
         mse_high, sim_high, _ = evaluate_merit(
             system_high, proj,
-            config_high.pupil.center, config_high.pupil.normal, config_high.pupil.radius,
+            config_high.pupil.center, config_high.pupil.normal, config_high.pupil.width / 2,
             x_fov=0.0, y_fov=0.0, config=mc,
         )
 

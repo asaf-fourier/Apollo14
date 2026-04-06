@@ -80,7 +80,7 @@ class TestEyeboxResponse:
     def test_response_shape(self, default_setup):
         config, params, n_glass = default_setup
         grid = eyebox_grid_points(
-            config.pupil.center, config.pupil.normal, config.pupil.radius,
+            config.pupil.center, config.pupil.normal, config.pupil.width / 2,
             nx=3, ny=3)
         mc = EyeboxConfig(n_fov_x=3, n_fov_y=3)
 
@@ -97,7 +97,7 @@ class TestEyeboxResponse:
     def test_response_nonnegative(self, default_setup):
         config, params, n_glass = default_setup
         grid = eyebox_grid_points(
-            config.pupil.center, config.pupil.normal, config.pupil.radius,
+            config.pupil.center, config.pupil.normal, config.pupil.width / 2,
             nx=3, ny=3)
         mc = EyeboxConfig(n_fov_x=3, n_fov_y=3)
 
@@ -114,7 +114,7 @@ class TestEyeboxResponse:
         """Center eyebox sample with on-axis ray should get some light."""
         config, params, n_glass = default_setup
         grid = eyebox_grid_points(
-            config.pupil.center, config.pupil.normal, config.pupil.radius,
+            config.pupil.center, config.pupil.normal, config.pupil.width / 2,
             nx=3, ny=3)
         mc = EyeboxConfig(n_fov_x=1, n_fov_y=1)
 
@@ -214,7 +214,7 @@ class TestEyeboxDifferentiability:
         """Gradient of eyebox merit w.r.t. mirror reflectances."""
         config, params, n_glass = default_setup
         grid = eyebox_grid_points(
-            config.pupil.center, config.pupil.normal, config.pupil.radius,
+            config.pupil.center, config.pupil.normal, config.pupil.width / 2,
             nx=3, ny=3)
         mc = EyeboxConfig(n_fov_x=3, n_fov_y=3)
 

@@ -4,7 +4,7 @@ from apollo14.combiner import CombinerConfig, build_system
 from apollo14.tracer import trace_nonsequential
 from apollo14.elements.surface import PartialMirror
 from apollo14.elements.glass_block import GlassBlock
-from apollo14.elements.pupil import Pupil
+from apollo14.elements.pupil import Pupil, RectangularPupil
 from apollo14.elements.boundary import BoundaryPlane
 
 
@@ -21,7 +21,7 @@ def test_default_config_creates_system():
     glass = [e for e in system.elements if isinstance(e, GlassBlock)]
     assert len(glass) == 1
 
-    pupils = [e for e in system.elements if isinstance(e, Pupil)]
+    pupils = [e for e in system.elements if isinstance(e, (Pupil, RectangularPupil))]
     assert len(pupils) == 1
 
     boundaries = [e for e in system.elements if isinstance(e, BoundaryPlane)]

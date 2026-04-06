@@ -5,7 +5,7 @@ import jax.numpy as jnp
 
 from apollo14.system import OpticalSystem
 from apollo14.elements.glass_block import GlassBlock
-from apollo14.elements.pupil import Pupil
+from apollo14.elements.pupil import Pupil, RectangularPupil
 from apollo14.interaction import Interaction
 from apollo14.units import EPSILON
 
@@ -72,7 +72,7 @@ def trace_nonsequential(system: OpticalSystem, origin, direction, wavelength,
 
         elem, dist, hit_point, hit_normal = hit_result
 
-        if isinstance(elem, Pupil):
+        if isinstance(elem, (Pupil, RectangularPupil)):
             hit = TraceHit(
                 element_name=elem.name, point=hit_point, normal=hit_normal,
                 direction=d, intensity=inten, interaction=Interaction.ABSORBED,

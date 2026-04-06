@@ -7,7 +7,7 @@ from apollo14.materials import air, agc_m074, Material
 from apollo14.elements.surface import PartialMirror
 from apollo14.elements.glass_block import GlassBlock
 from apollo14.elements.aperture import RectangularAperture
-from apollo14.elements.pupil import Pupil
+from apollo14.elements.pupil import RectangularPupil
 from apollo14.system import OpticalSystem
 
 
@@ -49,7 +49,8 @@ class PupilConfig:
     center: jnp.ndarray
     normal: jnp.ndarray
     eye_relief: float
-    radius: float
+    width: float
+    height: float
 
 
 @dataclass
@@ -92,7 +93,8 @@ class CombinerConfig:
             center=jnp.array([chassis_center[0], chassis_center[1] - 2 * mm,
                               eye_relief + chassis_dims[2]]),
             eye_relief=eye_relief,
-            radius=5.0 * mm,
+            width=10.0 * mm,
+            height=14.0 * mm,
         )
 
         chassis_config = ChassisConfig(
@@ -102,7 +104,7 @@ class CombinerConfig:
             distance_between_mirrors=1.47 * mm,
             skew_angle=6.0 * deg,
             material=agc_m074,
-            pupil_spacing=2 * pupil_config.radius,
+            pupil_spacing=pupil_config.width,
         )
 
         mirror_angle = 48.0 * deg
@@ -192,11 +194,12 @@ def build_system(config: CombinerConfig, stage_margin: float = 10.0) -> OpticalS
         ))
 
     # Pupil
-    system.add(Pupil(
+    system.add(RectangularPupil(
         name="pupil",
         position=config.pupil.center,
         normal=config.pupil.normal,
-        radius=config.pupil.radius,
+        width=config.pupil.width,
+        height=config.pupil.height,
     ))
 
     # Stage boundary
