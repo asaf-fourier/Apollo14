@@ -95,10 +95,10 @@ class TestTraceRay:
         for i in range(6):
             if valid[i]:
                 delta = pts[i] - params.pupil_center
-                r = jnp.sqrt(
-                    jnp.dot(delta, params.pupil_local_x) ** 2 +
-                    jnp.dot(delta, params.pupil_local_y) ** 2)
-                assert float(r) <= float(params.pupil_radius) + 1e-3
+                dx = jnp.abs(jnp.dot(delta, params.pupil_local_x))
+                dy = jnp.abs(jnp.dot(delta, params.pupil_local_y))
+                assert float(dx) <= float(params.pupil_half_width) + 1e-3
+                assert float(dy) <= float(params.pupil_half_height) + 1e-3
 
 
 

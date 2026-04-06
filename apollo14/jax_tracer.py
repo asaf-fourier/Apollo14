@@ -1,36 +1,135 @@
-"""JAX-native path-based tracer for differentiable optimization.
+"""JAX-native path-based tracer for differentiable ray tracing.
 
-Traces rays through predefined optical paths — sequences of surfaces with
-specified interactions (refraction, partial reflection, target). The path
-is defined as data, making the tracer general-purpose while remaining
-fully JIT-compatible.
+The tracer is **system-agnostic**: it traces rays through user-defined
+optical paths — sequences of ``PathStep`` surfaces with specified
+interactions. You build the path, the tracer executes it. Fully
+JIT-compatible and differentiable via ``jax.grad``.
 
-The generic entry point is ``trace_path``, which takes a sequence of
-``PathStep`` surfaces. For the combiner system, ``build_combiner_paths``
-constructs the appropriate paths from ``CombinerParams``, and convenience
-functions (``trace_ray``, ``trace_batch``, ``trace_beam``) handle the
-full workflow including chassis entry refraction.
+Architecture
+------------
 
-Usage::
+The tracer separates **path definition** (what surfaces exist and how
+rays interact with them) from **path execution** (propagating rays
+through those surfaces). This means:
 
-    from apollo14.jax_tracer import trace_ray, trace_batch, params_from_config
+- You can trace any optical system, not just the combiner.
+- You control which surfaces are included and in what order.
+- You can build paths once and reuse them for many rays (``vmap``).
+
+How it works
+~~~~~~~~~~~~
+
+A ray propagates through two nested sequences of ``PathStep`` surfaces:
+
+1. **Main path** ``(M,)`` — the primary sequence of surfaces the ray
+   visits in order. At each step, the ray intersects the surface and
+   interacts according to the step's ``interaction`` type.
+
+2. **Branch paths** ``(M, B)`` — at each main step, an optional branch
+   of B surfaces is traced from the reflected ray. This is how light
+   that splits off the main path (e.g., reflections from partial mirrors)
+   reaches a detector.
+
+The main-path scan uses ``jax.lax.scan`` over M steps. At each PARTIAL
+step, the reflected ray is traced through B branch steps via a nested
+scan. The branch endpoints, intensities, and validity flags are the
+tracer's output.
+
+Interaction types
+~~~~~~~~~~~~~~~~~
+
+Each ``PathStep`` has an ``interaction`` field (integer):
+
+- ``REFRACT`` (0) — Snell's law refraction. Changes the ray direction
+  based on ``n1`` and ``n2``. Used for glass-air boundaries.
+- ``PARTIAL`` (1) — Partial mirror. Splits intensity: ``reflectance``
+  fraction goes into the branch path, the rest continues along the
+  main path. The branch ray direction is the specular reflection.
+- ``TARGET`` (2) — Detector/target surface. Records the hit point.
+  No direction or intensity change. Used as the final branch step
+  to check if the ray reaches the pupil/sensor.
+
+Building paths with step constructors
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use the step constructors ``partial()``, ``refract()``, and ``target()``
+to create steps from your optical elements. Then ``stack_path()``
+assembles the lists into the arrays ``trace_path`` expects.
+
+Step constructors (one per interaction type):
+
+- ``partial(mirror)`` — wraps a ``PartialMirror`` element. Extracts
+  position, normal, width/height, and reflection_ratio. Accepts an
+  optional ``reflectance`` override ``(3,)`` for per-color R/G/B.
+- ``refract(face, n1, n2)`` — wraps a ``GlassFace`` element. You
+  must provide the refractive indices explicitly.
+- ``target(pupil)`` — wraps a ``Pupil`` element. Circular bounds from
+  the pupil's radius.
+
+``stack_path(main_list, branch_lists)`` takes:
+
+- ``main_list``: ``List[PathStep]`` of length M
+- ``branch_lists``: ``List[List[PathStep]]`` of length M, each inner
+  list of length B (same B for all branches)
+- Returns ``(main_steps, branch_steps)`` with shapes ``(M,)``/``(M,B)``
+
+Usage — generic path
+~~~~~~~~~~~~~~~~~~~~
+
+::
+
+    from apollo14.jax_tracer import partial, refract, target, stack_path, trace_path
+    from apollo14.elements.surface import PartialMirror
+    from apollo14.elements.pupil import Pupil
+
+    # Define paths using your elements
+    main = [partial(m) for m in mirrors]
+    branches = [
+        [refract(exit_face, n_glass, 1.0), target(pupil)]
+        for exit_face in exit_faces
+    ]
+    main_steps, branch_steps = stack_path(main, branches)
+
+    # Trace
+    endpoints, intensities, valid = trace_path(
+        origin, direction, jnp.array(1.0),
+        main_steps, branch_steps, color_idx=0)
+
+    # Batch with vmap:
+    trace_many = jax.vmap(lambda o: trace_path(
+        o, direction, jnp.array(1.0), main_steps, branch_steps))
+    all_endpoints, all_ints, all_valid = trace_many(origins)
+
+Usage — combiner convenience
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For the AR combiner system, helper functions build the paths from
+``CombinerParams``::
+
+    from apollo14.jax_tracer import trace_beam, params_from_config
     from apollo14.combiner import CombinerConfig
 
     config = CombinerConfig.default()
     params = params_from_config(config)
     n_glass = float(config.chassis.material.n(config.light.wavelength))
 
-    # Single ray
-    pts, intensities, valid = trace_ray(
-        config.light.position, config.light.direction, n_glass, params)
+    # Beam of rays with shared direction (most efficient)
+    pts, intensities, valid = trace_beam(origins, direction, n_glass, params)
 
-    # Batched rays (vmap over N rays)
-    pts, intensities, valid = trace_batch(origins, directions, n_glass, params)
+    # Single ray
+    pts, intensities, valid = trace_ray(origin, direction, n_glass, params)
 """
+
+from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-from typing import NamedTuple
+from typing import List, NamedTuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from apollo14.elements.surface import PartialMirror
+    from apollo14.elements.glass_block import GlassFace
+    from apollo14.elements.pupil import Pupil, RectangularPupil
 
 from apollo14.geometry import normalize, reflect, snell_refract, compute_local_axes
 from apollo14.units import EPSILON
@@ -66,6 +165,127 @@ class PathStep(NamedTuple):
     radius: jnp.ndarray         # scalar, circular bounds radius
 
 
+# ── Step constructors ───────────────────────────────────────────────────────
+
+def partial(mirror: PartialMirror, reflectance=None) -> PathStep:
+    """Create a PARTIAL step from a PartialMirror element.
+
+    Args:
+        mirror: PartialMirror with position, normal, width, height,
+            and reflection_ratio.
+        reflectance: optional (3,) per-color [R,G,B] reflectance override.
+            If None, uses mirror.reflection_ratio for all 3 channels.
+    """
+    n = normalize(mirror.normal)
+    lx, ly = compute_local_axes(n)
+    if reflectance is None:
+        r = float(mirror.reflection_ratio)
+        reflectance = jnp.array([r, r, r])
+    else:
+        reflectance = jnp.asarray(reflectance)
+    return PathStep(
+        position=jnp.asarray(mirror.position),
+        normal=n,
+        half_width=jnp.array(mirror.width / 2),
+        half_height=jnp.array(mirror.height / 2),
+        local_x=lx,
+        local_y=ly,
+        interaction=jnp.array(PARTIAL, dtype=jnp.int32),
+        n1=jnp.array(1.0),
+        n2=jnp.array(1.0),
+        reflectance=reflectance,
+        use_circular=jnp.array(False),
+        radius=jnp.array(0.0),
+    )
+
+
+def refract(face: GlassFace, n1: float, n2: float) -> PathStep:
+    """Create a REFRACT step from a GlassFace element.
+
+    Args:
+        face: GlassFace with position, normal, and vertices.
+        n1: refractive index on the incoming side.
+        n2: refractive index on the outgoing side.
+    """
+    n = normalize(face.normal)
+    lx, ly = compute_local_axes(n)
+    # Compute rectangular bounds from vertex bbox in local coords
+    deltas = face.vertices - face.position
+    proj_x = jnp.array([float(jnp.dot(d, lx)) for d in deltas])
+    proj_y = jnp.array([float(jnp.dot(d, ly)) for d in deltas])
+    half_w = float(jnp.max(jnp.abs(proj_x)))
+    half_h = float(jnp.max(jnp.abs(proj_y)))
+    return PathStep(
+        position=jnp.asarray(face.position),
+        normal=n,
+        half_width=jnp.array(half_w),
+        half_height=jnp.array(half_h),
+        local_x=lx,
+        local_y=ly,
+        interaction=jnp.array(REFRACT, dtype=jnp.int32),
+        n1=jnp.array(float(n1)),
+        n2=jnp.array(float(n2)),
+        reflectance=jnp.zeros(3),
+        use_circular=jnp.array(False),
+        radius=jnp.array(0.0),
+    )
+
+
+def target(pupil: Pupil | RectangularPupil) -> PathStep:
+    """Create a TARGET step from a Pupil or RectangularPupil element.
+
+    Args:
+        pupil: Pupil (circular) or RectangularPupil (rectangular).
+    """
+    from apollo14.elements.pupil import RectangularPupil as _RectPupil
+
+    n = normalize(pupil.normal)
+    lx, ly = compute_local_axes(n)
+    is_rect = isinstance(pupil, _RectPupil)
+    return PathStep(
+        position=jnp.asarray(pupil.position),
+        normal=n,
+        half_width=jnp.array(pupil.width / 2 if is_rect else 1e6),
+        half_height=jnp.array(pupil.height / 2 if is_rect else 1e6),
+        local_x=lx,
+        local_y=ly,
+        interaction=jnp.array(TARGET, dtype=jnp.int32),
+        n1=jnp.array(1.0),
+        n2=jnp.array(1.0),
+        reflectance=jnp.zeros(3),
+        use_circular=jnp.array(not is_rect),
+        radius=jnp.array(float(pupil.radius) if not is_rect else 0.0),
+    )
+
+
+def stack_path(main_list: List[PathStep],
+               branch_lists: List[List[PathStep]]):
+    """Stack lists of PathStep into batched arrays for trace_path.
+
+    Args:
+        main_list: list of M PathStep values (one per main surface)
+        branch_lists: list of M lists, each containing B PathStep values
+            (branch path per main surface). All inner lists must have the
+            same length B.
+
+    Returns:
+        (main_steps, branch_steps) where main_steps has (M,) arrays
+        and branch_steps has (M, B) arrays.
+    """
+    # Stack main path: list of M scalar PathSteps → one PathStep with (M,) arrays
+    main_steps = jax.tree.map(lambda *args: jnp.stack(args), *main_list)
+
+    # Stack branches: list of M lists of B PathSteps → PathStep with (M, B) arrays
+    # First stack each branch list into (B,), then stack across M
+    stacked_branches = [
+        jax.tree.map(lambda *args: jnp.stack(args), *branch)
+        for branch in branch_lists
+    ]
+    branch_steps = jax.tree.map(lambda *args: jnp.stack(args), *stacked_branches)
+
+    return main_steps, branch_steps
+
+
 class CombinerParams(NamedTuple):
     """JAX-compatible system parameters for the combiner tracer.
 
@@ -83,7 +303,8 @@ class CombinerParams(NamedTuple):
     chassis_max: jnp.ndarray        # (3,) AABB max corner
     pupil_center: jnp.ndarray       # (3,)
     pupil_normal: jnp.ndarray       # (3,)
-    pupil_radius: jnp.ndarray       # scalar
+    pupil_half_width: jnp.ndarray   # scalar
+    pupil_half_height: jnp.ndarray  # scalar
     pupil_local_x: jnp.ndarray      # (3,)
     pupil_local_y: jnp.ndarray      # (3,)
 
@@ -141,28 +362,19 @@ def _plane_t(origin, direction, normal, point):
 
 def trace_path(origin, direction, intensity, main_steps, branch_steps,
                color_idx=0):
-    """Trace a ray through a predefined optical path with branches.
+    """Trace a ray through a sequence of surfaces with branch paths.
 
-    The ray traverses ``main_steps`` in sequence. At each step the ray
-    interacts with a planar surface:
-
-    - **PARTIAL** — splits intensity: the transmitted ray continues along
-      the main path, while the reflected ray is traced through the
-      corresponding ``branch_steps`` (e.g., through an exit face to a
-      pupil plane).
-    - **REFRACT** — applies Snell's law, changing the ray direction.
-    - **TARGET** — records the hit point (no direction/intensity change).
-
-    All operations are pure JAX — no Python control flow on array values.
-    The main path uses ``jax.lax.scan``; each branch is a nested scan.
+    This is the primary entry point. Build your ``PathStep`` arrays
+    (see module docstring for how), then call this function. Use
+    ``jax.vmap`` to trace many rays efficiently.
 
     Args:
-        origin: (3,) start position (typically after entry refraction)
-        direction: (3,) initial direction inside the medium
-        intensity: scalar, initial intensity
+        origin: (3,) ray start position
+        direction: (3,) ray direction (normalized)
+        intensity: scalar, initial intensity (typically 1.0)
         main_steps: PathStep with (M,) arrays — M surfaces in sequence
         branch_steps: PathStep with (M, B) arrays — B branch steps per
-            main surface (used when a PARTIAL interaction splits the ray)
+            main surface (traced when a PARTIAL step splits the ray)
         color_idx: int, selects reflectance channel [0=R, 1=G, 2=B]
 
     Returns:
@@ -337,16 +549,16 @@ def build_combiner_paths(params, n_glass, direction):
     pupil_steps = PathStep(
         position=jnp.tile(params.pupil_center, (m, 1)),
         normal=jnp.tile(params.pupil_normal, (m, 1)),
-        half_width=jnp.full(m, 1e6),
-        half_height=jnp.full(m, 1e6),
+        half_width=jnp.full(m, float(params.pupil_half_width)),
+        half_height=jnp.full(m, float(params.pupil_half_height)),
         local_x=jnp.tile(params.pupil_local_x, (m, 1)),
         local_y=jnp.tile(params.pupil_local_y, (m, 1)),
         interaction=jnp.full(m, TARGET, dtype=jnp.int32),
         n1=jnp.ones(m),
         n2=jnp.ones(m),
         reflectance=jnp.zeros((m, 3)),
-        use_circular=jnp.ones(m, dtype=bool),
-        radius=jnp.full(m, float(params.pupil_radius)),
+        use_circular=jnp.zeros(m, dtype=bool),
+        radius=jnp.zeros(m),
     )
 
     # Stack into (M, 2) branch steps
@@ -525,7 +737,8 @@ def params_from_config(config) -> CombinerParams:
         chassis_max=chassis_max,
         pupil_center=config.pupil.center,
         pupil_normal=config.pupil.normal,
-        pupil_radius=jnp.array(config.pupil.radius),
+        pupil_half_width=jnp.array(config.pupil.width / 2),
+        pupil_half_height=jnp.array(config.pupil.height / 2),
         pupil_local_x=plx,
         pupil_local_y=ply,
     )
