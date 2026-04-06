@@ -106,12 +106,12 @@ Usage — combiner convenience
 For the AR combiner system, helper functions build the paths from
 ``CombinerParams``::
 
-    from apollo14.jax_tracer import trace_beam, params_from_config
-    from apollo14.combiner import CombinerConfig
+    from apollo14.jax_tracer import trace_beam, params_from_system
+    from apollo14.combiner import build_default_system, DEFAULT_WAVELENGTH
 
-    config = CombinerConfig.default()
-    params = params_from_config(config)
-    n_glass = float(config.chassis.material.n(config.light.wavelength))
+    system = build_default_system()
+    params = params_from_system(system, DEFAULT_WAVELENGTH)
+    # n_glass is computed internally by params_from_system
 
     # Beam of rays with shared direction (most efficient)
     pts, intensities, valid = trace_beam(origins, direction, n_glass, params)
@@ -289,8 +289,8 @@ def stack_path(main_list: List[PathStep],
 class CombinerParams(NamedTuple):
     """JAX-compatible system parameters for the combiner tracer.
 
-    All fields are JAX arrays. Use ``params_from_config()`` to construct
-    from a ``CombinerConfig``.
+    All fields are JAX arrays. Use ``params_from_system()`` to construct
+    from an ``OpticalSystem``.
     """
     mirror_positions: jnp.ndarray    # (M, 3)
     mirror_normals: jnp.ndarray      # (M, 3)
@@ -661,7 +661,7 @@ def compensated_reflectances(ratio, num_mirrors):
         r[i] = ratio / (1 - i * ratio)
 
     This is the JAX-differentiable equivalent of the Python loop in
-    ``build_system()``.  Gradients flow from the output array back
+    ``build_default_system()``.  Gradients flow from the output array back
     to ``ratio``.
 
     Args:
@@ -683,47 +683,57 @@ def compensated_reflectances(ratio, num_mirrors):
     return ratio[None, :] / (1.0 - i * ratio[None, :])  # (M, 3)
 
 
-# ── Config conversion ────────────────────────────────────────────────────────
+# ── System conversion ────────────────────────────────────────────────────────
 
-def params_from_config(config) -> CombinerParams:
-    """Build CombinerParams from a CombinerConfig.
+def params_from_system(system, wavelength) -> CombinerParams:
+    """Build CombinerParams from an OpticalSystem.
 
-    Replicates the mirror placement logic from ``combiner.build_system()``.
-    The chassis is approximated as an axis-aligned bounding box (ignoring
-    the small z_skew).
+    Extracts mirrors, chassis, and pupil from the system. The chassis is
+    approximated as an axis-aligned bounding box from its face vertices.
+
+    Args:
+        system: OpticalSystem containing GlassBlock, PartialMirror, and
+            RectangularPupil elements.
+        wavelength: Trace wavelength (for computing glass refractive index).
     """
-    # Chassis AABB
-    center = config.chassis.center
-    half = config.chassis.dimensions / 2
-    chassis_min = center - half
-    chassis_max = center + half
+    from apollo14.elements.surface import PartialMirror as _PM
+    from apollo14.elements.glass_block import GlassBlock as _GB
+    from apollo14.elements.pupil import RectangularPupil as _RP
 
-    # Mirror positions (same logic as build_system)
-    mirror_y_width = config.mirror.y_width
-    chassis_z = float(config.chassis.dimensions[2])
-    mirror_edge_to_center_y = 0.5 * jnp.sqrt(mirror_y_width ** 2 - chassis_z ** 2)
-    first_pos = (config.chassis.first_mirror_center -
-                 jnp.array([0.0, float(mirror_edge_to_center_y), 0.0]))
-    mirror_offset_y = config.chassis.distance_between_mirrors / config.mirror.normal[1]
-    mirror_offset = jnp.array([0.0, float(mirror_offset_y), 0.0])
+    mirrors = [e for e in system.elements if isinstance(e, _PM)]
+    chassis = next(e for e in system.elements if isinstance(e, _GB))
+    pupil = next(e for e in system.elements if isinstance(e, _RP))
 
-    m = config.num_mirrors
-    positions = jnp.stack([first_pos - i * mirror_offset for i in range(m)])
-    normals = jnp.tile(config.mirror.normal, (m, 1))
+    m = len(mirrors)
 
-    # Per-mirror, per-color reflectances (compensated for upstream loss)
-    reflectances = compensated_reflectances(config.mirror.reflection_ratio, m)
+    # Chassis AABB from face vertices
+    all_verts = jnp.concatenate([f.vertices for f in chassis.faces], axis=0)
+    chassis_min = jnp.min(all_verts, axis=0)
+    chassis_max = jnp.max(all_verts, axis=0)
 
-    half_widths = jnp.full(m, config.mirror.x_width / 2)
-    half_heights = jnp.full(m, config.mirror.y_width / 2)
+    # Mirror geometry
+    positions = jnp.stack([jnp.asarray(mir.position) for mir in mirrors])
+    normals = jnp.stack([jnp.asarray(mir.normal) for mir in mirrors])
 
-    # Local axes per mirror (all mirrors share the same normal)
-    lx, ly = compute_local_axes(config.mirror.normal)
-    local_x = jnp.tile(lx, (m, 1))
-    local_y = jnp.tile(ly, (m, 1))
+    # Per-mirror, per-color reflectances — tile scalar to (3,) per mirror
+    reflectances = jnp.stack([
+        jnp.full(3, float(mir.reflection_ratio)) for mir in mirrors
+    ])
+
+    half_widths = jnp.array([mir.width / 2 for mir in mirrors])
+    half_heights = jnp.array([mir.height / 2 for mir in mirrors])
+
+    # Local axes per mirror
+    lx_list, ly_list = [], []
+    for mir in mirrors:
+        lx, ly = compute_local_axes(jnp.asarray(mir.normal))
+        lx_list.append(lx)
+        ly_list.append(ly)
+    local_x = jnp.stack(lx_list)
+    local_y = jnp.stack(ly_list)
 
     # Pupil local axes
-    plx, ply = compute_local_axes(config.pupil.normal)
+    plx, ply = compute_local_axes(jnp.asarray(pupil.normal))
 
     return CombinerParams(
         mirror_positions=positions,
@@ -735,10 +745,10 @@ def params_from_config(config) -> CombinerParams:
         mirror_local_y=local_y,
         chassis_min=chassis_min,
         chassis_max=chassis_max,
-        pupil_center=config.pupil.center,
-        pupil_normal=config.pupil.normal,
-        pupil_half_width=jnp.array(config.pupil.width / 2),
-        pupil_half_height=jnp.array(config.pupil.height / 2),
+        pupil_center=jnp.asarray(pupil.position),
+        pupil_normal=jnp.asarray(pupil.normal),
+        pupil_half_width=jnp.array(pupil.width / 2),
+        pupil_half_height=jnp.array(pupil.height / 2),
         pupil_local_x=plx,
         pupil_local_y=ply,
     )

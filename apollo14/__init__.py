@@ -1,4 +1,4 @@
-from apollo14.combiner import CombinerConfig, build_system
+from apollo14.combiner import build_default_system
 from apollo14.projector import Projector, scan_directions
 from apollo14.tracer import trace_nonsequential
 from apollo14.stage import Stage

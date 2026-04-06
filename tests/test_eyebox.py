@@ -2,8 +2,14 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from apollo14.combiner import CombinerConfig
-from apollo14.jax_tracer import params_from_config
+from apollo14.combiner import (
+    build_default_system,
+    DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION, DEFAULT_WAVELENGTH,
+    DEFAULT_BEAM_WIDTH, DEFAULT_BEAM_HEIGHT, DEFAULT_X_FOV, DEFAULT_Y_FOV,
+)
+from apollo14.elements.glass_block import GlassBlock
+from apollo14.elements.pupil import RectangularPupil
+from apollo14.jax_tracer import params_from_system
 from apollo14.units import mm
 
 from helios.eyebox import (
@@ -14,10 +20,12 @@ from helios.eyebox import (
 
 @pytest.fixture
 def default_setup():
-    config = CombinerConfig.default()
-    params = params_from_config(config)
-    n_glass = float(config.chassis.material.n(config.light.wavelength))
-    return config, params, n_glass
+    system = build_default_system()
+    params = params_from_system(system, DEFAULT_WAVELENGTH)
+    chassis = next(e for e in system.elements if isinstance(e, GlassBlock))
+    n_glass = float(chassis.material.n(DEFAULT_WAVELENGTH))
+    pupil = next(e for e in system.elements if isinstance(e, RectangularPupil))
+    return params, n_glass, pupil
 
 
 # ── Eyebox sampling ─────────────────────────────────────────────────────────
@@ -78,50 +86,50 @@ class TestEyeboxSampling:
 class TestEyeboxResponse:
 
     def test_response_shape(self, default_setup):
-        config, params, n_glass = default_setup
+        params, n_glass, pupil = default_setup
         grid = eyebox_grid_points(
-            config.pupil.center, config.pupil.normal, config.pupil.width / 2,
+            pupil.position, pupil.normal, pupil.width / 2,
             nx=3, ny=3)
         mc = EyeboxConfig(n_fov_x=3, n_fov_y=3)
 
         response, dirs = compute_eyebox_response(
             params, n_glass,
-            config.light.position, config.light.direction,
-            config.light.beam_width, config.light.beam_height,
-            config.light.x_fov, config.light.y_fov,
+            DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
+            DEFAULT_BEAM_WIDTH, DEFAULT_BEAM_HEIGHT,
+            DEFAULT_X_FOV, DEFAULT_Y_FOV,
             grid, mc,
         )
         assert response.shape == (9, 9, 3)  # 3x3 grid, 3x3 angles, 3 colors
         assert dirs.shape == (9, 3)
 
     def test_response_nonnegative(self, default_setup):
-        config, params, n_glass = default_setup
+        params, n_glass, pupil = default_setup
         grid = eyebox_grid_points(
-            config.pupil.center, config.pupil.normal, config.pupil.width / 2,
+            pupil.position, pupil.normal, pupil.width / 2,
             nx=3, ny=3)
         mc = EyeboxConfig(n_fov_x=3, n_fov_y=3)
 
         response, _ = compute_eyebox_response(
             params, n_glass,
-            config.light.position, config.light.direction,
-            config.light.beam_width, config.light.beam_height,
-            config.light.x_fov, config.light.y_fov,
+            DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
+            DEFAULT_BEAM_WIDTH, DEFAULT_BEAM_HEIGHT,
+            DEFAULT_X_FOV, DEFAULT_Y_FOV,
             grid, mc,
         )
         assert jnp.all(response >= 0)
 
     def test_center_has_intensity(self, default_setup):
         """Center eyebox sample with on-axis ray should get some light."""
-        config, params, n_glass = default_setup
+        params, n_glass, pupil = default_setup
         grid = eyebox_grid_points(
-            config.pupil.center, config.pupil.normal, config.pupil.width / 2,
+            pupil.position, pupil.normal, pupil.width / 2,
             nx=3, ny=3)
         mc = EyeboxConfig(n_fov_x=1, n_fov_y=1)
 
         response, _ = compute_eyebox_response(
             params, n_glass,
-            config.light.position, config.light.direction,
-            config.light.beam_width, config.light.beam_height,
+            DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
+            DEFAULT_BEAM_WIDTH, DEFAULT_BEAM_HEIGHT,
             0.0, 0.0,  # on-axis only
             grid, mc,
         )
@@ -212,9 +220,9 @@ class TestEyeboxDifferentiability:
 
     def test_grad_wrt_reflectances(self, default_setup):
         """Gradient of eyebox merit w.r.t. mirror reflectances."""
-        config, params, n_glass = default_setup
+        params, n_glass, pupil = default_setup
         grid = eyebox_grid_points(
-            config.pupil.center, config.pupil.normal, config.pupil.width / 2,
+            pupil.position, pupil.normal, pupil.width / 2,
             nx=3, ny=3)
         mc = EyeboxConfig(n_fov_x=3, n_fov_y=3)
 
@@ -222,9 +230,9 @@ class TestEyeboxDifferentiability:
             p = params._replace(mirror_reflectances=reflectances)
             response, _ = compute_eyebox_response(
                 p, n_glass,
-                config.light.position, config.light.direction,
-                config.light.beam_width, config.light.beam_height,
-                config.light.x_fov, config.light.y_fov,
+                DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
+                DEFAULT_BEAM_WIDTH, DEFAULT_BEAM_HEIGHT,
+                DEFAULT_X_FOV, DEFAULT_Y_FOV,
                 grid, mc,
             )
             return eyebox_merit(response, mc)

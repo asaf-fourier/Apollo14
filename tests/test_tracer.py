@@ -9,7 +9,7 @@ from apollo14.elements.aperture import RectangularAperture
 from apollo14.elements.pupil import Pupil
 from apollo14.interaction import Interaction
 from apollo14.tracer import trace_nonsequential
-from apollo14.combiner import CombinerConfig, build_system
+from apollo14.combiner import build_default_system, DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION, DEFAULT_WAVELENGTH
 from apollo14.units import mm, nm
 
 
@@ -64,8 +64,8 @@ def two_mirror_system():
 
 @pytest.fixture
 def combiner_system():
-    config = CombinerConfig.default()
-    return config, build_system(config)
+    system = build_default_system()
+    return system
 
 
 # ── trace_nonsequential tests ────────────────────────────────────────────────────
@@ -183,27 +183,24 @@ class TestTraceSequential:
 class TestCombinerTracing:
 
     def test_on_axis_hits_all_mirrors(self, combiner_system):
-        config, system = combiner_system
         result = trace_nonsequential(
-            system, config.light.position, config.light.direction,
-            config.light.wavelength,
+            combiner_system, DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
+            DEFAULT_WAVELENGTH,
         )
         mirror_names = {h.element_name for h in result.flat_hits() if h.element_name.startswith("mirror_")}
         assert len(mirror_names) == 6
 
     def test_on_axis_reaches_pupil(self, combiner_system):
-        config, system = combiner_system
         result = trace_nonsequential(
-            system, config.light.position, config.light.direction,
-            config.light.wavelength,
+            combiner_system, DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
+            DEFAULT_WAVELENGTH,
         )
         assert result.pupil_hit is not None
 
     def test_chassis_refraction_occurs(self, combiner_system):
-        config, system = combiner_system
         result = trace_nonsequential(
-            system, config.light.position, config.light.direction,
-            config.light.wavelength,
+            combiner_system, DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
+            DEFAULT_WAVELENGTH,
         )
         chassis_hits = [h for h in result.flat_hits() if h.element_name == "chassis"]
         assert len(chassis_hits) > 0
@@ -211,10 +208,9 @@ class TestCombinerTracing:
         assert Interaction.ENTERING in interactions or Interaction.EXITING in interactions
 
     def test_hit_points_are_finite(self, combiner_system):
-        config, system = combiner_system
         result = trace_nonsequential(
-            system, config.light.position, config.light.direction,
-            config.light.wavelength,
+            combiner_system, DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
+            DEFAULT_WAVELENGTH,
         )
         for hit in result.flat_hits():
             assert jnp.all(jnp.isfinite(hit.point))

@@ -24,22 +24,32 @@ Usage::
         eyebox_sample_points, compute_eyebox_response,
         eyebox_merit, EyeboxConfig,
     )
-    from apollo14.jax_tracer import params_from_config
-    from apollo14.combiner import CombinerConfig
+    from apollo14.jax_tracer import params_from_system
+    from apollo14.combiner import build_default_system, DEFAULT_WAVELENGTH
 
-    config = CombinerConfig.default()
-    params = params_from_config(config)
-    n_glass = float(config.chassis.material.n(config.light.wavelength))
+    system = build_default_system()
+    params = params_from_system(system, DEFAULT_WAVELENGTH)
 
-    grid = eyebox_grid_points(
-        config.pupil.center, config.pupil.normal, radius=3.0)
+    from apollo14.elements.pupil import RectangularPupil
+    pupil = next(e for e in system.elements if isinstance(e, RectangularPupil))
+
+    grid = eyebox_grid_points(pupil.position, pupil.normal, radius=3.0)
     mc = EyeboxConfig()
+
+    from apollo14.combiner import (
+        DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
+        DEFAULT_BEAM_WIDTH, DEFAULT_BEAM_HEIGHT,
+        DEFAULT_X_FOV, DEFAULT_Y_FOV,
+    )
+    from apollo14.elements.glass_block import GlassBlock
+    chassis = next(e for e in system.elements if isinstance(e, GlassBlock))
+    n_glass = float(chassis.material.n(DEFAULT_WAVELENGTH))
 
     response, dirs = compute_eyebox_response(
         params, n_glass,
-        config.light.position, config.light.direction,
-        config.light.beam_width, config.light.beam_height,
-        config.light.x_fov, config.light.y_fov,
+        DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
+        DEFAULT_BEAM_WIDTH, DEFAULT_BEAM_HEIGHT,
+        DEFAULT_X_FOV, DEFAULT_Y_FOV,
         grid, mc,
     )
     loss = eyebox_merit(response, mc)

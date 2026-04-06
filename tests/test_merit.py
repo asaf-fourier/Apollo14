@@ -1,7 +1,14 @@
 import jax.numpy as jnp
 import pytest
 
-from apollo14.combiner import CombinerConfig, MirrorConfig, build_system
+from apollo14.combiner import (
+    build_default_system,
+    DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION, DEFAULT_WAVELENGTH,
+    DEFAULT_X_FOV, DEFAULT_Y_FOV,
+)
+from apollo14.elements.aperture import RectangularAperture
+from apollo14.elements.pupil import RectangularPupil
+from apollo14.elements.surface import PartialMirror
 from apollo14.projector import Projector
 from helios.merit import (
     MeritConfig, D65_WEIGHTS, DEFAULT_WAVELENGTHS,
@@ -13,19 +20,20 @@ from apollo14.units import mm, nm
 
 @pytest.fixture
 def combiner():
-    config = CombinerConfig.default()
-    system = build_system(config)
-    return config, system
+    system = build_default_system()
+    pupil = next(e for e in system.elements if isinstance(e, RectangularPupil))
+    aperture = next(e for e in system.elements if isinstance(e, RectangularAperture))
+    return system, pupil, aperture
 
 
-def _make_projector(config, nx=3, ny=3):
+def _make_projector(aperture, nx=3, ny=3):
     """Create a projector with a beam narrow enough to pass through the aperture."""
     return Projector.uniform(
-        position=config.light.position,
-        direction=config.light.direction,
-        beam_width=config.aperture.width * 0.8,   # fit inside aperture
-        beam_height=config.aperture.height * 0.8,
-        wavelength=config.light.wavelength,
+        position=DEFAULT_LIGHT_POSITION,
+        direction=DEFAULT_LIGHT_DIRECTION,
+        beam_width=aperture.width * 0.8,
+        beam_height=aperture.height * 0.8,
+        wavelength=DEFAULT_WAVELENGTH,
         nx=nx, ny=ny,
     )
 
@@ -126,48 +134,48 @@ class TestMeritMSE:
 class TestSimulatePupilResponse:
 
     def test_output_shape(self, combiner):
-        config, system = combiner
+        system, pupil, aperture = combiner
         mc = MeritConfig(pupil_nx=2, pupil_ny=2, angle_nx=2, angle_ny=2)
-        proj = _make_projector(config, nx=2, ny=2)
+        proj = _make_projector(aperture, nx=2, ny=2)
         result = simulate_pupil_response(
             system, proj,
-            config.pupil.center, config.pupil.normal, config.pupil.width / 2,
-            mc, x_fov=config.light.x_fov, y_fov=config.light.y_fov,
+            pupil.position, pupil.normal, pupil.width / 2,
+            mc, x_fov=DEFAULT_X_FOV, y_fov=DEFAULT_Y_FOV,
         )
         assert result.shape == (2, 2, 2, 2, 3)
 
     def test_nonzero_intensity_on_axis(self, combiner):
         """On-axis with a beam that fits the aperture should produce pupil hits."""
-        config, system = combiner
+        system, pupil, aperture = combiner
         mc = _on_axis_merit_config()
-        proj = _make_projector(config, nx=3, ny=3)
+        proj = _make_projector(aperture, nx=3, ny=3)
         result = simulate_pupil_response(
             system, proj,
-            config.pupil.center, config.pupil.normal, config.pupil.width / 2,
+            pupil.position, pupil.normal, pupil.width / 2,
             mc, x_fov=0.0, y_fov=0.0,
         )
         assert float(result.sum()) > 0, "On-axis rays should reach the pupil"
 
     def test_all_three_colors_present(self, combiner):
         """Each wavelength channel should have nonzero intensity."""
-        config, system = combiner
+        system, pupil, aperture = combiner
         mc = _on_axis_merit_config()
-        proj = _make_projector(config, nx=3, ny=3)
+        proj = _make_projector(aperture, nx=3, ny=3)
         result = simulate_pupil_response(
             system, proj,
-            config.pupil.center, config.pupil.normal, config.pupil.width / 2,
+            pupil.position, pupil.normal, pupil.width / 2,
             mc, x_fov=0.0, y_fov=0.0,
         )
         for ci in range(3):
             assert float(result[..., ci].sum()) > 0, f"Color channel {ci} should have intensity"
 
     def test_intensity_values_reasonable(self, combiner):
-        config, system = combiner
+        system, pupil, aperture = combiner
         mc = _on_axis_merit_config()
-        proj = _make_projector(config, nx=3, ny=3)
+        proj = _make_projector(aperture, nx=3, ny=3)
         result = simulate_pupil_response(
             system, proj,
-            config.pupil.center, config.pupil.normal, config.pupil.width / 2,
+            pupil.position, pupil.normal, pupil.width / 2,
             mc, x_fov=0.0, y_fov=0.0,
         )
         # Total per-ray intensity at pupil should not exceed input
@@ -178,12 +186,12 @@ class TestSimulatePupilResponse:
 class TestEvaluateMerit:
 
     def test_returns_valid_tuple(self, combiner):
-        config, system = combiner
+        system, pupil, aperture = combiner
         mc = _on_axis_merit_config()
-        proj = _make_projector(config, nx=3, ny=3)
+        proj = _make_projector(aperture, nx=3, ny=3)
         mse, simulated, target = evaluate_merit(
             system, proj,
-            config.pupil.center, config.pupil.normal, config.pupil.width / 2,
+            pupil.position, pupil.normal, pupil.width / 2,
             x_fov=0.0, y_fov=0.0, config=mc,
         )
         assert isinstance(mse, float)
@@ -192,42 +200,41 @@ class TestEvaluateMerit:
 
     def test_merit_nonzero(self, combiner):
         """Merit should be nonzero — the system doesn't perfectly match the target."""
-        config, system = combiner
+        system, pupil, aperture = combiner
         mc = _on_axis_merit_config()
-        proj = _make_projector(config, nx=3, ny=3)
+        proj = _make_projector(aperture, nx=3, ny=3)
         mse, _, _ = evaluate_merit(
             system, proj,
-            config.pupil.center, config.pupil.normal, config.pupil.width / 2,
+            pupil.position, pupil.normal, pupil.width / 2,
             x_fov=0.0, y_fov=0.0, config=mc,
         )
         assert mse > 0
 
-    def test_merit_changes_with_reflection(self, combiner):
+    def test_merit_changes_with_reflection(self):
         """Different mirror reflectance should produce different merit."""
-        config_low = CombinerConfig.default()
-        config_high = CombinerConfig.default()
-        config_high.mirror = MirrorConfig(
-            normal=config_high.mirror.normal,
-            angle_with_horizon=config_high.mirror.angle_with_horizon,
-            x_width=config_high.mirror.x_width,
-            y_width=config_high.mirror.y_width,
-            reflection_ratio=jnp.array([0.15, 0.15, 0.15]),  # 3x the default
-        )
+        system_low = build_default_system()
+        system_high = build_default_system()
 
-        system_low = build_system(config_low)
-        system_high = build_system(config_high)
+        # Modify mirrors in system_high to have 3x reflectance
+        for elem in system_high.elements:
+            if isinstance(elem, PartialMirror):
+                elem.reflection_ratio = elem.reflection_ratio * 3.0
+                elem.transmission_ratio = 1.0 - elem.reflection_ratio
+
+        pupil = next(e for e in system_low.elements if isinstance(e, RectangularPupil))
+        aperture = next(e for e in system_low.elements if isinstance(e, RectangularAperture))
 
         mc = _on_axis_merit_config()
-        proj = _make_projector(config_low, nx=3, ny=3)
+        proj = _make_projector(aperture, nx=3, ny=3)
 
         mse_low, sim_low, _ = evaluate_merit(
             system_low, proj,
-            config_low.pupil.center, config_low.pupil.normal, config_low.pupil.width / 2,
+            pupil.position, pupil.normal, pupil.width / 2,
             x_fov=0.0, y_fov=0.0, config=mc,
         )
         mse_high, sim_high, _ = evaluate_merit(
             system_high, proj,
-            config_high.pupil.center, config_high.pupil.normal, config_high.pupil.width / 2,
+            pupil.position, pupil.normal, pupil.width / 2,
             x_fov=0.0, y_fov=0.0, config=mc,
         )
 

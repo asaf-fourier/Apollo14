@@ -14,8 +14,15 @@ import jax
 import jax.numpy as jnp
 from typing import NamedTuple
 
-from apollo14.combiner import CombinerConfig
-from apollo14.jax_tracer import params_from_config
+from apollo14.combiner import (
+    build_default_system,
+    DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION, DEFAULT_WAVELENGTH,
+    DEFAULT_BEAM_WIDTH, DEFAULT_BEAM_HEIGHT, DEFAULT_X_FOV, DEFAULT_Y_FOV,
+)
+from apollo14.elements.glass_block import GlassBlock
+from apollo14.elements.pupil import RectangularPupil
+from apollo14.elements.surface import PartialMirror
+from apollo14.jax_tracer import params_from_system
 from apollo14.units import mm
 
 from helios.eyebox import (
@@ -34,16 +41,21 @@ class OptVars(NamedTuple):
 
 # ── Setup ───────────────────────────────────────────────────────────────────
 
-config = CombinerConfig.default()
-base_params = params_from_config(config)
-n_glass = float(config.chassis.material.n(config.light.wavelength))
-M = config.num_mirrors
+system = build_default_system()
+base_params = params_from_system(system, DEFAULT_WAVELENGTH)
+
+chassis = next(e for e in system.elements if isinstance(e, GlassBlock))
+n_glass = float(chassis.material.n(DEFAULT_WAVELENGTH))
+
+mirrors = [e for e in system.elements if isinstance(e, PartialMirror)]
+pupil = next(e for e in system.elements if isinstance(e, RectangularPupil))
+M = len(mirrors)
 
 eyebox_radius = 3.0 * mm  # 6x6 mm eyebox
 eyebox_nx, eyebox_ny = 5, 5
 
 eyebox_pts = eyebox_grid_points(
-    config.pupil.center, config.pupil.normal, eyebox_radius,
+    pupil.position, pupil.normal, eyebox_radius,
     nx=eyebox_nx, ny=eyebox_ny)
 
 mc = EyeboxConfig(
@@ -58,15 +70,16 @@ mc = EyeboxConfig(
 )
 
 # Precompute the offset direction (mirrors step along -y, scaled by normal)
-mirror_y_width = config.mirror.y_width
-chassis_z = float(config.chassis.dimensions[2])
-mirror_edge_to_center_y = 0.5 * jnp.sqrt(mirror_y_width ** 2 - chassis_z ** 2)
-first_pos = (config.chassis.first_mirror_center -
-             jnp.array([0.0, float(mirror_edge_to_center_y), 0.0]))
-unit_offset = jnp.array([0.0, 1.0 / float(config.mirror.normal[1]), 0.0])
+first_pos = jnp.asarray(mirrors[0].position)
+mirror_normal = jnp.asarray(mirrors[0].normal)
+unit_offset = jnp.array([0.0, 1.0 / float(mirror_normal[1]), 0.0])
 
-# Initial values
-init_interval = config.chassis.distance_between_mirrors  # 1.47 mm
+# Initial interval: distance between first two mirrors projected along offset
+init_interval = float(jnp.dot(
+    jnp.asarray(mirrors[0].position) - jnp.asarray(mirrors[1].position),
+    unit_offset / jnp.dot(unit_offset, unit_offset),
+))
+
 init_vars = OptVars(
     reflectances=base_params.mirror_reflectances,  # (M, 3)
     intervals=jnp.full(M - 1, init_interval),      # (M-1,)
@@ -94,9 +107,9 @@ def loss_fn(v):
     params = vars_to_params(v)
     response, _ = compute_eyebox_response(
         params, n_glass,
-        config.light.position, config.light.direction,
-        config.light.beam_width, config.light.beam_height,
-        config.light.x_fov, config.light.y_fov,
+        DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
+        DEFAULT_BEAM_WIDTH, DEFAULT_BEAM_HEIGHT,
+        DEFAULT_X_FOV, DEFAULT_Y_FOV,
         eyebox_pts, mc,
     )
     return eyebox_merit(response, mc)
@@ -204,9 +217,9 @@ def compute_fov(v):
     params = vars_to_params(v)
     response, _ = compute_eyebox_response(
         params, n_glass,
-        config.light.position, config.light.direction,
-        config.light.beam_width, config.light.beam_height,
-        config.light.x_fov, config.light.y_fov,
+        DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
+        DEFAULT_BEAM_WIDTH, DEFAULT_BEAM_HEIGHT,
+        DEFAULT_X_FOV, DEFAULT_Y_FOV,
         eyebox_pts, mc,
     )
     return visible_fov(response, mc.visibility_threshold)

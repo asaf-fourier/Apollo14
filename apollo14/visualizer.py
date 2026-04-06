@@ -244,7 +244,7 @@ def plot_jax_pupil_fill(projector, params, n_glass,
 
     Args:
         projector: Projector instance (beam geometry for tracing).
-        params: CombinerParams from ``params_from_config()``.
+        params: CombinerParams from ``params_from_system()``.
         n_glass: Refractive index of chassis glass at trace wavelength.
         x_fov: Horizontal field of view (radians).
         y_fov: Vertical field of view (radians).

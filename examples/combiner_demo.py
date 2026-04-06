@@ -7,7 +7,15 @@ traces rays from a projector through it, and visualizes the result.
 
 import jax.numpy as jnp
 
-from apollo14.combiner import CombinerConfig, build_system
+from apollo14.combiner import (
+    build_default_system,
+    DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION, DEFAULT_WAVELENGTH,
+    DEFAULT_BEAM_WIDTH, DEFAULT_BEAM_HEIGHT, DEFAULT_X_FOV, DEFAULT_Y_FOV,
+    DEFAULT_NUM_X_STEPS, DEFAULT_NUM_Y_STEPS,
+)
+from apollo14.elements.aperture import RectangularAperture
+from apollo14.elements.glass_block import GlassBlock
+from apollo14.elements.pupil import RectangularPupil
 from apollo14.projector import Projector, scan_directions
 from apollo14.tracer import trace_nonsequential, TraceResult
 from apollo14.visualizer import plot_system, plot_pupil_fill
@@ -15,21 +23,25 @@ from apollo14.units import mm, nm, deg
 
 # ── Build the system ──────────────────────────────────────────────────────────
 
-config = CombinerConfig.default()
-system = build_system(config)
+system = build_default_system()
 
 print("System elements:")
 for elem in system.elements:
     print(f"  {elem.name}")
 
+# ── Extract elements for projector/merit setup ──────────────────────────────
+
+aperture = next(e for e in system.elements if isinstance(e, RectangularAperture))
+pupil = next(e for e in system.elements if isinstance(e, RectangularPupil))
+
 # ── Create a projector ────────────────────────────────────────────────────────
 
 projector = Projector.uniform(
-    position=config.light.position,
-    direction=config.light.direction,
-    beam_width=config.light.beam_width,
-    beam_height=config.light.beam_height,
-    wavelength=config.light.wavelength,
+    position=DEFAULT_LIGHT_POSITION,
+    direction=DEFAULT_LIGHT_DIRECTION,
+    beam_width=DEFAULT_BEAM_WIDTH,
+    beam_height=DEFAULT_BEAM_HEIGHT,
+    wavelength=DEFAULT_WAVELENGTH,
     nx=5, ny=3,
     intensity=1.0,
 )
@@ -42,7 +54,7 @@ origins, directions, intensities, pixels = projector.generate_rays()
 results: list[TraceResult] = []
 for i in range(origins.shape[0]):
     result = trace_nonsequential(
-        system, origins[i], directions[i], config.light.wavelength,
+        system, origins[i], directions[i], DEFAULT_WAVELENGTH,
         intensity=float(intensities[i]),
     )
     results.append(result)
@@ -58,11 +70,11 @@ if pupil_hits:
 
 print("\n── Angular scan ──")
 scan_dirs, scan_angles = scan_directions(
-    config.light.direction,
-    x_fov=config.light.x_fov,
-    y_fov=config.light.y_fov,
-    num_x=config.light.num_x_steps,
-    num_y=config.light.num_y_steps,
+    DEFAULT_LIGHT_DIRECTION,
+    x_fov=DEFAULT_X_FOV,
+    y_fov=DEFAULT_Y_FOV,
+    num_x=DEFAULT_NUM_X_STEPS,
+    num_y=DEFAULT_NUM_Y_STEPS,
 )
 
 all_results: list[TraceResult] = []
@@ -73,7 +85,7 @@ for iy in range(scan_dirs.shape[0]):
 
         for i in range(origins.shape[0]):
             result = trace_nonsequential(
-                system, origins[i], directions[i], config.light.wavelength,
+                system, origins[i], directions[i], DEFAULT_WAVELENGTH,
                 intensity=float(intensities[i]),
             )
             all_results.append(result)
@@ -88,15 +100,18 @@ if pupil_hits:
 # ── Per-mirror reflectance summary (JAX tracer) ─────────────────────────────
 
 print("\n── Per-mirror reflectance (on-axis, single ray) ──")
-from apollo14.jax_tracer import trace_ray, params_from_config
+from apollo14.jax_tracer import trace_ray, params_from_system
 
-params = params_from_config(config)
-n_glass = float(config.chassis.material.n(config.light.wavelength))
+params = params_from_system(system, DEFAULT_WAVELENGTH)
+chassis = next(e for e in system.elements if isinstance(e, GlassBlock))
+n_glass = float(chassis.material.n(DEFAULT_WAVELENGTH))
+num_mirrors = len([e for e in system.elements if hasattr(e, 'reflection_ratio') and hasattr(e, 'transmission_ratio')])
+
 pupil_pts, pupil_ints, pupil_valid = trace_ray(
-    config.light.position, config.light.direction, n_glass, params,
+    DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION, n_glass, params,
 )
 
-for i in range(config.num_mirrors):
+for i in range(num_mirrors):
     status = "hit pupil" if pupil_valid[i] else "missed"
     print(f"  mirror_{i}: reflected={float(pupil_ints[i]):.4f}  {status}")
 
@@ -116,18 +131,18 @@ merit_config = MeritConfig(
 
 # Use a beam that fits through the aperture
 merit_proj = Projector.uniform(
-    position=config.light.position,
-    direction=config.light.direction,
-    beam_width=config.aperture.width * 0.8,
-    beam_height=config.aperture.height * 0.8,
-    wavelength=config.light.wavelength,
+    position=DEFAULT_LIGHT_POSITION,
+    direction=DEFAULT_LIGHT_DIRECTION,
+    beam_width=aperture.width * 0.8,
+    beam_height=aperture.height * 0.8,
+    wavelength=DEFAULT_WAVELENGTH,
     nx=3, ny=3,
 )
 
 mse, simulated, target = evaluate_merit(
     system, merit_proj,
-    config.pupil.center, config.pupil.normal, config.pupil.width / 2,
-    x_fov=config.light.x_fov, y_fov=config.light.y_fov,
+    pupil.position, pupil.normal, pupil.width / 2,
+    x_fov=DEFAULT_X_FOV, y_fov=DEFAULT_Y_FOV,
     config=merit_config,
 )
 
@@ -152,20 +167,20 @@ print("\n── Rendering 3D view (Plotly) ──")
 
 # Trace rays for all scan angles for the interactive slider
 viz_proj = Projector.uniform(
-    position=config.light.position,
-    direction=config.light.direction,
-    beam_width=config.light.beam_width,
-    beam_height=config.light.beam_height,
-    wavelength=config.light.wavelength,
+    position=DEFAULT_LIGHT_POSITION,
+    direction=DEFAULT_LIGHT_DIRECTION,
+    beam_width=DEFAULT_BEAM_WIDTH,
+    beam_height=DEFAULT_BEAM_HEIGHT,
+    wavelength=DEFAULT_WAVELENGTH,
     nx=3, ny=3,
 )
 
 viz_scan_dirs, viz_scan_angles = scan_directions(
-    config.light.direction,
-    x_fov=config.light.x_fov,
-    y_fov=config.light.y_fov,
-    num_x=config.light.num_x_steps,
-    num_y=config.light.num_y_steps,
+    DEFAULT_LIGHT_DIRECTION,
+    x_fov=DEFAULT_X_FOV,
+    y_fov=DEFAULT_Y_FOV,
+    num_x=DEFAULT_NUM_X_STEPS,
+    num_y=DEFAULT_NUM_Y_STEPS,
 )
 
 viz_results: list[TraceResult] = []
@@ -175,7 +190,7 @@ for iy in range(viz_scan_dirs.shape[0]):
         origins, directions, intensities, _ = viz_proj.generate_rays(direction=d)
         for i in range(origins.shape[0]):
             viz_results.append(trace_nonsequential(
-                system, origins[i], directions[i], config.light.wavelength,
+                system, origins[i], directions[i], DEFAULT_WAVELENGTH,
                 intensity=float(intensities[i]),
             ))
 
@@ -191,21 +206,21 @@ from apollo14.elements.pupil import Pupil as PupilElement
 pupil_elem = [e for e in system.elements if isinstance(e, PupilElement)][0]
 
 fill_proj = Projector.uniform(
-    position=config.light.position,
-    direction=config.light.direction,
-    beam_width=config.aperture.width * 0.8,
-    beam_height=config.aperture.height * 0.8,
-    wavelength=config.light.wavelength,
+    position=DEFAULT_LIGHT_POSITION,
+    direction=DEFAULT_LIGHT_DIRECTION,
+    beam_width=aperture.width * 0.8,
+    beam_height=aperture.height * 0.8,
+    wavelength=DEFAULT_WAVELENGTH,
     nx=5, ny=5,
 )
 
 fig2 = plot_pupil_fill(
     system, fill_proj, pupil_elem,
-    x_fov=config.light.x_fov,
-    y_fov=config.light.y_fov,
+    x_fov=DEFAULT_X_FOV,
+    y_fov=DEFAULT_Y_FOV,
     num_x_angles=5,
     num_y_angles=5,
-    wavelength=config.light.wavelength,
+    wavelength=DEFAULT_WAVELENGTH,
     pixel_size=0.5,
 )
 fig2.write_html("examples/pupil_fill.html")
