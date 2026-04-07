@@ -5,7 +5,6 @@ Uses the CombinerPath API: the full optical path (aperture, entry face,
 mirrors, exit face, pupil) is specified once. No manual path construction.
 """
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -135,95 +134,28 @@ print("Saved: jax_tracer_demo.html")
 
 print("\n── Rendering 3D system with rays ──")
 
-from apollo14.elements.surface import PartialMirror
-from apollo14.elements.glass_block import GlassBlock
+from apollo14.tracer import jax_to_trace_result
 
-mirrors = [e for e in system.elements if isinstance(e, PartialMirror)]
-chassis = next(e for e in system.elements if isinstance(e, GlassBlock))
-entry_face = next(f for f in chassis.faces if f.name == "back")
-
-fig3d = plot_system(system, show=False)
-static_count = len(fig3d.data)
-
-angle_labels = []
+trace_results = []
 for iy in range(num_y):
     for ix in range(num_x):
         direction = scan_dirs[iy, ix]
         beam_origins, _, _, _ = projector.generate_rays(direction=direction)
 
-        all_pts, _, all_valid, _, _ = trace_combiner_beam(
+        pts, ints, valid, main_hits, branch_hits = trace_combiner_beam(
             beam_origins, direction, path, color_idx=0)
-        # all_pts: (N, M, 3), all_valid: (N, M)
-
-        x_coords, y_coords, z_coords = [], [], []
 
         for ri in range(beam_origins.shape[0]):
-            o = beam_origins[ri]
+            trace_results.append(jax_to_trace_result(
+                beam_origins[ri], direction,
+                pts[ri], ints[ri], valid[ri], main_hits[ri], branch_hits[ri],
+                system, DEFAULT_WAVELENGTH,
+            ))
 
-            # Entry point on chassis face
-            entry_n = jnp.asarray(entry_face.normal)
-            entry_p = jnp.asarray(entry_face.position)
-            denom = jnp.dot(direction, entry_n)
-            t_entry = jnp.dot(entry_p - o, entry_n) / denom
-            ep = o + jnp.maximum(t_entry, 0.0) * direction
+fig3d = plot_system(system, trace_results=trace_results,
+                    scan_angles=scan_angles, show=False)
 
-            # Incident ray: projector → chassis entry
-            x_coords.extend([float(o[0]), float(ep[0]), None])
-            y_coords.extend([float(o[1]), float(ep[1]), None])
-            z_coords.extend([float(o[2]), float(ep[2]), None])
-
-            # For each valid mirror hit, draw entry → mirror → pupil
-            from apollo14.geometry import snell_refract
-            n_glass = float(path.n_glass)
-            d_glass, _ = snell_refract(direction, entry_n, 1.0, n_glass)
-
-            for mi in range(len(mirrors)):
-                if all_valid[ri, mi]:
-                    pupil_pt = all_pts[ri, mi]
-                    m_pos = jnp.asarray(mirrors[mi].position)
-                    m_normal = jnp.asarray(mirrors[mi].normal)
-                    d_m = jnp.dot(d_glass, m_normal)
-                    t_m = jnp.dot(m_pos - ep, m_normal) / d_m
-                    mhit = ep + jnp.maximum(t_m, 0.0) * d_glass
-
-                    x_coords.extend([float(ep[0]), float(mhit[0]),
-                                     float(pupil_pt[0]), None])
-                    y_coords.extend([float(ep[1]), float(mhit[1]),
-                                     float(pupil_pt[1]), None])
-                    z_coords.extend([float(ep[2]), float(mhit[2]),
-                                     float(pupil_pt[2]), None])
-
-        ax = float(scan_angles[iy, ix, 0]) * 180 / np.pi
-        ay = float(scan_angles[iy, ix, 1]) * 180 / np.pi
-        label = f"({ax:.1f}, {ay:.1f}) deg"
-        angle_labels.append(label)
-
-        fig3d.add_trace(go.Scatter3d(
-            x=x_coords, y=y_coords, z=z_coords,
-            mode='lines',
-            line=dict(color='rgba(0,100,255,0.7)', width=1),
-            name=label,
-            hoverinfo='name',
-            visible=(iy == 0 and ix == 0),
-        ))
-
-# Angle slider
-n_angles = len(angle_labels)
-steps = []
-for i, label in enumerate(angle_labels):
-    vis = [True] * static_count + [False] * n_angles
-    vis[static_count + i] = True
-    steps.append(dict(args=[{'visible': vis}], label=label, method='restyle'))
-
-fig3d.update_layout(
-    title='JAX Tracer — 3D Ray Visualization',
-    sliders=[dict(
-        pad=dict(b=10, t=60), len=0.9, x=0.1, y=0,
-        steps=steps,
-        currentvalue=dict(prefix="Angle: "),
-    )],
-)
-
+fig3d.update_layout(title='JAX Tracer — 3D Ray Visualization')
 fig3d.show()
 fig3d.write_html("jax_tracer_3d.html")
 print("Saved: jax_tracer_3d.html")
