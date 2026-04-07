@@ -159,4 +159,20 @@ fig3d.update_layout(title='JAX Tracer — 3D Ray Visualization')
 fig3d.show()
 fig3d.write_html("jax_tracer_3d.html")
 print("Saved: jax_tracer_3d.html")
+
+# ── Pupil coverage report ───────────────────────────────────────────────────
+
+print("\n── Rendering pupil coverage ──")
+
+from helios.reports import pupil_coverage_report
+
+fig_cov = pupil_coverage_report(
+    system, projector, DEFAULT_WAVELENGTH,
+    x_fov=x_fov, y_fov=y_fov,
+    num_x_angles=num_x, num_y_angles=num_y,
+    cell_size=2.0, show=True,
+)
+fig_cov.write_html("jax_tracer_pupil_coverage.html")
+print("Saved: jax_tracer_pupil_coverage.html")
+
 print("\nDone.")
