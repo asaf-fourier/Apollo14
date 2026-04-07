@@ -752,3 +752,343 @@ def params_from_system(system, wavelength) -> CombinerParams:
         pupil_local_x=plx,
         pupil_local_y=ply,
     )
+
+
+# ���─ CombinerPath API ─────────────���─────────────────────────────────────────
+#
+# High-level, JIT-compatible API. The user specifies the full optical path
+# (aperture, entry face, mirrors, exit face, pupil) declaratively.
+# The tracer handles all mechanics — no tracing logic in demos.
+
+class CombinerPath(NamedTuple):
+    """Complete combiner optical path as JAX arrays.
+
+    All fields are JAX arrays — fully JIT and grad compatible.
+    Build with ``combiner_path_from_system()``.
+
+    The path encodes::
+
+        aperture (clips beam) → entry face (air→glass refraction)
+        → M mirrors (partial reflection) → exit face (glass→air) → pupil (target)
+    """
+    # Mirrors
+    mirror_positions: jnp.ndarray       # (M, 3)
+    mirror_normals: jnp.ndarray         # (M, 3)
+    mirror_reflectances: jnp.ndarray    # (M, 3) per-color [R,G,B]
+    mirror_half_widths: jnp.ndarray     # (M,)
+    mirror_half_heights: jnp.ndarray    # (M,)
+    mirror_local_x: jnp.ndarray        # (M, 3)
+    mirror_local_y: jnp.ndarray        # (M, 3)
+    # Entry face (chassis entry — air → glass)
+    entry_position: jnp.ndarray         # (3,)
+    entry_normal: jnp.ndarray           # (3,) outward normal
+    entry_half_width: jnp.ndarray       # scalar
+    entry_half_height: jnp.ndarray      # scalar
+    entry_local_x: jnp.ndarray          # (3,)
+    entry_local_y: jnp.ndarray          # (3,)
+    # Exit face (chassis exit — glass → air)
+    exit_position: jnp.ndarray          # (3,)
+    exit_normal: jnp.ndarray            # (3,) outward normal
+    exit_half_width: jnp.ndarray        # scalar
+    exit_half_height: jnp.ndarray       # scalar
+    exit_local_x: jnp.ndarray           # (3,)
+    exit_local_y: jnp.ndarray           # (3,)
+    # Pupil (target detector)
+    pupil_center: jnp.ndarray           # (3,)
+    pupil_normal: jnp.ndarray           # (3,)
+    pupil_half_width: jnp.ndarray       # scalar
+    pupil_half_height: jnp.ndarray      # scalar
+    pupil_local_x: jnp.ndarray          # (3,)
+    pupil_local_y: jnp.ndarray          # (3,)
+    # Aperture (optional clipping plane)
+    aperture_position: jnp.ndarray      # (3,)
+    aperture_normal: jnp.ndarray        # (3,)
+    aperture_half_width: jnp.ndarray    # scalar
+    aperture_half_height: jnp.ndarray   # scalar
+    aperture_local_x: jnp.ndarray       # (3,)
+    aperture_local_y: jnp.ndarray       # (3,)
+    has_aperture: jnp.ndarray           # bool scalar
+    # Glass
+    n_glass: jnp.ndarray                # scalar
+
+
+def _face_geometry(face):
+    """Extract (position, normal, half_w, half_h, local_x, local_y) from a GlassFace."""
+    n = normalize(jnp.asarray(face.normal))
+    lx, ly = compute_local_axes(n)
+    deltas = face.vertices - face.position
+    proj_x = jnp.array([float(jnp.dot(d, lx)) for d in deltas])
+    proj_y = jnp.array([float(jnp.dot(d, ly)) for d in deltas])
+    half_w = float(jnp.max(jnp.abs(proj_x)))
+    half_h = float(jnp.max(jnp.abs(proj_y)))
+    return jnp.asarray(face.position), n, jnp.array(half_w), jnp.array(half_h), lx, ly
+
+
+def combiner_path_from_system(system, wavelength,
+                               entry_face_name="back",
+                               exit_face_name="top") -> CombinerPath:
+    """Build a CombinerPath from an OpticalSystem.
+
+    Extracts mirrors, chassis faces, pupil, and aperture from the system.
+    All geometry is converted to JAX arrays for JIT/grad compatibility.
+
+    Args:
+        system: OpticalSystem with GlassBlock, PartialMirror,
+            RectangularPupil, and optionally RectangularAperture.
+        wavelength: Trace wavelength (for computing n_glass).
+        entry_face_name: Name of the chassis face where light enters.
+        exit_face_name: Name of the chassis face where reflected light exits.
+    """
+    from apollo14.elements.surface import PartialMirror as _PM
+    from apollo14.elements.glass_block import GlassBlock as _GB
+    from apollo14.elements.pupil import RectangularPupil as _RP
+    from apollo14.elements.aperture import RectangularAperture as _RA
+
+    mirrors = [e for e in system.elements if isinstance(e, _PM)]
+    chassis = next(e for e in system.elements if isinstance(e, _GB))
+    pupil = next(e for e in system.elements if isinstance(e, _RP))
+    aperture = next((e for e in system.elements if isinstance(e, _RA)), None)
+
+    entry_face = next(f for f in chassis.faces if f.name == entry_face_name)
+    exit_face = next(f for f in chassis.faces if f.name == exit_face_name)
+    n_glass = float(chassis.material.n(wavelength))
+
+    m = len(mirrors)
+
+    # Mirror geometry
+    positions = jnp.stack([jnp.asarray(mir.position) for mir in mirrors])
+    normals = jnp.stack([jnp.asarray(mir.normal) for mir in mirrors])
+    reflectances = jnp.stack([
+        jnp.full(3, float(mir.reflection_ratio)) for mir in mirrors
+    ])
+    half_widths = jnp.array([mir.width / 2 for mir in mirrors])
+    half_heights = jnp.array([mir.height / 2 for mir in mirrors])
+    lx_list, ly_list = [], []
+    for mir in mirrors:
+        lx, ly = compute_local_axes(jnp.asarray(mir.normal))
+        lx_list.append(lx)
+        ly_list.append(ly)
+
+    # Face geometry
+    ep, en, ehw, ehh, elx, ely = _face_geometry(entry_face)
+    xp, xn, xhw, xhh, xlx, xly = _face_geometry(exit_face)
+
+    # Pupil
+    pn = normalize(jnp.asarray(pupil.normal))
+    plx, ply = compute_local_axes(pn)
+
+    # Aperture (dummy values if absent)
+    if aperture is not None:
+        an = normalize(jnp.asarray(aperture.normal))
+        alx, aly = compute_local_axes(an)
+        ap, ahw, ahh = jnp.asarray(aperture.position), jnp.array(aperture.width / 2), jnp.array(aperture.height / 2)
+        has_ap = jnp.array(True)
+    else:
+        an = jnp.zeros(3)
+        alx, aly = jnp.zeros(3), jnp.zeros(3)
+        ap, ahw, ahh = jnp.zeros(3), jnp.array(0.0), jnp.array(0.0)
+        has_ap = jnp.array(False)
+
+    return CombinerPath(
+        mirror_positions=positions,
+        mirror_normals=normals,
+        mirror_reflectances=reflectances,
+        mirror_half_widths=half_widths,
+        mirror_half_heights=half_heights,
+        mirror_local_x=jnp.stack(lx_list),
+        mirror_local_y=jnp.stack(ly_list),
+        entry_position=ep, entry_normal=en,
+        entry_half_width=ehw, entry_half_height=ehh,
+        entry_local_x=elx, entry_local_y=ely,
+        exit_position=xp, exit_normal=xn,
+        exit_half_width=xhw, exit_half_height=xhh,
+        exit_local_x=xlx, exit_local_y=xly,
+        pupil_center=jnp.asarray(pupil.position), pupil_normal=pn,
+        pupil_half_width=jnp.array(pupil.width / 2),
+        pupil_half_height=jnp.array(pupil.height / 2),
+        pupil_local_x=plx, pupil_local_y=ply,
+        aperture_position=ap, aperture_normal=an,
+        aperture_half_width=ahw, aperture_half_height=ahh,
+        aperture_local_x=alx, aperture_local_y=aly,
+        has_aperture=has_ap,
+        n_glass=jnp.array(n_glass),
+    )
+
+
+def _build_combiner_steps(path, direction):
+    """Build PathStep arrays from a CombinerPath for a given ray direction.
+
+    Entry refraction uses the actual entry face geometry (not AABB).
+    Exit face is a single user-specified face for all mirror branches.
+
+    Args:
+        path: CombinerPath with system geometry.
+        direction: (3,) ray direction in air (before entry).
+
+    Returns:
+        d_glass: (3,) refracted direction inside the chassis.
+        main_steps: PathStep with (M,) arrays — M mirrors.
+        branch_steps: PathStep with (M, 2) arrays — exit + pupil per mirror.
+    """
+    # Entry refraction using actual face normal
+    d_glass, _ = snell_refract(direction, path.entry_normal, 1.0, path.n_glass)
+
+    m = path.mirror_positions.shape[0]
+
+    # Main path: M partial mirrors
+    main_steps = PathStep(
+        position=path.mirror_positions,
+        normal=path.mirror_normals,
+        half_width=path.mirror_half_widths,
+        half_height=path.mirror_half_heights,
+        local_x=path.mirror_local_x,
+        local_y=path.mirror_local_y,
+        interaction=jnp.full(m, PARTIAL, dtype=jnp.int32),
+        n1=jnp.ones(m),
+        n2=jnp.ones(m),
+        reflectance=path.mirror_reflectances,
+        use_circular=jnp.zeros(m, dtype=bool),
+        radius=jnp.zeros(m),
+    )
+
+    # Branch: exit face (REFRACT) + pupil (TARGET), tiled M times
+    exit_steps = PathStep(
+        position=jnp.tile(path.exit_position, (m, 1)),
+        normal=jnp.tile(path.exit_normal, (m, 1)),
+        half_width=jnp.full(m, path.exit_half_width),
+        half_height=jnp.full(m, path.exit_half_height),
+        local_x=jnp.tile(path.exit_local_x, (m, 1)),
+        local_y=jnp.tile(path.exit_local_y, (m, 1)),
+        interaction=jnp.full(m, REFRACT, dtype=jnp.int32),
+        n1=jnp.full(m, path.n_glass),
+        n2=jnp.ones(m),
+        reflectance=jnp.zeros((m, 3)),
+        use_circular=jnp.zeros(m, dtype=bool),
+        radius=jnp.zeros(m),
+    )
+
+    pupil_steps = PathStep(
+        position=jnp.tile(path.pupil_center, (m, 1)),
+        normal=jnp.tile(path.pupil_normal, (m, 1)),
+        half_width=jnp.full(m, path.pupil_half_width),
+        half_height=jnp.full(m, path.pupil_half_height),
+        local_x=jnp.tile(path.pupil_local_x, (m, 1)),
+        local_y=jnp.tile(path.pupil_local_y, (m, 1)),
+        interaction=jnp.full(m, TARGET, dtype=jnp.int32),
+        n1=jnp.ones(m),
+        n2=jnp.ones(m),
+        reflectance=jnp.zeros((m, 3)),
+        use_circular=jnp.zeros(m, dtype=bool),
+        radius=jnp.zeros(m),
+    )
+
+    branch_steps = jax.tree.map(
+        lambda a, b: jnp.stack([a, b], axis=1),
+        exit_steps, pupil_steps,
+    )
+
+    return d_glass, main_steps, branch_steps
+
+
+def _entry_intensity(origin, direction, path):
+    """Compute entry point and initial intensity with aperture + face bounds.
+
+    Returns:
+        entry_point: (3,) point on the entry face.
+        intensity: scalar, 1.0 if ray passes aperture and hits entry face, else 0.0.
+    """
+    # Aperture check (before entry face)
+    t_ap = _plane_t(origin, direction, path.aperture_normal, path.aperture_position)
+    ap_hit = origin + jnp.maximum(t_ap, 0.0) * direction
+    ap_delta = ap_hit - path.aperture_position
+    in_aperture = (
+        (jnp.abs(jnp.dot(ap_delta, path.aperture_local_x)) <= path.aperture_half_width) &
+        (jnp.abs(jnp.dot(ap_delta, path.aperture_local_y)) <= path.aperture_half_height)
+    )
+    # If no aperture, always pass
+    in_aperture = jnp.where(path.has_aperture, in_aperture, True)
+
+    # Entry face intersection
+    t_entry = _plane_t(origin, direction, path.entry_normal, path.entry_position)
+    entry_point = origin + jnp.maximum(t_entry, 0.0) * direction
+
+    # Entry face bounds check
+    e_delta = entry_point - path.entry_position
+    in_entry = (
+        (jnp.abs(jnp.dot(e_delta, path.entry_local_x)) <= path.entry_half_width) &
+        (jnp.abs(jnp.dot(e_delta, path.entry_local_y)) <= path.entry_half_height) &
+        (t_entry > 0)
+    )
+
+    intensity = jnp.where(in_aperture & in_entry, 1.0, 0.0)
+    return entry_point, intensity
+
+
+def trace_combiner_ray(origin, direction, path, color_idx=0):
+    """Trace one ray through the combiner.
+
+    Handles aperture clipping, entry face refraction, mirror reflections,
+    exit face refraction, and pupil detection.
+
+    Args:
+        origin: (3,) ray start position (outside chassis).
+        direction: (3,) ray direction (normalized).
+        path: CombinerPath with system geometry.
+        color_idx: color channel index (0=R, 1=G, 2=B).
+
+    Returns:
+        endpoints: (M, 3) where each mirror's reflected ray ends up.
+        intensities: (M,) reflected intensity per mirror.
+        valid: (M,) bool — True if the reflection reaches the pupil.
+    """
+    d_glass, main_steps, branch_steps = _build_combiner_steps(path, direction)
+    entry_point, intensity = _entry_intensity(origin, direction, path)
+    return trace_path(entry_point, d_glass, intensity,
+                      main_steps, branch_steps, color_idx)
+
+
+def trace_combiner_beam(origins, direction, path, color_idx=0):
+    """Trace a beam of rays sharing the same direction.
+
+    Optimized: path steps are built once (shared direction), then
+    vmapped over ray origins. Aperture and entry face checks per ray.
+
+    Args:
+        origins: (N, 3) ray start positions.
+        direction: (3,) shared direction (normalized).
+        path: CombinerPath with system geometry.
+        color_idx: color channel index (0=R, 1=G, 2=B).
+
+    Returns:
+        endpoints: (N, M, 3) hit positions on pupil plane.
+        intensities: (N, M) reflected intensity per mirror per ray.
+        valid: (N, M) bool mask.
+    """
+    d_glass, main_steps, branch_steps = _build_combiner_steps(path, direction)
+
+    def _trace_single(origin):
+        entry_point, intensity = _entry_intensity(origin, direction, path)
+        return trace_path(entry_point, d_glass, intensity,
+                          main_steps, branch_steps, color_idx)
+
+    return jax.vmap(_trace_single)(origins)
+
+
+def trace_combiner_batch(origins, directions, path, color_idx=0):
+    """Trace rays with different directions (e.g. FOV scan).
+
+    Each ray gets its own origin and direction. Path steps are rebuilt
+    per direction.
+
+    Args:
+        origins: (N, 3) ray start positions.
+        directions: (N, 3) per-ray directions (normalized).
+        path: CombinerPath with system geometry.
+        color_idx: color channel index (0=R, 1=G, 2=B).
+
+    Returns:
+        endpoints: (N, M, 3), intensities: (N, M), valid: (N, M).
+    """
+    return jax.vmap(
+        lambda o, d: trace_combiner_ray(o, d, path, color_idx)
+    )(origins, directions)

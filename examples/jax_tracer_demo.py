@@ -1,8 +1,8 @@
 """
-JAX tracer demo — explicit path construction with RGB color scanning.
+JAX tracer demo — RGB color scanning across FOV.
 
-Builds the complete optical path from elements: entry face → mirrors → exit face → pupil.
-Scans a projector beam across the FOV in R/G/B at 1-degree steps.
+Uses the CombinerPath API: the full optical path (aperture, entry face,
+mirrors, exit face, pupil) is specified once. No manual path construction.
 """
 
 import jax
@@ -13,53 +13,20 @@ from apollo14.combiner import (
     build_default_system,
     DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION, DEFAULT_WAVELENGTH,
 )
-from apollo14.elements.glass_block import GlassBlock
-from apollo14.elements.pupil import RectangularPupil
-from apollo14.elements.surface import PartialMirror
 from apollo14.jax_tracer import (
-    partial, refract, target, stack_path, trace_path,
+    combiner_path_from_system, trace_combiner_beam,
 )
 from apollo14.projector import Projector, scan_directions
 from apollo14.visualizer import plot_system
 from apollo14.units import mm, deg
 
-# ── Build system ─────────────────────────────────────────────────────────────
+# ── Build system and path ────────────────────────────────────────────────────
 
 system = build_default_system()
-chassis = next(e for e in system.elements if isinstance(e, GlassBlock))
-n_glass = float(chassis.material.n(DEFAULT_WAVELENGTH))
+path = combiner_path_from_system(system, DEFAULT_WAVELENGTH)
 
-# ── Extract elements from the built system ───────────────────────────────────
-
-mirrors = [e for e in system.elements if isinstance(e, PartialMirror)]
-pupil = next(e for e in system.elements if isinstance(e, RectangularPupil))
-entry_face = next(f for f in chassis.faces if f.name == "back")
-exit_face = next(f for f in chassis.faces if f.name == "top")
-
-print(f"System: {len(mirrors)} mirrors, chassis ({chassis.name}), pupil ({pupil.name})")
-print(f"Entry face: {entry_face.name} (normal={entry_face.normal})")
-print(f"Exit face: {exit_face.name} (normal={exit_face.normal})")
-
-# ── Build complete optical path from elements ────────────────────────────────
-#
-# Main path: entry face (air→glass) → mirror_0 → mirror_1 → ... → mirror_5
-# Branch per step:
-#   - entry face (REFRACT): dummy branch (no reflection, 0 intensity)
-#   - each mirror (PARTIAL): exit face (glass→air) → pupil (TARGET)
-
-main_list = (
-    [refract(entry_face, n1=1.0, n2=n_glass)]
-    + [partial(m) for m in mirrors]
-)
-
-mirror_branch = [refract(exit_face, n1=n_glass, n2=1.0), target(pupil)]
-# The entry step is REFRACT, so its branch produces 0 intensity — reuse same structure
-branch_lists = [mirror_branch] * len(main_list)
-
-main_steps, branch_steps = stack_path(main_list, branch_lists)
-
-# Output of trace_path: (M+1,) arrays where index 0 = entry step (always 0 intensity),
-# indices 1..M = mirror branches.
+print(f"System: {path.mirror_positions.shape[0]} mirrors, "
+      f"n_glass={float(path.n_glass):.3f}, aperture={bool(path.has_aperture)}")
 
 # ── Projector setup ──────────────────────────────────────────────────────────
 
@@ -82,11 +49,9 @@ projector = Projector.uniform(
     nx=5, ny=5,
 )
 
-print(f"\nScan: {num_x}x{num_y} angles ({num_x * num_y} total), "
-      f"FOV {x_fov/deg:.0f}x{y_fov/deg:.0f} deg, step {step/deg:.0f} deg")
+print(f"Scan: {num_x}x{num_y} angles, FOV {x_fov/deg:.0f}x{y_fov/deg:.0f} deg")
 print(f"Beam: {projector.nx}x{projector.ny} rays, "
       f"{projector.beam_width/mm:.0f}x{projector.beam_height/mm:.0f} mm")
-print(f"Colors: R, G, B (3 channels)")
 
 # ── Trace RGB across all angles ──────────────────────────────────────────────
 
@@ -99,17 +64,10 @@ for iy in range(num_y):
         direction = scan_dirs[iy, ix]
         beam_origins, _, _, _ = projector.generate_rays(direction=direction)
 
-        def _trace_single(origin, color_idx):
-            endpoints, intensities, valid = trace_path(
-                origin, direction, jnp.array(1.0),
-                main_steps, branch_steps, color_idx)
-            # Skip index 0 (entry face REFRACT step — always 0 intensity)
-            return jnp.where(valid[1:], intensities[1:], 0.0).sum()
-
         for ci in range(3):
-            trace_color = jax.vmap(lambda o: _trace_single(o, ci))
-            total = float(trace_color(beam_origins).sum())
-            result[iy, ix, ci] = total
+            _, ints, valid = trace_combiner_beam(
+                beam_origins, direction, path, color_idx=ci)
+            result[iy, ix, ci] = float(jnp.where(valid, ints, 0.0).sum())
 
 # ── Print summary ────────────────────────────────────────────────────────────
 
@@ -163,7 +121,7 @@ fig.add_trace(go.Heatmap(
 ), row=1, col=4)
 
 fig.update_layout(
-    title='RGB FOV scan — per-color pupil intensity (explicit paths)',
+    title='RGB FOV scan — per-color pupil intensity',
     height=400, width=1200,
 )
 for col in range(1, 5):
@@ -177,6 +135,13 @@ print("Saved: jax_tracer_demo.html")
 
 print("\n── Rendering 3D system with rays ──")
 
+from apollo14.elements.surface import PartialMirror
+from apollo14.elements.glass_block import GlassBlock
+
+mirrors = [e for e in system.elements if isinstance(e, PartialMirror)]
+chassis = next(e for e in system.elements if isinstance(e, GlassBlock))
+entry_face = next(f for f in chassis.faces if f.name == "back")
+
 fig3d = plot_system(system, show=False)
 static_count = len(fig3d.data)
 
@@ -186,44 +151,41 @@ for iy in range(num_y):
         direction = scan_dirs[iy, ix]
         beam_origins, _, _, _ = projector.generate_rays(direction=direction)
 
-        # Trace all rays — full path including entry refraction
-        def _trace_full(origin):
-            endpoints, intensities, valid = trace_path(
-                origin, direction, jnp.array(1.0),
-                main_steps, branch_steps, color_idx=0)
-            return endpoints, valid
-
-        all_pts, all_valid = jax.vmap(_trace_full)(beam_origins)
-        # all_pts: (N, M+1, 3), all_valid: (N, M+1)
-        # index 0 = entry face branch endpoint (dummy), 1..M = mirror branches
+        _, all_pts_batch, all_valid_batch = (
+            lambda origins: trace_combiner_beam(origins, direction, path, color_idx=0)
+        )(beam_origins)
+        # Unpack: trace_combiner_beam returns (pts, ints, valid)
+        all_pts, _, all_valid = trace_combiner_beam(
+            beam_origins, direction, path, color_idx=0)
+        # all_pts: (N, M, 3), all_valid: (N, M)
 
         x_coords, y_coords, z_coords = [], [], []
 
         for ri in range(beam_origins.shape[0]):
             o = beam_origins[ri]
 
-            # Find entry point: intersection of ray with entry face plane
+            # Entry point on chassis face
             entry_n = jnp.asarray(entry_face.normal)
             entry_p = jnp.asarray(entry_face.position)
             denom = jnp.dot(direction, entry_n)
             t_entry = jnp.dot(entry_p - o, entry_n) / denom
             ep = o + jnp.maximum(t_entry, 0.0) * direction
 
-            # Incident ray: projector origin → chassis entry
+            # Incident ray: projector → chassis entry
             x_coords.extend([float(o[0]), float(ep[0]), None])
             y_coords.extend([float(o[1]), float(ep[1]), None])
             z_coords.extend([float(o[2]), float(ep[2]), None])
 
             # For each valid mirror hit, draw entry → mirror → pupil
+            from apollo14.geometry import snell_refract
+            n_glass = float(path.n_glass)
+            d_glass, _ = snell_refract(direction, entry_n, 1.0, n_glass)
+
             for mi in range(len(mirrors)):
-                if all_valid[ri, mi + 1]:  # +1 because index 0 is entry step
-                    pupil_pt = all_pts[ri, mi + 1]
-                    # Compute mirror hit point (ray-plane intersection in glass)
+                if all_valid[ri, mi]:
+                    pupil_pt = all_pts[ri, mi]
                     m_pos = jnp.asarray(mirrors[mi].position)
                     m_normal = jnp.asarray(mirrors[mi].normal)
-                    # Refracted direction inside glass (approximate from entry normal)
-                    from apollo14.geometry import snell_refract
-                    d_glass, _ = snell_refract(direction, entry_n, 1.0, n_glass)
                     d_m = jnp.dot(d_glass, m_normal)
                     t_m = jnp.dot(m_pos - ep, m_normal) / d_m
                     mhit = ep + jnp.maximum(t_m, 0.0) * d_glass
@@ -258,7 +220,7 @@ for i, label in enumerate(angle_labels):
     steps.append(dict(args=[{'visible': vis}], label=label, method='restyle'))
 
 fig3d.update_layout(
-    title='JAX Tracer — 3D Ray Visualization (explicit paths)',
+    title='JAX Tracer — 3D Ray Visualization',
     sliders=[dict(
         pad=dict(b=10, t=60), len=0.9, x=0.1, y=0,
         steps=steps,
