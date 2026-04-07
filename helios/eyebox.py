@@ -195,7 +195,7 @@ def compute_eyebox_response(params, n_glass, projector_pos, projector_dir,
             origins = _beam_origins(projector_pos, d, beam_width, beam_height,
                                    config.n_beam_x, config.n_beam_y)
             # trace_beam: shared direction, multiple origins
-            pts, ints, valid = trace_beam(origins, d, n_glass, params, ci)
+            pts, ints, valid, _, _ = trace_beam(origins, d, n_glass, params, ci)
             # pts: (R, M, 3), ints: (R, M), valid: (R, M)
             # Flatten rays × mirrors → (R*M,)
             R, M = ints.shape

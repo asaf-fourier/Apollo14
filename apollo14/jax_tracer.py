@@ -91,14 +91,17 @@ Usage — generic path
     main_steps, branch_steps = stack_path(main, branches)
 
     # Trace
-    endpoints, intensities, valid = trace_path(
+    endpoints, intensities, valid, main_hits, branch_hits = trace_path(
         origin, direction, jnp.array(1.0),
         main_steps, branch_steps, color_idx=0)
+
+    # main_hits: (M, 3) — where the ray hit each main-path surface
+    # branch_hits: (M, B, 3) — intermediate points along each branch
 
     # Batch with vmap:
     trace_many = jax.vmap(lambda o: trace_path(
         o, direction, jnp.array(1.0), main_steps, branch_steps))
-    all_endpoints, all_ints, all_valid = trace_many(origins)
+    all_endpoints, all_ints, all_valid, all_main, all_branch = trace_many(origins)
 
 Usage — combiner convenience
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -114,10 +117,12 @@ For the AR combiner system, helper functions build the paths from
     # n_glass is computed internally by params_from_system
 
     # Beam of rays with shared direction (most efficient)
-    pts, intensities, valid = trace_beam(origins, direction, n_glass, params)
+    pts, intensities, valid, main_hits, branch_hits = trace_beam(
+        origins, direction, n_glass, params)
 
     # Single ray
-    pts, intensities, valid = trace_ray(origin, direction, n_glass, params)
+    pts, intensities, valid, main_hits, branch_hits = trace_ray(
+        origin, direction, n_glass, params)
 """
 
 from __future__ import annotations
@@ -381,6 +386,8 @@ def trace_path(origin, direction, intensity, main_steps, branch_steps,
         branch_endpoints: (M, 3) where each branch ray ends up
         branch_intensities: (M,) reflected intensity per main step
         branch_valid: (M,) whether each branch reached its target
+        main_hits: (M, 3) hit point on each main-path surface
+        branch_hits: (M, B, 3) hit point at each branch step
     """
 
     def _branch_step(carry, step):
@@ -407,7 +414,7 @@ def trace_path(origin, direction, intensity, main_steps, branch_steps,
         new_d = jnp.where(is_refract, d_refr, d)
         new_valid = valid & in_bounds & jnp.where(is_refract, ~is_tir, True)
 
-        return (hit, new_d, inten, new_valid), None
+        return (hit, new_d, inten, new_valid), hit
 
     def _main_step(carry, step_and_branch):
         """Process one main-path surface (mirror / interface)."""
@@ -439,7 +446,7 @@ def trace_path(origin, direction, intensity, main_steps, branch_steps,
 
         # Trace branch (reflected ray through branch steps)
         branch_init = (hit, d_refl, refl_int, in_bounds)
-        (branch_end, _, _, branch_valid), _ = jax.lax.scan(
+        (branch_end, _, _, branch_valid), branch_hits = jax.lax.scan(
             _branch_step, branch_init, branch)
 
         # Update main-path carry
@@ -448,13 +455,15 @@ def trace_path(origin, direction, intensity, main_steps, branch_steps,
         new_inten = jnp.where(is_partial, trans_int, inten)
         new_pos = jnp.where(in_bounds, hit, pos)
 
-        return (new_pos, new_d, new_inten), (branch_end, refl_int, branch_valid)
+        return (new_pos, new_d, new_inten), (branch_end, refl_int, branch_valid,
+                                              hit, branch_hits)
 
     init = (origin, direction, intensity)
-    _, (endpoints, intensities, valids) = jax.lax.scan(
+    _, (endpoints, intensities, valids,
+        main_hits, branch_hits) = jax.lax.scan(
         _main_step, init, (main_steps, branch_steps))
 
-    return endpoints, intensities, valids
+    return endpoints, intensities, valids, main_hits, branch_hits
 
 
 # ── Combiner path builder ───────────────────────────────────────────────────
@@ -589,6 +598,8 @@ def trace_ray(origin, direction, n_glass, params, color_idx=0):
         pupil_points: (M, 3) where each reflected ray hits the pupil plane
         pupil_intensities: (M,) reflected intensity per mirror
         pupil_valid: (M,) bool — True if the reflection reaches the pupil
+        main_hits: (M, 3) hit point on each mirror surface
+        branch_hits: (M, B, 3) hit point at each branch step
     """
     _, d_glass, main_steps, branch_steps = build_combiner_paths(
         params, n_glass, direction)
@@ -608,7 +619,8 @@ def trace_batch(origins, directions, n_glass, params, color_idx=0):
 
         origins:    (N, 3)
         directions: (N, 3)
-        -> pupil_points (N, M, 3), intensities (N, M), valid (N, M)
+        -> pupil_points (N, M, 3), intensities (N, M), valid (N, M),
+           main_hits (N, M, 3), branch_hits (N, M, B, 3)
     """
     return jax.vmap(
         lambda o, d: trace_ray(o, d, n_glass, params, color_idx)
@@ -634,6 +646,8 @@ def trace_beam(origins, direction, n_glass, params, color_idx=0):
         pupil_points: (N, M, 3) hit positions on pupil plane
         pupil_intensities: (N, M) reflected intensity per mirror per ray
         pupil_valid: (N, M) bool mask
+        main_hits: (N, M, 3) hit point on each mirror per ray
+        branch_hits: (N, M, B, 3) hit point at each branch step per ray
     """
     # Build paths once (shared direction) — the beam optimization
     _, d_glass, main_steps, branch_steps = build_combiner_paths(
@@ -1040,6 +1054,8 @@ def trace_combiner_ray(origin, direction, path, color_idx=0):
         endpoints: (M, 3) where each mirror's reflected ray ends up.
         intensities: (M,) reflected intensity per mirror.
         valid: (M,) bool — True if the reflection reaches the pupil.
+        main_hits: (M, 3) hit point on each mirror surface.
+        branch_hits: (M, B, 3) hit point at each branch step.
     """
     d_glass, main_steps, branch_steps = _build_combiner_steps(path, direction)
     entry_point, intensity = _entry_intensity(origin, direction, path)
@@ -1063,6 +1079,8 @@ def trace_combiner_beam(origins, direction, path, color_idx=0):
         endpoints: (N, M, 3) hit positions on pupil plane.
         intensities: (N, M) reflected intensity per mirror per ray.
         valid: (N, M) bool mask.
+        main_hits: (N, M, 3) hit point on each mirror per ray.
+        branch_hits: (N, M, B, 3) hit point at each branch step per ray.
     """
     d_glass, main_steps, branch_steps = _build_combiner_steps(path, direction)
 
@@ -1087,7 +1105,8 @@ def trace_combiner_batch(origins, directions, path, color_idx=0):
         color_idx: color channel index (0=R, 1=G, 2=B).
 
     Returns:
-        endpoints: (N, M, 3), intensities: (N, M), valid: (N, M).
+        endpoints: (N, M, 3), intensities: (N, M), valid: (N, M),
+        main_hits: (N, M, 3), branch_hits: (N, M, B, 3).
     """
     return jax.vmap(
         lambda o, d: trace_combiner_ray(o, d, path, color_idx)

@@ -65,7 +65,7 @@ for iy in range(num_y):
         beam_origins, _, _, _ = projector.generate_rays(direction=direction)
 
         for ci in range(3):
-            _, ints, valid = trace_combiner_beam(
+            _, ints, valid, _, _ = trace_combiner_beam(
                 beam_origins, direction, path, color_idx=ci)
             result[iy, ix, ci] = float(jnp.where(valid, ints, 0.0).sum())
 
@@ -151,11 +151,7 @@ for iy in range(num_y):
         direction = scan_dirs[iy, ix]
         beam_origins, _, _, _ = projector.generate_rays(direction=direction)
 
-        _, all_pts_batch, all_valid_batch = (
-            lambda origins: trace_combiner_beam(origins, direction, path, color_idx=0)
-        )(beam_origins)
-        # Unpack: trace_combiner_beam returns (pts, ints, valid)
-        all_pts, _, all_valid = trace_combiner_beam(
+        all_pts, _, all_valid, _, _ = trace_combiner_beam(
             beam_origins, direction, path, color_idx=0)
         # all_pts: (N, M, 3), all_valid: (N, M)
 

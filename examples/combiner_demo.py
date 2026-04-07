@@ -107,7 +107,7 @@ chassis = next(e for e in system.elements if isinstance(e, GlassBlock))
 n_glass = float(chassis.material.n(DEFAULT_WAVELENGTH))
 num_mirrors = len([e for e in system.elements if hasattr(e, 'reflection_ratio') and hasattr(e, 'transmission_ratio')])
 
-pupil_pts, pupil_ints, pupil_valid = trace_ray(
+pupil_pts, pupil_ints, pupil_valid, _, _ = trace_ray(
     DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION, n_glass, params,
 )
 

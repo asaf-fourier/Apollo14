@@ -57,7 +57,7 @@ class TestTraceRay:
     def test_per_mirror_reflected_intensity(self, default_setup):
         """Each mirror should reflect 0.05 of original intensity."""
         params, n_glass = default_setup
-        pts, ints, valid = trace_ray(
+        pts, ints, valid, _, _ = trace_ray(
             DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION, n_glass, params)
         for i in range(6):
             assert float(ints[i]) == pytest.approx(0.05, abs=1e-3)
@@ -65,14 +65,14 @@ class TestTraceRay:
     def test_total_reflected_intensity(self, default_setup):
         """6 mirrors * 0.05 = 0.30 total reflected."""
         params, n_glass = default_setup
-        pts, ints, valid = trace_ray(
+        pts, ints, valid, _, _ = trace_ray(
             DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION, n_glass, params)
         assert float(jnp.sum(ints)) == pytest.approx(0.30, abs=1e-3)
 
     def test_some_reflections_reach_pupil(self, default_setup):
         """On-axis ray: at least some reflected rays should hit the pupil."""
         params, n_glass = default_setup
-        pts, ints, valid = trace_ray(
+        pts, ints, valid, _, _ = trace_ray(
             DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION, n_glass, params)
         assert jnp.any(valid)
         # Upper mirrors (closer to pupil center) should hit; lower ones may miss
@@ -81,7 +81,7 @@ class TestTraceRay:
     def test_pupil_points_are_on_pupil_plane(self, default_setup):
         """Hit points should lie on the pupil plane (z = pupil_center.z)."""
         params, n_glass = default_setup
-        pts, ints, valid = trace_ray(
+        pts, ints, valid, _, _ = trace_ray(
             DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION, n_glass, params)
         for i in range(6):
             if valid[i]:
@@ -92,7 +92,7 @@ class TestTraceRay:
     def test_pupil_points_within_radius(self, default_setup):
         """Valid hits should be within the pupil radius."""
         params, n_glass = default_setup
-        pts, ints, valid = trace_ray(
+        pts, ints, valid, _, _ = trace_ray(
             DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION, n_glass, params)
         for i in range(6):
             if valid[i]:
@@ -113,19 +113,19 @@ class TestTraceBatch:
         N = 4
         origins = jnp.tile(DEFAULT_LIGHT_POSITION, (N, 1))
         directions = jnp.tile(DEFAULT_LIGHT_DIRECTION, (N, 1))
-        pts, ints, valid = trace_batch(origins, directions, n_glass, params)
+        pts, ints, valid, _, _ = trace_batch(origins, directions, n_glass, params)
         assert pts.shape == (N, 6, 3)
         assert ints.shape == (N, 6)
         assert valid.shape == (N, 6)
 
     def test_batch_matches_single(self, default_setup):
         params, n_glass = default_setup
-        single_pts, single_ints, single_valid = trace_ray(
+        single_pts, single_ints, single_valid, _, _ = trace_ray(
             DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION, n_glass, params)
 
         origins = jnp.tile(DEFAULT_LIGHT_POSITION, (3, 1))
         directions = jnp.tile(DEFAULT_LIGHT_DIRECTION, (3, 1))
-        batch_pts, batch_ints, batch_valid = trace_batch(
+        batch_pts, batch_ints, batch_valid, _, _ = trace_batch(
             origins, directions, n_glass, params)
 
         for i in range(3):
@@ -144,7 +144,7 @@ class TestTraceBeam:
         origins = jnp.tile(DEFAULT_LIGHT_POSITION, (N, 1))
         origins = origins.at[:, 0].add(offsets)
 
-        pts, ints, valid = trace_beam(origins, DEFAULT_LIGHT_DIRECTION, n_glass, params)
+        pts, ints, valid, _, _ = trace_beam(origins, DEFAULT_LIGHT_DIRECTION, n_glass, params)
         assert pts.shape == (N, 6, 3)
         assert ints.shape == (N, 6)
         assert valid.shape == (N, 6)
@@ -158,9 +158,9 @@ class TestTraceBeam:
         origins = origins.at[:, 0].add(offsets)
         directions = jnp.tile(DEFAULT_LIGHT_DIRECTION, (N, 1))
 
-        beam_pts, beam_ints, beam_valid = trace_beam(
+        beam_pts, beam_ints, beam_valid, _, _ = trace_beam(
             origins, DEFAULT_LIGHT_DIRECTION, n_glass, params)
-        batch_pts, batch_ints, batch_valid = trace_batch(
+        batch_pts, batch_ints, batch_valid, _, _ = trace_batch(
             origins, directions, n_glass, params)
 
         assert jnp.allclose(beam_ints, batch_ints, atol=1e-4)
@@ -174,7 +174,7 @@ class TestTraceBeam:
 
         def total_intensity(reflectances):
             p = params._replace(mirror_reflectances=reflectances)
-            _, ints, valid = trace_beam(origins, DEFAULT_LIGHT_DIRECTION, n_glass, p)
+            _, ints, valid, _, _ = trace_beam(origins, DEFAULT_LIGHT_DIRECTION, n_glass, p)
             return jnp.sum(jnp.where(valid, ints, 0.0))
 
         grads = jax.grad(total_intensity)(params.mirror_reflectances)
@@ -192,7 +192,7 @@ class TestDifferentiability:
 
         def total_intensity(reflectances):
             p = params._replace(mirror_reflectances=reflectances)
-            _, ints, valid = trace_ray(
+            _, ints, valid, _, _ = trace_ray(
                 DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION, n_glass, p)
             return jnp.sum(jnp.where(valid, ints, 0.0))
 
@@ -207,7 +207,7 @@ class TestDifferentiability:
 
         def total_intensity(positions):
             p = params._replace(mirror_positions=positions)
-            _, ints, valid = trace_ray(
+            _, ints, valid, _, _ = trace_ray(
                 DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION, n_glass, p)
             return jnp.sum(jnp.where(valid, ints, 0.0))
 

@@ -284,7 +284,7 @@ def plot_jax_pupil_fill(projector, params, n_glass,
             d = scan_dirs[iy, ix]
             ray_origins, _, _, _ = projector.generate_rays(direction=d)
 
-            pts, ints, valid = trace_beam(ray_origins, d, n_glass, params)
+            pts, ints, valid, _, _ = trace_beam(ray_origins, d, n_glass, params)
 
             grid = np.zeros((n_bins, n_bins))
             for ri in range(pts.shape[0]):

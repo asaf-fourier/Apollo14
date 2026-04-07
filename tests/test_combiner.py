@@ -47,7 +47,7 @@ def test_jax_trace():
     chassis = next(e for e in system.elements if isinstance(e, GlassBlock))
     n_glass = float(chassis.material.n(DEFAULT_WAVELENGTH))
 
-    pts, ints, valid = trace_ray(
+    pts, ints, valid, _, _ = trace_ray(
         DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION, n_glass, params)
     assert ints.shape == (6,)
     assert jnp.any(valid)
