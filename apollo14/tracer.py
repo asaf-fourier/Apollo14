@@ -193,15 +193,21 @@ def jax_to_trace_result(
 
     result = TraceResult()
 
-    # Build bottom-up: last mirror → first, chaining via transmitted path
+    # Build bottom-up: last mirror → first, chaining via transmitted path.
+    # Skip mirrors where intensities[i] ≈ 0 — the ray missed that mirror
+    # (main_hits[i] is a phantom plane intersection outside the mirror bounds).
     next_mirror_node = None
 
     for i in range(M - 1, -1, -1):
+        hit_mirror = float(intensities[i]) > EPSILON
+        if not hit_mirror:
+            continue
+
         mirror = mirrors[i] if i < len(mirrors) else None
         mirror_name = mirror.name if mirror else f"mirror_{i}"
         mirror_normal = np.asarray(mirror.normal) if mirror else np.array([0, 0, 1.0])
 
-        # Reflected branch: exit face → pupil
+        # Reflected branch: exit face → pupil (only if mirror was hit)
         branch_children = []
         if B >= 1:
             exit_node = TraceHit(
