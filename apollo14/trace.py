@@ -1,132 +1,158 @@
-"""Generic sequential ray tracer — uniform SurfaceState throughout.
+"""Generic single-path sequential tracer.
 
-One step function for the transmitted path, three scans:
-  1. preamble  — aperture + entry face
-  2. mirrors   — mirror stack (each step also records branch origin)
-  3. branch    — exit face + pupil, vmapped over all mirrors
+A ``Route`` is a flat ordered stack of ``Surface`` states. ``trace_ray``
+runs one ``jax.lax.scan`` over it — no branching, no assumed ordering,
+no type dispatch.
 
-Reflection is computed once per mirror between scans 2 and 3,
-not inside the step function.
+Wavelength is a trace-time argument: each surface carries sampled material
+data for n1/n2, and ``surface_step`` interpolates when the ray arrives.
 
-For the Talos-specific hard-coded tracer, see ``talos_trace.py``.
+Branching (reflected daughter rays, multi-path combiner) is out of scope
+for v1 — layer it on top later.
 """
 
-from typing import NamedTuple
+from typing import NamedTuple, Sequence, Union
 
 import jax
 import jax.numpy as jnp
 
-from apollo14.surface import surface_step, mirror_branch_origin
-from apollo14.route import Route
+from apollo14.surface import Surface, TRANSMIT, surface_step
+from apollo14.system import OpticalSystem
+
+
+# An element reference is either a plain string ("mirror_0") or a
+# (block, face) tuple (("chassis", "back")). A path entry is that
+# reference, optionally wrapped with a mode: (ref, mode).
+ElementRef = Union[str, tuple]
+PathEntry = Union[ElementRef, tuple]
+
+
+class Route(NamedTuple):
+    """Flat ordered optical path — a single ``lax.scan`` worth of surfaces."""
+    surfaces: Surface  # stacked: each field has leading dim (N,)
 
 
 class TraceResult(NamedTuple):
-    """Result of tracing rays through a route.
+    """Result of tracing one ray through a Route.
 
-    For a single ray, arrays have shape (M, ...) for M mirrors.
-    For batched rays, they gain an additional leading (N, ...) dimension.
+    Shapes are (N, ...) for N surfaces, or with extra leading batch dims
+    when produced via ``trace_beam`` / ``trace_batch``.
     """
-    pupil_points: jnp.ndarray      # (..., M, 3) where reflected rays hit pupil
-    intensities: jnp.ndarray       # (..., M) reflected intensity per mirror
-    valid: jnp.ndarray             # (..., M) bool — reflection reached pupil
-    main_hits: jnp.ndarray         # (..., M, 3) hit points on mirrors
-    branch_hits: jnp.ndarray       # (..., M, B, 3) intermediate branch hits
-
-    @property
-    def total_intensity(self) -> jnp.ndarray:
-        """Sum of valid intensities across all mirrors. Shape (...)."""
-        return jnp.sum(jnp.where(self.valid, self.intensities, 0.0), axis=-1)
+    hits: jnp.ndarray              # (..., N, 3) raw plane intersection at each step
+    valids: jnp.ndarray            # (..., N) bool — whether each step was valid
+    final_pos: jnp.ndarray         # (..., 3) position after the final step
+    final_dir: jnp.ndarray         # (..., 3) direction after the final step
+    final_intensity: jnp.ndarray   # (...,) intensity after the final step
 
 
-def trace_ray(origin, direction, route: Route, color_idx=0) -> TraceResult:
-    """Trace a single ray through a Route.
+# ── Route building ───────────────────────────────────────────────────────────
 
-    Args:
-        origin: (3,) ray start position.
-        direction: (3,) ray direction (normalized).
-        route: Route with preamble, mirrors, and branch.
-        color_idx: color channel index (0=R, 1=G, 2=B).
+def _stack_surfaces(states: Sequence[Surface]) -> Surface:
+    """Stack per-surface states into one with a leading (N,) dim on every leaf."""
+    return jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *states)
 
-    Returns:
-        TraceResult with (M,) arrays.
+
+def _parse_entry(entry: PathEntry) -> tuple:
+    """Split a path entry into ``(ref, mode)``.
+
+    Accepted forms:
+        "mirror_0"                         → transmit
+        ("chassis", "back")                → transmit (block+face ref)
+        ("mirror_0", REFLECT)              → explicit mode on plain ref
+        (("chassis", "back"), REFLECT)     → explicit mode on block+face ref
     """
+    if isinstance(entry, str):
+        return entry, TRANSMIT
+    if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[1], int):
+        return entry[0], int(entry[1])
+    return entry, TRANSMIT
+
+
+def build_route(system: OpticalSystem, path: Sequence[PathEntry]) -> Route:
+    """Build a Route from a flat list of element references.
+
+    Each entry is either a plain element name (``"mirror_0"``), a
+    ``(block, face)`` tuple (``("chassis", "back")``), or a ``(ref, mode)``
+    pair where ``mode`` is one of ``TRANSMIT``/``REFLECT``/``ABSORB``.
+
+    The builder tracks the current medium as a ``Material`` instance
+    (starting from ``system.env_material``) and hands it to each element's
+    ``to_generic_surface`` — no wavelength involved.
+    """
+    current = system.env_material
+    surfaces: list[Surface] = []
+    for entry in path:
+        name, mode = _parse_entry(entry)
+        elem = system.resolve(name)
+        surf, current = elem.to_generic_surface(current, mode)
+        surfaces.append(surf)
+
+    return Route(surfaces=_stack_surfaces(surfaces))
+
+
+# ── Tracing ──────────────────────────────────────────────────────────────────
+
+def trace_ray(route: Route, origin, direction, wavelength,
+              color_idx: int = 0) -> TraceResult:
+    """Trace one ray along the route via a single ``lax.scan``."""
     def step(carry, state):
         pos, d, inten = carry
-        out_pos, out_dir, out_inten, hit, valid = \
-            surface_step(state, pos, d, inten, color_idx)
-        return (out_pos, out_dir, out_inten), (hit, d, inten, valid)
+        out_pos, out_dir, out_inten, hit, valid = surface_step(
+            state, pos, d, inten, wavelength, color_idx)
+        return (out_pos, out_dir, out_inten), (hit, valid)
 
-    # 1. Preamble: aperture + entry face
     init = (origin, direction, jnp.float32(1.0))
-    (pos, d, inten), _ = jax.lax.scan(step, init, route.preamble)
-
-    # 2. Mirrors: transmitted path continues, record pre-step state for branches
-    (_, _, _), (mirror_hits, pre_dirs, pre_intens, mirror_valids) = \
-        jax.lax.scan(step, (pos, d, inten), route.mirrors)
-
-    # Compute reflected ray at each mirror (one-time, between scans)
-    refl_dirs, refl_intens = jax.vmap(
-        lambda state, d, inten, hit, valid:
-            mirror_branch_origin(state, d, inten, hit, valid, color_idx)
-    )(route.mirrors, pre_dirs, pre_intens, mirror_hits, mirror_valids)
-
-    # 3. Branch per mirror: exit face + pupil
-    def branch_trace(hit, refl_dir, refl_inten):
-        def bstep(carry, state):
-            pos, d, inten = carry
-            out_pos, out_dir, out_inten, bhit, bvalid = \
-                surface_step(state, pos, d, inten, color_idx)
-            return (out_pos, out_dir, out_inten), (bhit, bvalid)
-
-        _, (bhits, bvalids) = jax.lax.scan(
-            bstep, (hit, refl_dir, refl_inten), route.branch)
-        all_valid = jnp.all(bvalids)
-        pupil_point = bhits[-1]
-        return pupil_point, all_valid, bhits
-
-    pupil_points, branch_valids, branch_hits = \
-        jax.vmap(branch_trace)(mirror_hits, refl_dirs, refl_intens)
+    (final_pos, final_dir, final_inten), (hits, valids) = jax.lax.scan(
+        step, init, route.surfaces)
 
     return TraceResult(
-        pupil_points=pupil_points,           # (M, 3)
-        intensities=refl_intens,             # (M,)
-        valid=mirror_valids & branch_valids,  # (M,)
-        main_hits=mirror_hits,               # (M, 3)
-        branch_hits=branch_hits,             # (M, B, 3)
+        hits=hits,
+        valids=valids,
+        final_pos=final_pos,
+        final_dir=final_dir,
+        final_intensity=final_inten,
     )
 
 
-def trace_beam(origins, direction, route: Route, color_idx=0) -> TraceResult:
-    """Trace N rays sharing one direction through a Route.
+def trace_beam(route: Route, origins, direction, wavelength,
+               color_idx: int = 0) -> TraceResult:
+    """Trace N rays sharing one direction through a route."""
+    return jax.vmap(
+        lambda o: trace_ray(route, o, direction, wavelength, color_idx)
+    )(origins)
 
-    Args:
-        origins: (N, 3) ray start positions.
-        direction: (3,) shared direction (normalized).
-        route: Route with preamble, mirrors, and branch.
-        color_idx: color channel index (0=R, 1=G, 2=B).
 
-    Returns:
-        TraceResult with (N, M, ...) arrays.
+def trace_batch(route: Route, origins, directions, wavelength,
+                color_idx: int = 0) -> TraceResult:
+    """Trace N rays with per-ray directions through a route."""
+    return jax.vmap(
+        lambda o, d: trace_ray(route, o, d, wavelength, color_idx)
+    )(origins, directions)
+
+
+# ── Combiner helper ──────────────────────────────────────────────────────────
+
+def combiner_main_path(system: OpticalSystem,
+                       entry_face: str = "back",
+                       exit_face: str = "front") -> Route:
+    """Build the straight-through main path for a Talos-style combiner.
+
+    The path is: aperture (if present) → entry chassis face → each partial
+    mirror in order (all transmit) → exit chassis face. No pupil, no
+    reflected branches — branching will be layered on later.
     """
-    def _single(origin):
-        return trace_ray(origin, direction, route, color_idx)
+    chassis = next(e for e in system.elements if hasattr(e, "get_face"))
+    mirrors = [e for e in system.elements
+               if hasattr(e, "reflectance") and hasattr(e, "name")
+               and getattr(e, "name", "").startswith("mirror")]
+    apertures = [e for e in system.elements
+                 if getattr(e, "name", None) == "aperture"]
 
-    return jax.vmap(_single)(origins)
+    path: list[PathEntry] = []
+    if apertures:
+        path.append(apertures[0].name)
+    path.append((chassis.name, entry_face))
+    path.extend(m.name for m in mirrors)
+    path.append((chassis.name, exit_face))
 
-
-def trace_batch(origins, directions, route: Route, color_idx=0) -> TraceResult:
-    """Trace N rays with different directions through a Route.
-
-    Args:
-        origins: (N, 3) ray start positions.
-        directions: (N, 3) per-ray directions (normalized).
-        route: Route with preamble, mirrors, and branch.
-        color_idx: color channel index (0=R, 1=G, 2=B).
-
-    Returns:
-        TraceResult with (N, M, ...) arrays.
-    """
-    def _single(origin, direction):
-        return trace_ray(origin, direction, route, color_idx)
-
-    return jax.vmap(_single)(origins, directions)
+    return build_route(system, path)

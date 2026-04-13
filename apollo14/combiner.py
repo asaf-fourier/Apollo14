@@ -4,7 +4,7 @@ import jax.numpy as jnp
 
 from apollo14.units import mm, nm, deg
 from apollo14.materials import air, agc_m074
-from apollo14.elements.surface import PartialMirror
+from apollo14.elements.partial_mirror import PartialMirror
 from apollo14.elements.glass_block import GlassBlock
 from apollo14.elements.aperture import RectangularAperture
 from apollo14.elements.pupil import RectangularPupil

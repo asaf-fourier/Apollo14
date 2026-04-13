@@ -1,10 +1,23 @@
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 import jax.numpy as jnp
 import numpy as np
 
 from apollo14.units import nm
+
+
+# Common visible-spectrum grid. All Material.data pytrees are resampled onto
+# this grid so every route surface has identically-shaped n1/n2 leaves
+# (required for stacking into a single lax.scan pytree).
+STANDARD_WAVELENGTHS = jnp.linspace(380.0 * nm, 780.0 * nm, 81, dtype=jnp.float32)
+
+
+class MaterialData(NamedTuple):
+    """Pytree-friendly sampled material: n(wavelength) via linear interp."""
+    wavelengths: jnp.ndarray  # (K,)
+    n_values: jnp.ndarray     # (K,)
 
 
 @dataclass(frozen=True)
@@ -19,6 +32,18 @@ class Material:
 
     def k(self, wavelength):
         return jnp.interp(wavelength, self.wavelengths, self.k_values)
+
+    @property
+    def data(self) -> MaterialData:
+        """Pytree-friendly sampled (wavelength, n) pair on the standard grid.
+
+        All materials share ``STANDARD_WAVELENGTHS`` so route surfaces can
+        be stacked into a single pytree with uniform leaf shapes.
+        """
+        n = jnp.interp(STANDARD_WAVELENGTHS,
+                       jnp.asarray(self.wavelengths, dtype=jnp.float32),
+                       jnp.asarray(self.n_values, dtype=jnp.float32))
+        return MaterialData(wavelengths=STANDARD_WAVELENGTHS, n_values=n)
 
     @classmethod
     def from_csv(cls, name: str, path: str, wavelength_units: float = nm):
@@ -46,6 +71,14 @@ class Air(Material):
 
     def k(self, wavelength):
         return 0.0
+
+    @property
+    def data(self) -> MaterialData:
+        # Constant n=1 across the standard grid.
+        return MaterialData(
+            wavelengths=STANDARD_WAVELENGTHS,
+            n_values=jnp.ones_like(STANDARD_WAVELENGTHS),
+        )
 
 
 _DATA_DIR = Path(__file__).parent / "data"

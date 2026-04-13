@@ -1,18 +1,15 @@
-"""Generic surface state and interaction — uniform interface for all optical elements.
+"""Generic planar surfaces for the sequential single-path tracer.
 
-Every planar optical element (aperture, refracting face, partial mirror, detector)
-is represented by the same SurfaceState. The single ``surface_step`` function
-handles the transmitted path: intersection, Snell refraction, attenuation by (1-r).
+Two NamedTuples, one physics kernel:
 
-Reflection is NOT computed inside the step. It's a one-time operation at the
-mirror boundary, computed before launching a branch trace. This keeps the step
-function simple and avoids wasted computation on non-mirror elements.
+- ``RouteSurface`` is what a ``Route`` holds — it carries ``MaterialData``
+  for n1/n2, so the same route can be reused across wavelengths.
+- ``Surface`` is what the scan consumes — it carries already-interpolated
+  scalar indices for one specific wavelength.
 
-Element-specific behavior emerges from parameter values:
-- Aperture: n1=n2=1, reflectance=0, kill_on_miss=True
-- Refracting face: n1≠n2, reflectance=0, kill_on_miss=True
-- Mirror: n1=n2 (no refraction on main path), reflectance>0, kill_on_miss=False
-- Detector: n1=n2=1, reflectance=0, kill_on_miss=True
+``prepare_beam`` (in ``apollo14.trace``) turns a ``RouteSurface`` stack into
+a ``Surface`` stack by interpolating each material once. ``surface_step``
+works on ``Surface`` only — no wavelength argument at trace time.
 """
 
 from typing import NamedTuple
@@ -20,44 +17,61 @@ from typing import NamedTuple
 import jax.numpy as jnp
 
 from apollo14.geometry import ray_rect_intersect, snell_refract, reflect
+from apollo14.materials import MaterialData
 
 
-class SurfaceState(NamedTuple):
-    """Universal JAX-traceable state for any planar optical surface.
+# ── Surface modes ────────────────────────────────────────────────────────────
+# Stored as int8 scalars inside (Route)Surface.
 
-    All fields are JAX arrays — auto-pytree via NamedTuple.
-    """
+TRANSMIT = 0   # refract through; mirrors attenuate by (1-r)
+REFLECT = 1    # reflect off facing normal; mirrors attenuate by r
+ABSORB = 2     # terminal surface (detector); keeps intensity, no direction change
+
+
+class RouteSurface(NamedTuple):
+    """Route-time planar surface — materials stored as ``MaterialData``."""
     position: jnp.ndarray       # (3,)
-    normal: jnp.ndarray         # (3,) outward-facing unit normal
-    half_extents: jnp.ndarray   # (2,) [half_width, half_height]
+    normal: jnp.ndarray         # (3,) outward unit normal
+    half_extents: jnp.ndarray   # (2,)
     local_x: jnp.ndarray        # (3,)
     local_y: jnp.ndarray        # (3,)
-    n1: jnp.ndarray             # scalar — refractive index on incoming side
-    n2: jnp.ndarray             # scalar — refractive index on outgoing side
-    reflectance: jnp.ndarray    # (3,) per-color [R, G, B]; 0 for non-mirrors
-    kill_on_miss: jnp.ndarray   # bool — zero intensity when ray misses bounds
+    n1: MaterialData            # incoming-side material
+    n2: MaterialData            # outgoing-side material
+    reflectance: jnp.ndarray    # (3,) per-color
+    mode: jnp.ndarray           # int8 scalar — TRANSMIT / REFLECT / ABSORB
 
 
-def surface_step(state: SurfaceState, origin, direction, intensity, color_idx):
-    """Transmitted-path interaction: intersect, refract, attenuate.
+class Surface(NamedTuple):
+    """Trace-time planar surface — n1/n2 are scalar refractive indices."""
+    position: jnp.ndarray
+    normal: jnp.ndarray
+    half_extents: jnp.ndarray
+    local_x: jnp.ndarray
+    local_y: jnp.ndarray
+    n1: jnp.ndarray             # scalar
+    n2: jnp.ndarray             # scalar
+    reflectance: jnp.ndarray
+    mode: jnp.ndarray
 
-    Computes only the transmitted ray. Reflection (direction + intensity)
-    is handled separately at branch entry — see ``mirror_branch_origin``.
 
-    Args:
-        state: SurfaceState for this element.
-        origin: (3,) ray position.
-        direction: (3,) ray direction (normalized).
-        intensity: scalar, current ray intensity.
-        color_idx: int, selects reflectance channel [0=R, 1=G, 2=B].
+def _transmit_step(state, direction, facing, intensity, color_idx):
+    refracted, is_tir = snell_refract(direction, facing, state.n1, state.n2)
+    out_i = intensity * (1.0 - state.reflectance[color_idx])
+    return refracted, out_i, is_tir
 
-    Returns:
-        out_pos: (3,) updated position (hit point if valid, else origin).
-        out_dir: (3,) updated direction (refracted if valid, else unchanged).
-        out_intensity: scalar, transmitted intensity.
-        hit: (3,) raw intersection point on the surface plane.
-        valid: bool, whether the ray hit within bounds.
-    """
+
+def _reflect_step(state, direction, facing, intensity, color_idx):
+    reflected = reflect(direction, facing)
+    out_i = intensity * state.reflectance[color_idx]
+    return reflected, out_i
+
+
+def _absorb_step(direction, intensity):
+    return direction, intensity
+
+
+def surface_step(state: Surface, origin, direction, intensity, color_idx):
+    """One generic surface interaction on a wavelength-resolved surface."""
     hit, t, in_bounds = ray_rect_intersect(
         origin, direction, state.position, state.normal,
         state.local_x, state.local_y, state.half_extents)
@@ -65,46 +79,25 @@ def surface_step(state: SurfaceState, origin, direction, intensity, color_idx):
     facing = jnp.where(jnp.dot(direction, state.normal) < 0,
                        state.normal, -state.normal)
 
-    # Refraction — identity when n1 == n2
-    new_dir, is_tir = snell_refract(direction, facing, state.n1, state.n2)
-    valid = in_bounds & ~is_tir
+    t_dir, t_i, is_tir = _transmit_step(
+        state, direction, facing, intensity, color_idx)
+    r_dir, r_i = _reflect_step(
+        state, direction, facing, intensity, color_idx)
+    a_dir, a_i = _absorb_step(direction, intensity)
 
-    # Attenuation: transmitted intensity = input * (1 - reflectance)
-    r = state.reflectance[color_idx]
-    trans_intensity = intensity * (1.0 - r)
+    is_reflect = state.mode == REFLECT
+    is_absorb = state.mode == ABSORB
+    is_transmit = (~is_reflect) & (~is_absorb)
 
-    # Main ray continues
+    mode_intensity = jnp.where(is_absorb, a_i,
+                               jnp.where(is_reflect, r_i, t_i))
+    mode_dir = jnp.where(is_absorb, a_dir,
+                         jnp.where(is_reflect, r_dir, t_dir))
+
+    valid = in_bounds & ~(is_transmit & is_tir)
+
+    out_intensity = jnp.where(valid, mode_intensity, 0.0)
     out_pos = jnp.where(valid, hit, origin)
-    out_dir = jnp.where(valid, new_dir, direction)
-    out_intensity = jnp.where(valid, trans_intensity,
-                              jnp.where(state.kill_on_miss, 0.0, intensity))
+    out_dir = jnp.where(valid, mode_dir, direction)
 
     return out_pos, out_dir, out_intensity, hit, valid
-
-
-def mirror_branch_origin(state: SurfaceState, direction, intensity, hit, valid,
-                         color_idx):
-    """Compute reflected ray at a mirror — the starting point for a branch trace.
-
-    Called once per mirror after the main-path step. Not part of the scan.
-
-    Args:
-        state: SurfaceState of the mirror that was hit.
-        direction: (3,) incoming ray direction (before the mirror step).
-        intensity: scalar, ray intensity *before* the mirror attenuated it.
-        hit: (3,) intersection point from surface_step.
-        valid: bool, whether the mirror was actually hit.
-        color_idx: int, color channel.
-
-    Returns:
-        refl_dir: (3,) reflected direction.
-        refl_intensity: scalar, reflected intensity (0 if not valid).
-    """
-    facing = jnp.where(jnp.dot(direction, state.normal) < 0,
-                       state.normal, -state.normal)
-    refl_dir = reflect(direction, facing)
-
-    r = state.reflectance[color_idx]
-    refl_intensity = jnp.where(valid, intensity * r, 0.0)
-
-    return refl_dir, refl_intensity
