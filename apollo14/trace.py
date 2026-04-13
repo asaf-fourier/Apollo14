@@ -1,12 +1,12 @@
 """Generic sequential ray tracer — uniform SurfaceState throughout.
 
-One interact function, three scans:
+One step function for the transmitted path, three scans:
   1. preamble  — aperture + entry face
-  2. mirrors   — mirror stack, each step produces a branch origin
+  2. mirrors   — mirror stack (each step also records branch origin)
   3. branch    — exit face + pupil, vmapped over all mirrors
 
-No type dispatch, no jnp.where on element types. Element-specific behavior
-is encoded in SurfaceState parameters (n1/n2, reflectance, kill_on_miss).
+Reflection is computed once per mirror between scans 2 and 3,
+not inside the step function.
 
 For the Talos-specific hard-coded tracer, see ``talos_trace.py``.
 """
@@ -16,7 +16,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
-from apollo14.surface import surface_interact
+from apollo14.surface import surface_step, mirror_branch_origin
 from apollo14.route import Route
 
 
@@ -52,24 +52,30 @@ def trace_ray(origin, direction, route: Route, color_idx=0) -> TraceResult:
     """
     def step(carry, state):
         pos, d, inten = carry
-        out_pos, out_dir, out_inten, hit, refl_dir, refl_inten, valid = \
-            surface_interact(state, pos, d, inten, color_idx)
-        return (out_pos, out_dir, out_inten), (hit, refl_dir, refl_inten, valid)
+        out_pos, out_dir, out_inten, hit, valid = \
+            surface_step(state, pos, d, inten, color_idx)
+        return (out_pos, out_dir, out_inten), (hit, d, inten, valid)
 
     # 1. Preamble: aperture + entry face
     init = (origin, direction, jnp.float32(1.0))
     (pos, d, inten), _ = jax.lax.scan(step, init, route.preamble)
 
-    # 2. Mirrors: each step transmits on main path, outputs branch origin
-    (_, _, _), (mirror_hits, refl_dirs, refl_intens, mirror_valids) = \
+    # 2. Mirrors: transmitted path continues, record pre-step state for branches
+    (_, _, _), (mirror_hits, pre_dirs, pre_intens, mirror_valids) = \
         jax.lax.scan(step, (pos, d, inten), route.mirrors)
+
+    # Compute reflected ray at each mirror (one-time, between scans)
+    refl_dirs, refl_intens = jax.vmap(
+        lambda state, d, inten, hit, valid:
+            mirror_branch_origin(state, d, inten, hit, valid, color_idx)
+    )(route.mirrors, pre_dirs, pre_intens, mirror_hits, mirror_valids)
 
     # 3. Branch per mirror: exit face + pupil
     def branch_trace(hit, refl_dir, refl_inten):
         def bstep(carry, state):
             pos, d, inten = carry
-            out_pos, out_dir, out_inten, bhit, _, _, bvalid = \
-                surface_interact(state, pos, d, inten, color_idx)
+            out_pos, out_dir, out_inten, bhit, bvalid = \
+                surface_step(state, pos, d, inten, color_idx)
             return (out_pos, out_dir, out_inten), (bhit, bvalid)
 
         _, (bhits, bvalids) = jax.lax.scan(
