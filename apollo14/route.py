@@ -1,21 +1,27 @@
 """Route — a sequential optical path as a JAX pytree.
 
-A Route encodes *how light travels* through the system:
-  preamble (aperture + entry refraction) → mirror scan → branch (exit + pupil)
+A Route encodes *how light travels* through the system using uniform
+``SurfaceState`` fields throughout. All elements share the same state
+shape — element-specific behavior emerges from parameter values
+(n1/n2, reflectance, kill_on_miss). No type dispatch needed.
 
-Different routes through the same system model different light paths
-(display, see-through, ghost).
+Three scans:
+  1. preamble — aperture + entry face (small, fixed)
+  2. mirrors  — mirror stack (variable M, produces branch origins)
+  3. branch   — exit face + pupil (shared by all mirrors, vmapped)
+
+For the Talos-specific route with typed element states, see ``talos_route.py``.
 """
 
 from typing import NamedTuple
 
 import jax.numpy as jnp
 
-from apollo14.elements.surface import PartialMirror, MirrorState
-from apollo14.elements.refracting_surface import RefractingSurface, RefractState
-from apollo14.elements.aperture import RectangularAperture, ApertureState
-from apollo14.elements.pupil import RectangularPupil, DetectorState
+from apollo14.elements.surface import PartialMirror
+from apollo14.elements.aperture import RectangularAperture
+from apollo14.elements.pupil import RectangularPupil
 from apollo14.elements.glass_block import GlassBlock
+from apollo14.surface import SurfaceState
 from apollo14.geometry import compute_local_axes
 from apollo14.materials import air
 from apollo14.system import OpticalSystem
@@ -25,56 +31,46 @@ class Route(NamedTuple):
     """Sequential optical path — fully JAX-compatible (NamedTuple = auto pytree).
 
     Fields:
-        aperture: ApertureState for pre-entry clipping.
-        has_aperture: bool scalar — if False, aperture check is skipped.
-        entry_face: RefractState for air→glass refraction at entry.
-        mirrors: MirrorState with stacked (M, ...) arrays for lax.scan.
-        exit_face: RefractState tiled to (M, ...) for per-mirror branch.
-        target: DetectorState tiled to (M, ...) for per-mirror branch.
-        n_glass: scalar refractive index inside the chassis.
+        preamble: SurfaceState with (P, ...) stacked arrays.
+        mirrors: SurfaceState with (M, ...) stacked arrays.
+        branch: SurfaceState with (B, ...) stacked arrays.
     """
-    aperture: ApertureState
-    has_aperture: jnp.ndarray       # bool scalar
-    entry_face: RefractState
-    mirrors: MirrorState            # stacked (M, ...)
-    exit_face: RefractState         # tiled (M, ...)
-    target: DetectorState           # tiled (M, ...)
-    n_glass: jnp.ndarray            # scalar
+    preamble: SurfaceState      # (P, ...) — aperture + entry face
+    mirrors: SurfaceState       # (M, ...) — mirror stack
+    branch: SurfaceState        # (B, ...) — exit face + pupil
 
 
-def _stack_mirror_states(mirrors: list[PartialMirror]) -> MirrorState:
-    """Stack a list of PartialMirror states into a single MirrorState with leading (M,) dim."""
-    states = [m.state for m in mirrors]
-    return MirrorState(
-        position=jnp.stack([s.position for s in states]),
-        normal=jnp.stack([s.normal for s in states]),
-        half_extents=jnp.stack([s.half_extents for s in states]),
-        reflectance=jnp.stack([s.reflectance for s in states]),
-        local_x=jnp.stack([s.local_x for s in states]),
-        local_y=jnp.stack([s.local_y for s in states]),
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _to_surface(position, normal, half_extents, local_x, local_y, *,
+                n1=1.0, n2=1.0, reflectance=None, kill_on_miss=True):
+    """Build a SurfaceState from raw parameters."""
+    if reflectance is None:
+        reflectance = jnp.zeros(3)
+    return SurfaceState(
+        position=jnp.asarray(position, dtype=jnp.float32),
+        normal=jnp.asarray(normal, dtype=jnp.float32),
+        half_extents=jnp.asarray(half_extents, dtype=jnp.float32),
+        local_x=jnp.asarray(local_x, dtype=jnp.float32),
+        local_y=jnp.asarray(local_y, dtype=jnp.float32),
+        n1=jnp.float32(n1),
+        n2=jnp.float32(n2),
+        reflectance=jnp.asarray(reflectance, dtype=jnp.float32),
+        kill_on_miss=jnp.bool_(kill_on_miss),
     )
 
 
-def _tile_state(state, M):
-    """Tile a state's arrays to have a leading (M,) dimension."""
-    return type(state)(*(jnp.broadcast_to(f[None], (M,) + f.shape).copy()
-                         for f in state))
+def _stack_surface_states(states: list[SurfaceState]) -> SurfaceState:
+    """Stack a list of SurfaceStates into one with leading (N,) dim."""
+    return SurfaceState(*(jnp.stack([getattr(s, f) for s in states])
+                          for f in SurfaceState._fields))
 
 
-def _dummy_aperture() -> ApertureState:
-    """Create a no-op aperture state (used when system has no aperture)."""
-    z = jnp.zeros(3)
-    return ApertureState(
-        position=z,
-        normal=jnp.array([0.0, 0.0, 1.0]),
-        half_extents=jnp.array([1e6, 1e6]),  # huge — passes everything
-        local_x=jnp.array([1.0, 0.0, 0.0]),
-        local_y=jnp.array([0.0, 1.0, 0.0]),
-    )
-
+# ── Route builders ───────────────────────────────────────────────────────────
 
 def display_route(system: OpticalSystem, wavelength: float,
-                  entry_face: str = "back", exit_face: str = "top") -> Route:
+                  entry_face: str = "back",
+                  exit_face: str = "top") -> Route:
     """Build the display path: projector → mirrors → pupil.
 
     Light enters through ``entry_face`` of the chassis, hits M mirrors
@@ -90,7 +86,6 @@ def display_route(system: OpticalSystem, wavelength: float,
     Returns:
         Route ready for tracing with ``trace_ray``/``trace_beam``/``trace_batch``.
     """
-    # Find elements by type
     chassis = next(e for e in system.elements if isinstance(e, GlassBlock))
     mirrors = [e for e in system.elements if isinstance(e, PartialMirror)]
     pupil = next(e for e in system.elements if isinstance(e, RectangularPupil))
@@ -98,36 +93,56 @@ def display_route(system: OpticalSystem, wavelength: float,
 
     n_air = float(air.n(wavelength))
     n_glass = float(chassis.material.n(wavelength))
-    M = len(mirrors)
 
-    # Aperture
+    # ── Preamble: aperture + entry face ──
     if apertures:
-        ap_state = apertures[0].state
-        has_aperture = jnp.array(True)
+        ap = apertures[0]
+        lx, ly = compute_local_axes(ap.state.normal)
+        aperture_s = _to_surface(
+            ap.state.position, ap.state.normal, ap.state.half_extents, lx, ly,
+            kill_on_miss=True)
     else:
-        ap_state = _dummy_aperture()
-        has_aperture = jnp.array(False)
+        # Dummy aperture: huge opening at entry face position, never blocks
+        entry_surf = chassis.face(entry_face, n1=n_air, n2=n_glass)
+        aperture_s = _to_surface(
+            entry_surf.state.position,
+            entry_surf.state.normal,
+            jnp.array([1e6, 1e6]),
+            entry_surf.state.local_x,
+            entry_surf.state.local_y,
+            kill_on_miss=False)
 
-    # Entry face: air → glass
     entry_surf = chassis.face(entry_face, n1=n_air, n2=n_glass)
-    entry_state = entry_surf.state
+    es = entry_surf.state
+    entry_s = _to_surface(
+        es.position, es.normal, es.half_extents, es.local_x, es.local_y,
+        n1=n_air, n2=n_glass, kill_on_miss=True)
 
-    # Mirrors (stacked)
-    mirror_states = _stack_mirror_states(mirrors)
+    preamble = _stack_surface_states([aperture_s, entry_s])
 
-    # Exit face: glass → air (tiled for per-mirror branch)
+    # ── Mirrors: n1=n2=n_glass, reflectance from element, kill_on_miss=False ──
+    mirror_surfaces = []
+    for m in mirrors:
+        ms = m.state
+        mirror_surfaces.append(_to_surface(
+            ms.position, ms.normal, ms.half_extents, ms.local_x, ms.local_y,
+            n1=n_glass, n2=n_glass, reflectance=ms.reflectance,
+            kill_on_miss=False))
+
+    mirror_stack = _stack_surface_states(mirror_surfaces)
+
+    # ── Branch: exit face + pupil ──
     exit_surf = chassis.face(exit_face, n1=n_glass, n2=n_air)
-    exit_state = _tile_state(exit_surf.state, M)
+    xs = exit_surf.state
+    exit_s = _to_surface(
+        xs.position, xs.normal, xs.half_extents, xs.local_x, xs.local_y,
+        n1=n_glass, n2=n_air, kill_on_miss=True)
 
-    # Pupil (tiled for per-mirror branch)
-    target_state = _tile_state(pupil.state, M)
+    ps = pupil.state
+    pupil_s = _to_surface(
+        ps.position, ps.normal, ps.half_extents, ps.local_x, ps.local_y,
+        kill_on_miss=True)
 
-    return Route(
-        aperture=ap_state,
-        has_aperture=has_aperture,
-        entry_face=entry_state,
-        mirrors=mirror_states,
-        exit_face=exit_state,
-        target=target_state,
-        n_glass=jnp.asarray(n_glass),
-    )
+    branch = _stack_surface_states([exit_s, pupil_s])
+
+    return Route(preamble=preamble, mirrors=mirror_stack, branch=branch)
