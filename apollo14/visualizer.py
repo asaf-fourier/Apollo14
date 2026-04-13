@@ -4,7 +4,7 @@ import numpy as np
 import plotly.graph_objects as go
 
 from apollo14.system import OpticalSystem
-from apollo14.elements.surface import PartialMirror
+from apollo14.elements.partial_mirror import PartialMirror
 from apollo14.elements.glass_block import GlassBlock, GlassFace
 from apollo14.elements.aperture import RectangularAperture
 from apollo14.elements.pupil import Pupil, RectangularPupil
@@ -118,44 +118,33 @@ def plot_pupil_fill(system: OpticalSystem, projector, pupil_element,
                     wavelength, pixel_size=0.1, show=True):
     """Plot pupil intensity heatmaps with a slider to step through scan angles.
 
+    Builds the main combiner path terminated at the pupil (absorbing),
+    prepares a beam for the given wavelength, and renders one heatmap per
+    scan angle.
+
     Returns a Plotly Figure.
     """
-    from apollo14.route import display_route
-
-    route = display_route(system, wavelength)
-    return plot_route_pupil_fill(
-        projector, route, pupil_element,
-        x_fov, y_fov, num_x_angles, num_y_angles,
-        pixel_size=pixel_size, show=show,
+    from apollo14.trace import (
+        build_route, prepare_beam, trace_beam, combiner_main_path,
     )
-
-
-def plot_route_pupil_fill(projector, route, pupil_element,
-                         x_fov, y_fov, num_x_angles, num_y_angles,
-                         pixel_size=0.5, show=True):
-    """Plot pupil intensity heatmaps with a slider to step through scan angles.
-
-    Traces a beam at each scan angle using ``trace_beam``, bins pupil hits
-    into a 2D spatial grid, and renders one heatmap per angle with a Plotly
-    slider.
-
-    Args:
-        projector: Projector instance (beam geometry for tracing).
-        route: Route from ``display_route()``.
-        pupil_element: RectangularPupil element for geometry.
-        x_fov: Horizontal field of view (radians).
-        y_fov: Vertical field of view (radians).
-        num_x_angles: Number of horizontal scan steps.
-        num_y_angles: Number of vertical scan steps.
-        pixel_size: Bin size on the pupil plane (mm). Default 0.5.
-        show: Whether to call ``fig.show()``. Default True.
-
-    Returns:
-        Plotly Figure.
-    """
-    import jax.numpy as jnp
-    from apollo14.trace import trace_beam
+    from apollo14.surface import ABSORB
     from apollo14.projector import scan_directions
+
+    # Main path + pupil as absorbing terminal surface.
+    chassis = next(e for e in system.elements if hasattr(e, "get_face"))
+    mirrors = [e for e in system.elements
+               if isinstance(e, PartialMirror)]
+    apertures = [e for e in system.elements
+                 if isinstance(e, RectangularAperture)]
+    path = []
+    if apertures:
+        path.append(apertures[0].name)
+    path.append((chassis.name, "back"))
+    path.extend(m.name for m in mirrors)
+    path.append((chassis.name, "front"))
+    path.append((pupil_element.name, ABSORB))
+    route = build_route(system, path)
+    beam = prepare_beam(route, wavelength)
 
     pupil_center = np.asarray(pupil_element.position)
     pupil_normal = np.asarray(pupil_element.normal)
@@ -182,7 +171,7 @@ def plot_route_pupil_fill(projector, route, pupil_element,
             d = scan_dirs[iy, ix]
             ray_origins, _, _, _ = projector.generate_rays(direction=d)
 
-            tr = trace_beam(ray_origins, d, route, color_idx=0)
+            tr = trace_beam(beam, ray_origins, d, color_idx=0)
             grid = bin_hits_to_grid_np(tr, pupil_center, pupil_lx, pupil_ly,
                                        bin_edges, bin_edges)
 
@@ -402,20 +391,23 @@ def _add_pupil(traces, pupil):
 # ── ray path helpers ─────────────────────────────────────────────────────────
 
 def _collect_ray_coords(trace: TraceResult, x, y, z):
-    """Walk the TraceHit tree and draw each parent→child segment."""
-    for root in trace.hits:
-        _walk_hit_tree(root, x, y, z)
+    """Draw a polyline through each ray's valid hit points.
 
+    Handles both a single-ray TraceResult (``hits`` shape ``(N, 3)``) and
+    a beam-batched one (``(R, N, 3)``).
+    """
+    hits = np.asarray(trace.hits)
+    valids = np.asarray(trace.valids)
+    if hits.ndim == 2:
+        hits = hits[None]
+        valids = valids[None]
 
-def _walk_hit_tree(hit, x, y, z):
-    """Recursively draw segments from this hit to each child."""
-    parent_pt = np.array(hit.point)
-    for child in hit.children:
-        child_pt = np.array(child.point)
-        x.extend([float(parent_pt[0]), float(child_pt[0]), None])
-        y.extend([float(parent_pt[1]), float(child_pt[1]), None])
-        z.extend([float(parent_pt[2]), float(child_pt[2]), None])
-        _walk_hit_tree(child, x, y, z)
+    for ray_hits, ray_valids in zip(hits, valids):
+        pts = ray_hits[ray_valids.astype(bool)]
+        for i in range(len(pts) - 1):
+            x.extend([float(pts[i, 0]), float(pts[i + 1, 0]), None])
+            y.extend([float(pts[i, 1]), float(pts[i + 1, 1]), None])
+            z.extend([float(pts[i, 2]), float(pts[i + 1, 2]), None])
 
 
 # ── slider builder ───────────────────────────────────────────────────────────
