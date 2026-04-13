@@ -1,11 +1,9 @@
 """Generic single-path sequential tracer.
 
-A ``Route`` is a flat ordered stack of ``Surface`` states. ``trace_ray``
-runs one ``jax.lax.scan`` over it — no branching, no assumed ordering,
-no type dispatch.
-
-Wavelength is a trace-time argument: each surface carries sampled material
-data for n1/n2, and ``surface_step`` interpolates when the ray arrives.
+A route is a flat stacked ``Surface`` — one ``lax.scan`` worth of surfaces,
+built once, wavelength-agnostic. ``prepare_beam`` turns it into a ``Beam``
+for a specific wavelength + initial intensity; ``trace_ray`` consumes the
+beam.
 
 Branching (reflected daughter rays, multi-path combiner) is out of scope
 for v1 — layer it on top later.
@@ -16,7 +14,7 @@ from typing import NamedTuple, Sequence, Union
 import jax
 import jax.numpy as jnp
 
-from apollo14.surface import Surface, TRANSMIT, surface_step
+from apollo14.surface import Surface, TRANSMIT, surface_step, interp_n
 from apollo14.system import OpticalSystem
 
 
@@ -27,13 +25,14 @@ ElementRef = Union[str, tuple]
 PathEntry = Union[ElementRef, tuple]
 
 
-class Route(NamedTuple):
-    """Flat ordered optical path — a single ``lax.scan`` worth of surfaces."""
-    surfaces: Surface  # stacked: each field has leading dim (N,)
+class Beam(NamedTuple):
+    """A route prepared for a specific wavelength and initial intensity."""
+    surfaces: Surface              # stacked; n1/n2 are scalar (wavelength-resolved)
+    intensity: jnp.ndarray         # scalar initial intensity
 
 
 class TraceResult(NamedTuple):
-    """Result of tracing one ray through a Route.
+    """Result of tracing one ray through a beam.
 
     Shapes are (N, ...) for N surfaces, or with extra leading batch dims
     when produced via ``trace_beam`` / ``trace_batch``.
@@ -68,8 +67,8 @@ def _parse_entry(entry: PathEntry) -> tuple:
     return entry, TRANSMIT
 
 
-def build_route(system: OpticalSystem, path: Sequence[PathEntry]) -> Route:
-    """Build a Route from a flat list of element references.
+def build_route(system: OpticalSystem, path: Sequence[PathEntry]) -> Surface:
+    """Build a stacked wavelength-agnostic ``Surface`` from a flat path.
 
     Each entry is either a plain element name (``"mirror_0"``), a
     ``(block, face)`` tuple (``("chassis", "back")``), or a ``(ref, mode)``
@@ -87,23 +86,39 @@ def build_route(system: OpticalSystem, path: Sequence[PathEntry]) -> Route:
         surf, current = elem.to_generic_surface(current, mode)
         surfaces.append(surf)
 
-    return Route(surfaces=_stack_surfaces(surfaces))
+    return _stack_surfaces(surfaces)
+
+
+# ── Beam preparation ─────────────────────────────────────────────────────────
+
+def prepare_beam(route: Surface, wavelength, intensity=1.0) -> Beam:
+    """Resolve a route's per-surface n1/n2 at ``wavelength`` and pair it
+    with an initial ``intensity``.
+
+    The route itself is wavelength-agnostic — call this once per wavelength
+    (and per intensity if you vary angle/wavelength dependent power).
+    """
+    n1 = jax.vmap(lambda m: interp_n(m, wavelength))(route.n1)
+    n2 = jax.vmap(lambda m: interp_n(m, wavelength))(route.n2)
+    ready = route._replace(n1=n1, n2=n2)
+    return Beam(surfaces=ready,
+                intensity=jnp.asarray(intensity, dtype=jnp.float32))
 
 
 # ── Tracing ──────────────────────────────────────────────────────────────────
 
-def trace_ray(route: Route, origin, direction, wavelength,
+def trace_ray(beam: Beam, origin, direction,
               color_idx: int = 0) -> TraceResult:
-    """Trace one ray along the route via a single ``lax.scan``."""
+    """Trace one ray along the beam via a single ``lax.scan``."""
     def step(carry, state):
         pos, d, inten = carry
         out_pos, out_dir, out_inten, hit, valid = surface_step(
-            state, pos, d, inten, wavelength, color_idx)
+            state, pos, d, inten, color_idx)
         return (out_pos, out_dir, out_inten), (hit, valid)
 
-    init = (origin, direction, jnp.float32(1.0))
+    init = (origin, direction, beam.intensity)
     (final_pos, final_dir, final_inten), (hits, valids) = jax.lax.scan(
-        step, init, route.surfaces)
+        step, init, beam.surfaces)
 
     return TraceResult(
         hits=hits,
@@ -114,19 +129,19 @@ def trace_ray(route: Route, origin, direction, wavelength,
     )
 
 
-def trace_beam(route: Route, origins, direction, wavelength,
+def trace_beam(beam: Beam, origins, direction,
                color_idx: int = 0) -> TraceResult:
-    """Trace N rays sharing one direction through a route."""
+    """Trace N rays sharing one direction through a beam."""
     return jax.vmap(
-        lambda o: trace_ray(route, o, direction, wavelength, color_idx)
+        lambda o: trace_ray(beam, o, direction, color_idx)
     )(origins)
 
 
-def trace_batch(route: Route, origins, directions, wavelength,
+def trace_batch(beam: Beam, origins, directions,
                 color_idx: int = 0) -> TraceResult:
-    """Trace N rays with per-ray directions through a route."""
+    """Trace N rays with per-ray directions through a beam."""
     return jax.vmap(
-        lambda o, d: trace_ray(route, o, d, wavelength, color_idx)
+        lambda o, d: trace_ray(beam, o, d, color_idx)
     )(origins, directions)
 
 
@@ -134,7 +149,7 @@ def trace_batch(route: Route, origins, directions, wavelength,
 
 def combiner_main_path(system: OpticalSystem,
                        entry_face: str = "back",
-                       exit_face: str = "front") -> Route:
+                       exit_face: str = "front") -> Surface:
     """Build the straight-through main path for a Talos-style combiner.
 
     The path is: aperture (if present) → entry chassis face → each partial

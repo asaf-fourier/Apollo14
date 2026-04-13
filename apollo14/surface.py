@@ -1,15 +1,16 @@
-"""Generic planar surfaces for the sequential single-path tracer.
+"""Generic planar surface state for the sequential single-path tracer.
 
-Two NamedTuples, one physics kernel:
+All planar optical elements share this one ``Surface`` NamedTuple.
+Element-specific behavior emerges from field values plus a ``mode`` flag —
+no type dispatch, no branching inside the scan step.
 
-- ``RouteSurface`` is what a ``Route`` holds — it carries ``MaterialData``
-  for n1/n2, so the same route can be reused across wavelengths.
-- ``Surface`` is what the scan consumes — it carries already-interpolated
-  scalar indices for one specific wavelength.
+``Surface`` has two life-stages, both using the same class:
+- route-time: n1/n2 hold sampled ``MaterialData`` (wavelength-agnostic).
+- beam-time: n1/n2 hold scalar refractive indices (resolved by
+  ``prepare_beam`` for a specific wavelength).
 
-``prepare_beam`` (in ``apollo14.trace``) turns a ``RouteSurface`` stack into
-a ``Surface`` stack by interpolating each material once. ``surface_step``
-works on ``Surface`` only — no wavelength argument at trace time.
+``surface_step`` runs at beam-time and reads ``state.n1``/``state.n2`` as
+scalars — no interpolation inside the scan.
 """
 
 from typing import NamedTuple
@@ -21,15 +22,15 @@ from apollo14.materials import MaterialData
 
 
 # ── Surface modes ────────────────────────────────────────────────────────────
-# Stored as int8 scalars inside (Route)Surface.
+# Stored as int8 scalars inside Surface.
 
 TRANSMIT = 0   # refract through; mirrors attenuate by (1-r)
 REFLECT = 1    # reflect off facing normal; mirrors attenuate by r
 ABSORB = 2     # terminal surface (detector); keeps intensity, no direction change
 
 
-class RouteSurface(NamedTuple):
-    """Route-time planar surface — materials stored as ``MaterialData``."""
+class Surface(NamedTuple):
+    """Universal planar surface used by the single-path tracer."""
     position: jnp.ndarray       # (3,)
     normal: jnp.ndarray         # (3,) outward unit normal
     half_extents: jnp.ndarray   # (2,)
@@ -41,17 +42,8 @@ class RouteSurface(NamedTuple):
     mode: jnp.ndarray           # int8 scalar — TRANSMIT / REFLECT / ABSORB
 
 
-class Surface(NamedTuple):
-    """Trace-time planar surface — n1/n2 are scalar refractive indices."""
-    position: jnp.ndarray
-    normal: jnp.ndarray
-    half_extents: jnp.ndarray
-    local_x: jnp.ndarray
-    local_y: jnp.ndarray
-    n1: jnp.ndarray             # scalar
-    n2: jnp.ndarray             # scalar
-    reflectance: jnp.ndarray
-    mode: jnp.ndarray
+def interp_n(mat: MaterialData, wavelength) -> jnp.ndarray:
+    return jnp.interp(wavelength, mat.wavelengths, mat.n_values)
 
 
 def _transmit_step(state, direction, facing, intensity, color_idx):
@@ -71,7 +63,15 @@ def _absorb_step(direction, intensity):
 
 
 def surface_step(state: Surface, origin, direction, intensity, color_idx):
-    """One generic surface interaction on a wavelength-resolved surface."""
+    """One generic surface interaction. Mode-driven, no Python dispatch.
+
+    Each mode's physics lives in its own helper; this function intersects
+    the plane, runs all three helpers, and selects via ``jnp.where`` on
+    ``state.mode``. Same single-scan pytree, cleaner decomposition.
+
+    Returns:
+        out_pos, out_dir, out_intensity, hit, valid
+    """
     hit, t, in_bounds = ray_rect_intersect(
         origin, direction, state.position, state.normal,
         state.local_x, state.local_y, state.half_extents)
