@@ -21,7 +21,7 @@ from apollo14.combiner import (
 from apollo14.route import build_route, branch_path, absorb
 from apollo14.trace import prepare_beam, trace_beam
 from apollo14.projector import Projector, scan_directions
-from apollo14.visualizer import plot_system
+from apollo14.visualizer import plot_system, plot_pupil_fill
 from apollo14.units import mm, nm, deg
 
 
@@ -155,7 +155,25 @@ print("\n── Rendering 3D view (green channel) ──")
 # viz_traces has 7 entries per scan angle (6 branches + main).
 fig = plot_system(system, trace_results=viz_traces,
                   scan_angles=np.asarray(scan_angles), show=False)
-fig.write_html("jax_tracer_demo.html")
+fig.show()
+fig.write_html("examples/reports/jax_tracer_demo.html")
 print("Saved: jax_tracer_demo.html")
+
+# ── Pupil fill visualization ───────────────────────────────────────────────
+
+print("\n── Rendering pupil fill (green channel) ──")
+
+pupil_element = system.resolve("pupil")
+
+fig_pupil = plot_pupil_fill(
+    list(branch_beams["G"].values()),
+    projector, pupil_element,
+    x_fov, y_fov, num_x, num_y,
+    color_idx=RGB_COLOR_IDX["G"],
+    pixel_size=0.5,
+    show=False,
+)
+fig_pupil.write_html("examples/reports/jax_tracer_demo_pupil.html")
+print("Saved: jax_tracer_demo_pupil.html")
 
 print("\nDone.")

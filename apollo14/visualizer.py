@@ -113,36 +113,33 @@ def plot_system(system: OpticalSystem, trace_results: list[TraceResult] = None,
     return fig
 
 
-def plot_pupil_fill(system: OpticalSystem, projector, pupil_element,
+def plot_pupil_fill(beams, projector, pupil_element,
                     x_fov, y_fov, num_x_angles, num_y_angles,
-                    wavelength, pixel_size=0.1, show=True):
+                    color_idx: int = 0, pixel_size: float = 0.5,
+                    show: bool = True):
     """Plot pupil intensity heatmaps with a slider to step through scan angles.
 
-    Builds the main combiner path terminated at the pupil (absorbing),
-    prepares a beam for the given wavelength, and renders one heatmap per
-    scan angle.
+    Traces each ``Beam`` in ``beams`` at every scan angle and sums their
+    pupil hits into a 2D grid. Use one beam per reflected branch to see
+    the combined pupil fill from the whole combiner stack.
 
-    Returns a Plotly Figure.
+    Args:
+        beams: iterable of ``Beam`` — each is assumed to terminate on the
+            pupil (e.g. via ``absorb(pupil.name)``).
+        projector: ``Projector`` — generates origins and sweeps the FOV.
+        pupil_element: ``RectangularPupil`` — pupil geometry for binning.
+        x_fov, y_fov: scan extents in radians.
+        num_x_angles, num_y_angles: scan grid.
+        color_idx: which per-color reflectance channel to use.
+        pixel_size: bin size on the pupil plane in mm.
+
+    Returns:
+        Plotly Figure with one heatmap per scan angle and an angle slider.
     """
-    from apollo14.route import build_route, absorb
-    from apollo14.trace import prepare_beam, trace_beam
+    from apollo14.trace import trace_beam
     from apollo14.projector import scan_directions
 
-    # Main path + pupil as absorbing terminal surface.
-    chassis = next(e for e in system.elements if hasattr(e, "get_face"))
-    mirrors = [e for e in system.elements
-               if isinstance(e, PartialMirror)]
-    apertures = [e for e in system.elements
-                 if isinstance(e, RectangularAperture)]
-    path = []
-    if apertures:
-        path.append(apertures[0].name)
-    path.append((chassis.name, "back"))
-    path.extend(m.name for m in mirrors)
-    path.append((chassis.name, "front"))
-    path.append(absorb(pupil_element.name))
-    route = build_route(system, path)
-    beam = prepare_beam(route, wavelength)
+    beams = list(beams)
 
     pupil_center = np.asarray(pupil_element.position)
     pupil_normal = np.asarray(pupil_element.normal)
@@ -169,9 +166,13 @@ def plot_pupil_fill(system: OpticalSystem, projector, pupil_element,
             d = scan_dirs[iy, ix]
             ray_origins, _, _, _ = projector.generate_rays(direction=d)
 
-            tr = trace_beam(beam, ray_origins, d, color_idx=0)
-            grid = bin_hits_to_grid_np(tr, pupil_center, pupil_lx, pupil_ly,
-                                       bin_edges, bin_edges)
+            grid = np.zeros((n_bins, n_bins))
+            for beam in beams:
+                tr = trace_beam(beam, ray_origins, d, color_idx=color_idx)
+                grid += bin_hits_to_grid_np(
+                    tr, pupil_center, pupil_lx, pupil_ly,
+                    bin_edges, bin_edges,
+                )
 
             grids.append(grid)
             a_x = float(scan_angles[iy, ix, 0]) * 180 / np.pi
