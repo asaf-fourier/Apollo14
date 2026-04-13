@@ -1,7 +1,7 @@
 [project]
 name = "apollo14"
 version = "0.1.0"
-description = "JAX-based optical combiner simulation engine for AR glasses"
+description = "JAX-native sequential ray tracer for AR combiner optimization"
 requires-python = ">=3.14"
 dependencies = [
     "jax[cpu]",

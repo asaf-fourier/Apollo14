@@ -12,30 +12,32 @@ pytest tests/test_jax_tracer.py    # Run JAX tracer tests
 
 ## Project Overview
 
-Apollo14 is a rewrite of Apollo13 — a simulation engine for designing **compound optical combiners** for AR glasses. The combiner is a stack of cascaded thin partial mirrors glued together, cut at ~45 deg, and encased in ophthalmic glass to fit inside a regular eyeglass frame. Each mirror reflects a fraction of projector light toward the eye while transmitting the rest (plus ambient light) to the next mirror.
+Apollo14 is a **JAX-native sequential ray tracer** for designing compound optical combiners for AR glasses. The combiner is a stack of cascaded thin partial mirrors glued together, cut at ~45 deg, and encased in ophthalmic glass to fit inside a regular eyeglass frame. Each mirror reflects a fraction of projector light toward the eye while transmitting the rest (plus ambient light) to the next mirror.
+
+The tracer is fully differentiable — `jax.grad` flows through the entire simulation, enabling gradient-based optimization of mirror reflectances, spacing, and other parameters.
 
 ### Goals
 
-1. **Simulate the combiner** — non-sequential (detailed, full ray tree) and JAX-native (fast, differentiable) ray tracing.
+1. **Simulate the combiner** — JAX-native sequential ray tracing: fast, vectorized (`vmap`), JIT-compiled, and differentiable.
 2. **Output mirror reflectance curves** — per mirror, per incidence angle, across the visible spectrum. A separate project will design the actual thin-film coatings from these curves.
-3. **Enable JAX-based optimization** — the JAX tracer (`jax_tracer.py`) is fully differentiable so gradients flow through the simulation. Optimization lives in the `helios` package (see below). Primary optimization variables: per-color mirror reflectances and distances between mirrors; later possibly thickness and aperture.
+3. **Enable JAX-based optimization** — the tracer is fully differentiable so gradients flow through the simulation. Optimization lives in the `helios` package (see below). Primary optimization variables: per-color mirror reflectances and distances between mirrors; later possibly thickness and aperture.
 
 ## Architecture
 
-### Two tracers, different purposes
+### JAX sequential tracer
 
-- **Non-sequential tracer** (`tracer.py`) — full ray tree with branching at every surface. Python-based, uses `isinstance` dispatch. For detailed analysis and visualization.
-- **JAX tracer** (`jax_tracer.py`) — path-based, pure JAX, no Python control flow on array values. Optical paths are defined as data (`PathStep` sequences), making the tracer system-agnostic. The generic entry point is `trace_path`; combiner-specific paths are built by `build_combiner_paths`. Fully differentiable via `jax.grad`. Three combiner convenience functions:
-  - `trace_ray` — single ray
-  - `trace_batch` — N rays with N different directions (angular scan)
-  - `trace_beam` — N rays with shared direction (projector beam, paths built once outside vmap)
+The tracer follows predefined optical paths (sequences of surfaces) rather than branching ray trees. Each optical element provides a `jax_interact()` method — a pure JAX function that computes intersections, refractions, or reflections without Python control flow on traced values. The tracer orchestrates these via `jax.lax.scan` over homogeneous sequences (e.g., the mirror stack), keeping dynamic path lengths while avoiding `jnp.where`-based type dispatch.
+
+Key design:
+- **Per-element JAX methods** — physics lives on the element (e.g., `PartialMirror.jax_interact()`), not in a monolithic tracer function.
+- **Homogeneous scan** — main path is a `lax.scan` over mirrors (all same type), branch paths (exit face + pupil) are short and unrolled.
+- **vmap for batching** — `trace_beam` vmaps over ray origins with shared direction; `trace_batch` vmaps over both origins and directions.
+- **Differentiable** — `jax.grad` through the full pipeline for optimization.
 
 ### Key modules
 
-- `combiner.py` — `CombinerConfig` dataclass and `build_system()` for constructing the optical system
-- `jax_tracer.py` — path-based differentiable tracer with `PathStep`, `CombinerParams`, `trace_path`, `build_combiner_paths`, and `params_from_config()`
-- `tracer.py` — non-sequential tracer returning `TraceResult` with `TraceHit` tree
-- `interaction.py` — `Interaction` enum (REFLECTED, TRANSMITTED, ENTERING, EXITING, TIR, ABSORBED)
+- `combiner.py` — `build_default_system()` for constructing the Talos reference optical system
+- `jax_tracer.py` — sequential differentiable tracer with `CombinerPath`, `trace_combiner_beam`, `trace_combiner_batch`, `trace_combiner_ray`
 - `geometry.py` — JAX-native primitives: `reflect`, `snell_refract`, `ray_plane_intersection`, `normalize`
 - `materials.py` — `Material` class with wavelength-dependent refractive index interpolation
 - `projector.py` — `Projector` class and `scan_directions` for FOV scanning
@@ -48,20 +50,22 @@ Helios is the optimization layer. It imports from `apollo14` but **`apollo14` mu
 
 #### Key modules
 
-- `merit.py` — D65 white-balance merit function sampling pupil positions and FOV angles; `MeritConfig`, `evaluate_merit`, `simulate_pupil_response`
+- `merit.py` — D65 white-balance merit function; `MeritConfig`, `evaluate_merit`
+- `eyebox.py` — eye-box area and uniformity merit functions; `EyeboxConfig`, `EyeboxAreaConfig`, `compute_eyebox_response`, `eyebox_merit`, `eyebox_area_merit`
 
 #### Optimization targets
 
 - Target: ~10% of projector light reaches a ~10x10 mm pupil (eyebox) uniformly across ~20x20 deg FOV, while maximizing ambient transparency.
 - Merit function: takes a base target efficiency, tries to make the entire pupil D65-white-balanced.
 - Mirror reflectances are per-color (R/G/B) for white-balance optimization.
+- Eye-box area merit: maximize the number of pupil grid cells where all FOV angles exceed a minimum intensity threshold.
 
 ### Principles
 
 - **JAX everywhere** in the ray tracing math — arrays, not scalar dataclasses. Critical for differentiability.
-- **Clean API** — the system definition and tracers should be usable as a library by the optimization project.
+- **Physics on elements** — each optical element owns its JAX interaction method. The tracer orchestrates, elements compute.
+- **Clean API** — the system definition and tracer should be usable as a library by the optimization project.
 - **Plotly for visualization** — interactive 3D renders of the system with slider to step through scan angles.
-- **Interaction types are enums** — use `Interaction.REFLECTED` etc., never raw strings.
 
 ## Target System (Talos)
 
