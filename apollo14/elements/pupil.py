@@ -1,68 +1,76 @@
+"""Detector elements — record ray hits on a planar surface."""
+
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import jax.numpy as jnp
 
-from apollo14.geometry import normalize, ray_plane_intersection, compute_local_axes, point_in_circle, point_in_rect
+from apollo14.geometry import normalize, compute_local_axes
 
 
-@dataclass
-class Pupil:
-    """Circular detector plane. Records hits but produces no child rays."""
-    name: str
-    position: jnp.ndarray  # (3,)
-    normal: jnp.ndarray    # (3,)
-    radius: float
-
-    def find_intersection(self, origin, direction):
-        n = normalize(self.normal)
-        dist = ray_plane_intersection(origin, direction, n, self.position)
-        if dist == jnp.inf:
-            return None
-
-        hit = origin + dist * direction
-        local_x, local_y = compute_local_axes(n)
-        delta = hit - self.position
-        lx = jnp.dot(delta, local_x)
-        ly = jnp.dot(delta, local_y)
-
-        if not point_in_circle(lx, ly, self.radius):
-            return None
-
-        hit_normal = jnp.where(jnp.dot(direction, n) < 0, n, -n)
-        return dist, hit, hit_normal
-
-    def interact(self, origin, direction, intensity):
-        """Pupil absorbs — returns empty list (ray stops, hit is recorded by tracer)."""
-        return []
+class DetectorState(NamedTuple):
+    """JAX-traceable state for a rectangular detector (pupil)."""
+    position: jnp.ndarray       # (3,)
+    normal: jnp.ndarray         # (3,) unit normal
+    half_extents: jnp.ndarray   # (2,) [half_width, half_height]
+    local_x: jnp.ndarray        # (3,)
+    local_y: jnp.ndarray        # (3,)
 
 
 @dataclass
 class RectangularPupil:
-    """Rectangular detector plane. Records hits but produces no child rays."""
+    """Rectangular detector plane. Records hits, produces no child rays.
+
+    The static ``jax_interact`` method is the pure-JAX detection kernel.
+    """
     name: str
     position: jnp.ndarray  # (3,)
     normal: jnp.ndarray    # (3,)
     width: float
     height: float
 
-    def find_intersection(self, origin, direction):
-        n = normalize(self.normal)
-        dist = ray_plane_intersection(origin, direction, n, self.position)
-        if dist == jnp.inf:
-            return None
+    def __post_init__(self):
+        self.normal = normalize(jnp.asarray(self.normal, dtype=jnp.float32))
+        self.position = jnp.asarray(self.position, dtype=jnp.float32)
 
-        hit = origin + dist * direction
-        local_x, local_y = compute_local_axes(n)
-        delta = hit - self.position
-        lx = jnp.dot(delta, local_x)
-        ly = jnp.dot(delta, local_y)
+    @property
+    def state(self) -> DetectorState:
+        lx, ly = compute_local_axes(self.normal)
+        return DetectorState(
+            position=self.position,
+            normal=self.normal,
+            half_extents=jnp.array([self.width / 2.0, self.height / 2.0]),
+            local_x=lx,
+            local_y=ly,
+        )
 
-        if not point_in_rect(lx, ly, self.width / 2, self.height / 2):
-            return None
+    @staticmethod
+    def jax_interact(state: DetectorState, origin, direction, intensity):
+        """Pure JAX: intersect detector plane, check bounds.
 
-        hit_normal = jnp.where(jnp.dot(direction, n) < 0, n, -n)
-        return dist, hit, hit_normal
+        Args:
+            state: DetectorState for this detector.
+            origin: (3,) ray position.
+            direction: (3,) ray direction (normalized).
+            intensity: scalar, current ray intensity.
 
-    def interact(self, origin, direction, intensity):
-        """Pupil absorbs — returns empty list (ray stops, hit is recorded by tracer)."""
-        return []
+        Returns:
+            hit: (3,) intersection point on the detector plane.
+            intensity: scalar (unchanged).
+            valid: bool, whether the ray hit within detector bounds.
+        """
+        denom = jnp.dot(direction, state.normal)
+        t = jnp.dot(state.position - origin, state.normal) / (denom + 1e-30)
+        hit = origin + jnp.maximum(t, 0.0) * direction
+
+        delta = hit - state.position
+        valid = (
+            (jnp.abs(jnp.dot(delta, state.local_x)) <= state.half_extents[0]) &
+            (jnp.abs(jnp.dot(delta, state.local_y)) <= state.half_extents[1]) &
+            (t > 0)
+        )
+        return hit, intensity, valid
+
+
+# Keep Pupil as alias for backward compat during transition
+Pupil = RectangularPupil

@@ -1,16 +1,16 @@
+"""Glass block element — refractive volume defined by planar faces."""
+
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List
 
 import jax.numpy as jnp
 import numpy as np
 
-from apollo14.interaction import Interaction
 from apollo14.geometry import (
-    normalize, ray_plane_intersection, compute_local_axes,
-    point_in_polygon_2d, reflect, snell_refract,
+    normalize, compute_local_axes, point_in_polygon_2d,
 )
 from apollo14.materials import Material
-from apollo14.units import EPSILON
+from apollo14.elements.refracting_surface import RefractingSurface
 
 
 @dataclass
@@ -26,82 +26,61 @@ class GlassFace:
         local_x, local_y = compute_local_axes(self.normal)
         self._local_x = local_x
         self._local_y = local_y
-        # Pre-compute 2D vertices
+        # Pre-compute 2D vertices for containment testing
         deltas = self.vertices - self.position
         self._verts_x = jnp.array([jnp.dot(d, local_x) for d in deltas])
         self._verts_y = jnp.array([jnp.dot(d, local_y) for d in deltas])
 
-    def is_point_on_face(self, point):
-        delta = point - self.position
-        if jnp.abs(jnp.dot(delta, self.normal)) > EPSILON:
-            return False
-        lx = jnp.dot(delta, self._local_x)
-        ly = jnp.dot(delta, self._local_y)
-        return point_in_polygon_2d(lx, ly, self._verts_x, self._verts_y)
+    @property
+    def half_extents(self):
+        """Compute rectangular half-extents from vertex bounding box."""
+        hw = float(jnp.max(jnp.abs(self._verts_x)))
+        hh = float(jnp.max(jnp.abs(self._verts_y)))
+        return hw, hh
 
 
 @dataclass
 class GlassBlock:
-    """A refractive glass volume defined by planar faces."""
+    """A refractive glass volume defined by planar faces.
+
+    Construction helper: holds geometry and material. Use ``.face()`` to
+    produce ``RefractingSurface`` instances for route building.
+    """
     name: str
     position: jnp.ndarray   # (3,) center
     material: Material
     faces: List[GlassFace] = field(default_factory=list)
 
-    def is_point_inside(self, point):
-        for face in self.faces:
-            if jnp.dot(point - face.position, face.normal) > EPSILON:
-                return False
-        return True
+    def get_face(self, name: str) -> GlassFace:
+        """Get a face by name."""
+        for f in self.faces:
+            if f.name == name:
+                return f
+        raise KeyError(f"No face named '{name}' in {self.name}. "
+                       f"Available: {[f.name for f in self.faces]}")
 
-    def find_intersection(self, origin, direction):
-        """Returns (distance, hit_point, face_normal, face_name) or None."""
-        origin_inside = self.is_point_inside(origin)
-        best_dist = jnp.inf
-        best_result = None
+    def face(self, name: str, n1: float, n2: float) -> RefractingSurface:
+        """Create a RefractingSurface from a named face.
 
-        for face in self.faces:
-            t = ray_plane_intersection(origin, direction, face.normal, face.position)
-            if t == jnp.inf or t <= EPSILON:
-                continue
+        Args:
+            name: face name (e.g., "back", "top", "front").
+            n1: refractive index on incoming side.
+            n2: refractive index on outgoing side.
 
-            hit = origin + t * direction
-            if not face.is_point_on_face(hit):
-                continue
-
-            dot_dn = jnp.dot(direction, face.normal)
-            # Inside → expect exiting (dot > 0), outside → expect entering (dot < 0)
-            valid = (origin_inside and dot_dn > 0) or (not origin_inside and dot_dn < 0)
-            if valid and t < best_dist:
-                best_dist = t
-                best_result = (t, hit, face.normal, face.name)
-
-        return best_result
-
-    def interact(self, origin, direction, intensity, wavelength, env_material):
-        """Refract or TIR at the glass block surface.
-
-        Returns list of (new_origin, new_direction, new_intensity, interaction_type).
+        Returns:
+            RefractingSurface with the face geometry and given indices.
         """
-        result = self.find_intersection(origin, direction)
-        if result is None:
-            return []
-
-        dist, hit, face_normal, face_name = result
-        is_entering = jnp.dot(direction, face_normal) < 0
-
-        if is_entering:
-            n1 = float(env_material.n(wavelength))
-            n2 = float(self.material.n(wavelength))
-            normal_for_snell = face_normal
-        else:
-            n1 = float(self.material.n(wavelength))
-            n2 = float(env_material.n(wavelength))
-            normal_for_snell = -face_normal
-
-        new_dir, is_tir = snell_refract(direction, normal_for_snell, n1, n2)
-        interaction = Interaction.TIR if is_tir else (Interaction.ENTERING if is_entering else Interaction.EXITING)
-        return [(hit, new_dir, intensity, interaction)]
+        f = self.get_face(name)
+        hw, hh = f.half_extents
+        return RefractingSurface(
+            name=f"{self.name}.{name}",
+            position=f.position,
+            normal=f.normal,
+            half_width=hw,
+            half_height=hh,
+            n1=n1,
+            n2=n2,
+        )
 
     @classmethod
     def create_chassis(cls, name, x, y, z, material, z_skew=0.0):
@@ -125,7 +104,6 @@ class GlassBlock:
                              vertices=jnp.stack(verts))
 
         def _face_from_edges(name, verts):
-            """Compute normal from edge cross product."""
             pos = verts[0]
             e1 = normalize(verts[1] - verts[0])
             e2 = normalize(verts[3] - verts[0])
