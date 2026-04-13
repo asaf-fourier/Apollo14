@@ -10,13 +10,8 @@ from apollo14.combiner import (
     DEFAULT_WAVELENGTH,
 )
 from apollo14.surface import TRANSMIT, REFLECT
-from apollo14.trace import (
-    build_route,
-    combiner_main_path,
-    prepare_beam,
-    trace,
-    trace_beam,
-)
+from apollo14.route import build_route, combiner_main_path
+from apollo14.trace import prepare_beam, trace, trace_beam
 
 
 class TestBuildRoute:

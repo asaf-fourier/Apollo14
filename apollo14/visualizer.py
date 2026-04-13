@@ -124,10 +124,8 @@ def plot_pupil_fill(system: OpticalSystem, projector, pupil_element,
 
     Returns a Plotly Figure.
     """
-    from apollo14.trace import (
-        build_route, prepare_beam, trace_beam, combiner_main_path,
-    )
-    from apollo14.surface import ABSORB
+    from apollo14.route import build_route, absorb
+    from apollo14.trace import prepare_beam, trace_beam
     from apollo14.projector import scan_directions
 
     # Main path + pupil as absorbing terminal surface.
@@ -142,7 +140,7 @@ def plot_pupil_fill(system: OpticalSystem, projector, pupil_element,
     path.append((chassis.name, "back"))
     path.extend(m.name for m in mirrors)
     path.append((chassis.name, "front"))
-    path.append((pupil_element.name, ABSORB))
+    path.append(absorb(pupil_element.name))
     route = build_route(system, path)
     beam = prepare_beam(route, wavelength)
 
