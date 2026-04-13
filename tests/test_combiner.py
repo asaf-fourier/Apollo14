@@ -1,18 +1,18 @@
 import jax.numpy as jnp
 
 from apollo14.combiner import build_default_system, DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION, DEFAULT_WAVELENGTH
-from apollo14.tracer import trace_nonsequential
+from apollo14.route import display_route
+from apollo14.trace import trace_ray, trace_beam
 from apollo14.elements.surface import PartialMirror
 from apollo14.elements.glass_block import GlassBlock
 from apollo14.elements.pupil import Pupil, RectangularPupil
-from apollo14.elements.boundary import BoundaryPlane
 
 
 def test_default_system_creates_elements():
     system = build_default_system()
 
-    # 1 chassis + 1 aperture + 6 mirrors + 1 pupil + 6 boundary planes = 15
-    assert len(system.elements) == 15
+    # 1 chassis + 1 aperture + 6 mirrors + 1 pupil = 9
+    assert len(system.elements) == 9
 
     mirrors = [e for e in system.elements if isinstance(e, PartialMirror)]
     assert len(mirrors) == 6
@@ -23,31 +23,29 @@ def test_default_system_creates_elements():
     pupils = [e for e in system.elements if isinstance(e, (Pupil, RectangularPupil))]
     assert len(pupils) == 1
 
-    boundaries = [e for e in system.elements if isinstance(e, BoundaryPlane)]
-    assert len(boundaries) == 6
-
 
 def test_trace_on_axis_ray():
     system = build_default_system()
+    route = display_route(system, DEFAULT_WAVELENGTH)
 
-    result = trace_nonsequential(system, DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
-                                  DEFAULT_WAVELENGTH)
-    assert len(result.flat_hits()) > 0, "Ray should hit something"
-
-    mirror_hits = [h for h in result.flat_hits() if h.element_name.startswith("mirror_")]
-    assert len(mirror_hits) > 0, "Ray should hit at least one mirror"
+    result = trace_ray(DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION, route)
+    assert result.intensities.shape == (6,)
+    assert jnp.any(result.valid), "On-axis ray should hit at least one mirror"
+    assert float(result.total_intensity) > 0
 
 
-def test_jax_trace():
-    from apollo14.jax_tracer import trace_ray, params_from_system
-    from apollo14.elements.glass_block import GlassBlock
+def test_trace_beam():
+    from apollo14.projector import Projector
+    from apollo14.units import mm
 
     system = build_default_system()
-    params = params_from_system(system, DEFAULT_WAVELENGTH)
-    chassis = next(e for e in system.elements if isinstance(e, GlassBlock))
-    n_glass = float(chassis.material.n(DEFAULT_WAVELENGTH))
+    route = display_route(system, DEFAULT_WAVELENGTH)
 
-    pts, ints, valid, _, _ = trace_ray(
-        DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION, n_glass, params)
-    assert ints.shape == (6,)
-    assert jnp.any(valid)
+    proj = Projector.uniform(
+        DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
+        4.0 * mm, 2.0 * mm, DEFAULT_WAVELENGTH, nx=3, ny=3)
+    origins, _, _, _ = proj.generate_rays()
+
+    result = trace_beam(origins, DEFAULT_LIGHT_DIRECTION, route, color_idx=0)
+    assert result.intensities.shape == (9, 6)
+    assert float(result.total_intensity.sum()) > 0

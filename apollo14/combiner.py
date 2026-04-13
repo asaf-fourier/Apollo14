@@ -1,3 +1,5 @@
+"""Talos reference combiner system definition."""
+
 import jax.numpy as jnp
 
 from apollo14.units import mm, nm, deg
@@ -22,16 +24,38 @@ DEFAULT_NUM_X_STEPS = 5
 DEFAULT_NUM_Y_STEPS = 5
 
 
-def build_default_system(stage_margin: float = 10.0) -> OpticalSystem:
+def compensated_reflectances(ratio, num_mirrors):
+    """Compute per-mirror reflectances compensated for upstream losses.
+
+    Each mirror reflects ``ratio`` of the *original* beam intensity. Because
+    earlier mirrors absorb light, later mirrors need a higher local
+    reflectance to achieve the same absolute reflected amount::
+
+        r[i] = ratio / (1 - i * ratio)
+
+    Args:
+        ratio: Target fraction of original intensity reflected by each mirror.
+            Either a scalar (same for all colors) or a (3,) array [R,G,B].
+        num_mirrors: Number of mirrors (M).
+
+    Returns:
+        (M, 3) array of per-mirror, per-color reflectances.
+    """
+    ratio = jnp.atleast_1d(jnp.asarray(ratio))
+    if ratio.shape == ():
+        ratio = jnp.broadcast_to(ratio, (3,))
+    elif ratio.shape == (1,):
+        ratio = jnp.broadcast_to(ratio, (3,))
+    i = jnp.arange(num_mirrors)[:, None]  # (M, 1)
+    return ratio[None, :] / (1.0 - i * ratio[None, :])  # (M, 3)
+
+
+def build_default_system() -> OpticalSystem:
     """Build the Talos reference combiner system.
 
     Creates a 6-mirror AR combiner: glass chassis with cascaded partial
     mirrors, aperture, and rectangular pupil. All parameters match the
     Apollo13 Talos reference design.
-
-    Args:
-        stage_margin: Margin around system elements for the Stage boundary.
-            Set to 0 to skip adding a stage.
 
     Returns:
         OpticalSystem with all elements added.
@@ -68,7 +92,10 @@ def build_default_system(stage_margin: float = 10.0) -> OpticalSystem:
                                 float(jnp.cos(normal_angle))])
     mirror_x_width = float(cx)
     mirror_y_width = float(cz / jnp.cos(mirror_angle))
-    reflection_ratio = jnp.array([0.05, 0.05, 0.05])
+
+    # Per-mirror compensated reflectances (equal absolute intensity per mirror)
+    base_reflectance = jnp.array([0.05, 0.05, 0.05])
+    refl_table = compensated_reflectances(base_reflectance, num_mirrors)
 
     first_mirror_center = chassis_center + jnp.array([0.0, 5.0 * mm, 0.0])
     distance_between_mirrors = 1.47 * mm
@@ -78,23 +105,14 @@ def build_default_system(stage_margin: float = 10.0) -> OpticalSystem:
     mirror_offset_y = distance_between_mirrors / mirror_normal[1]
     mirror_offset = jnp.array([0.0, float(mirror_offset_y), 0.0])
 
-    # Non-sequential tracer uses scalar reflectance (mean across colors)
-    global_refl = float(jnp.mean(reflection_ratio))
-    transmitted_light = 1.0
-
     for i in range(num_mirrors):
-        refl_ratio = global_refl / transmitted_light
-        transmitted_light -= global_refl
-        trans_ratio = 1.0 - refl_ratio
-
         system.add(PartialMirror(
             name=f"mirror_{i}",
             position=first_pos - i * mirror_offset,
             normal=mirror_normal.copy(),
             width=mirror_x_width,
             height=mirror_y_width,
-            transmission_ratio=trans_ratio,
-            reflection_ratio=refl_ratio,
+            reflectance=refl_table[i],
         ))
 
     # ── Pupil ────────────────────────────────────────────────────────────
@@ -108,11 +126,5 @@ def build_default_system(stage_margin: float = 10.0) -> OpticalSystem:
         width=10.0 * mm,
         height=14.0 * mm,
     ))
-
-    # ── Stage boundary ───────────────────────────────────────────────────
-    if stage_margin > 0:
-        from apollo14.stage import Stage
-        stage = Stage.from_system(system, margin=stage_margin)
-        stage.add_to_system(system)
 
     return system

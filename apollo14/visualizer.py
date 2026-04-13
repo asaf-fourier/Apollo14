@@ -8,8 +8,7 @@ from apollo14.elements.surface import PartialMirror
 from apollo14.elements.glass_block import GlassBlock, GlassFace
 from apollo14.elements.aperture import RectangularAperture
 from apollo14.elements.pupil import Pupil, RectangularPupil
-from apollo14.elements.boundary import BoundaryPlane
-from apollo14.tracer import TraceResult
+from apollo14.trace import TraceResult
 from apollo14.geometry import compute_local_axes
 
 
@@ -32,9 +31,7 @@ def plot_system(system: OpticalSystem, trace_results: list[TraceResult] = None,
 
     # ── static element traces ────────────────────────────────────────────
     for elem in system.elements:
-        if isinstance(elem, BoundaryPlane):
-            pass  # infinite planes — not rendered, but they catch stray rays
-        elif isinstance(elem, GlassBlock):
+        if isinstance(elem, GlassBlock):
             _add_glass_block(static_traces, elem)
         elif isinstance(elem, PartialMirror):
             _add_mirror(static_traces, elem)
@@ -122,121 +119,20 @@ def plot_pupil_fill(system: OpticalSystem, projector, pupil_element,
 
     Returns a Plotly Figure.
     """
-    from apollo14.projector import scan_directions
-    from apollo14.tracer import trace_nonsequential
+    from apollo14.route import display_route
 
-    scan_dirs, scan_angles = scan_directions(
-        projector.direction, x_fov, y_fov, num_x_angles, num_y_angles,
+    route = display_route(system, wavelength)
+    return plot_route_pupil_fill(
+        projector, route, pupil_element,
+        x_fov, y_fov, num_x_angles, num_y_angles,
+        pixel_size=pixel_size, show=show,
     )
 
-    pupil_pos = np.array(pupil_element.position)
-    pupil_normal = pupil_element.normal
-    pupil_r = pupil_element.radius
-    lx, ly = compute_local_axes(pupil_normal)
-    lx, ly = np.array(lx), np.array(ly)
 
-    n_bins = int(np.ceil(2 * pupil_r / pixel_size))
-    bin_edges = np.linspace(-pupil_r, pupil_r, n_bins + 1)
-
-    # Trace all angles and collect grids
-    grids = []
-    labels = []
-    for iy in range(num_y_angles):
-        for ix in range(num_x_angles):
-            d = scan_dirs[iy, ix]
-            origins, directions, intensities, _ = projector.generate_rays(direction=d)
-
-            grid = np.zeros((n_bins, n_bins))
-            for ri in range(origins.shape[0]):
-                tr = trace_nonsequential(
-                    system, origins[ri], directions[ri], wavelength,
-                    intensity=float(intensities[ri]),
-                )
-                if tr.pupil_hit is None:
-                    continue
-                hit_pt = np.array(tr.pupil_hit.point)
-                hit_intensity = float(tr.pupil_hit.intensity)
-                delta = hit_pt - pupil_pos
-                px = float(np.dot(delta, lx))
-                py = float(np.dot(delta, ly))
-                bx = np.searchsorted(bin_edges, px) - 1
-                by = np.searchsorted(bin_edges, py) - 1
-                if 0 <= bx < n_bins and 0 <= by < n_bins:
-                    grid[by, bx] += hit_intensity
-
-            grids.append(grid)
-            angle_x_deg = float(scan_angles[iy, ix, 0]) * 180 / np.pi
-            angle_y_deg = float(scan_angles[iy, ix, 1]) * 180 / np.pi
-            labels.append(f"({angle_x_deg:.1f}, {angle_y_deg:.1f}) deg")
-
-    vmax = max(g.max() for g in grids) if grids else 1.0
-    if vmax == 0:
-        vmax = 1.0
-
-    # Pupil boundary circle
-    theta = np.linspace(0, 2 * np.pi, 100)
-    circle_x = pupil_r * np.cos(theta)
-    circle_y = pupil_r * np.sin(theta)
-
-    fig = go.Figure()
-
-    for i, (grid, label) in enumerate(zip(grids, labels)):
-        fig.add_trace(go.Heatmap(
-            z=grid,
-            x0=-pupil_r, dx=2 * pupil_r / n_bins,
-            y0=-pupil_r, dy=2 * pupil_r / n_bins,
-            zmin=0, zmax=vmax,
-            colorscale='Viridis',
-            name=label,
-            visible=(i == 0),
-            colorbar=dict(title="Intensity"),
-        ))
-
-    # Pupil boundary (always visible on all steps)
-    fig.add_trace(go.Scatter(
-        x=np.concatenate([circle_x, [circle_x[0]]]).tolist(),
-        y=np.concatenate([circle_y, [circle_y[0]]]).tolist(),
-        mode='lines',
-        line=dict(color='red', dash='dash', width=1),
-        name='Pupil boundary',
-        visible=True,
-    ))
-
-    n_heatmaps = len(grids)
-    boundary_idx = n_heatmaps  # index of the circle trace
-
-    steps = []
-    for i, label in enumerate(labels):
-        vis = [False] * n_heatmaps + [True]  # boundary always on
-        vis[i] = True
-        steps.append(dict(
-            args=[{'visible': vis}],
-            label=label,
-            method='restyle',
-        ))
-
-    fig.update_layout(
-        title='Pupil fill per scan angle',
-        xaxis_title='mm',
-        yaxis_title='mm',
-        yaxis_scaleanchor='x',
-        sliders=[dict(
-            pad=dict(b=10, t=60),
-            len=0.9, x=0.1, y=0,
-            steps=steps,
-            currentvalue=dict(prefix="Angle: "),
-        )] if steps else None,
-    )
-
-    if show:
-        fig.show()
-    return fig
-
-
-def plot_jax_pupil_fill(projector, params, n_glass,
-                        x_fov, y_fov, num_x_angles, num_y_angles,
-                        pixel_size=0.5, show=True):
-    """Plot pupil intensity heatmaps using the JAX tracer, with an angle slider.
+def plot_route_pupil_fill(projector, route, pupil_element,
+                         x_fov, y_fov, num_x_angles, num_y_angles,
+                         pixel_size=0.5, show=True):
+    """Plot pupil intensity heatmaps with a slider to step through scan angles.
 
     Traces a beam at each scan angle using ``trace_beam``, bins pupil hits
     into a 2D spatial grid, and renders one heatmap per angle with a Plotly
@@ -244,8 +140,8 @@ def plot_jax_pupil_fill(projector, params, n_glass,
 
     Args:
         projector: Projector instance (beam geometry for tracing).
-        params: CombinerParams from ``params_from_system()``.
-        n_glass: Refractive index of chassis glass at trace wavelength.
+        route: Route from ``display_route()``.
+        pupil_element: RectangularPupil element for geometry.
         x_fov: Horizontal field of view (radians).
         y_fov: Vertical field of view (radians).
         num_x_angles: Number of horizontal scan steps.
@@ -257,16 +153,17 @@ def plot_jax_pupil_fill(projector, params, n_glass,
         Plotly Figure.
     """
     import jax.numpy as jnp
-    from apollo14.jax_tracer import trace_beam, CombinerParams
+    from apollo14.trace import trace_beam
     from apollo14.projector import scan_directions
 
-    pupil_hw = float(params.pupil_half_width)
-    pupil_hh = float(params.pupil_half_height)
-    pupil_center = params.pupil_center
-    pupil_lx = params.pupil_local_x
-    pupil_ly = params.pupil_local_y
+    pupil_center = np.asarray(pupil_element.position)
+    pupil_normal = np.asarray(pupil_element.normal)
+    pupil_lx, pupil_ly = compute_local_axes(pupil_normal)
+    pupil_lx, pupil_ly = np.asarray(pupil_lx), np.asarray(pupil_ly)
+    pupil_hw = pupil_element.width / 2
+    pupil_hh = pupil_element.height / 2
 
-    pupil_r = max(pupil_hw, pupil_hh)
+    pupil_r = max(float(pupil_hw), float(pupil_hh))
     n_bins = int(np.ceil(2 * pupil_r / pixel_size))
     bin_edges = np.linspace(-pupil_r, pupil_r, n_bins + 1)
     bin_centers_x = (bin_edges[:-1] + bin_edges[1:]) / 2
@@ -284,20 +181,24 @@ def plot_jax_pupil_fill(projector, params, n_glass,
             d = scan_dirs[iy, ix]
             ray_origins, _, _, _ = projector.generate_rays(direction=d)
 
-            pts, ints, valid, _, _ = trace_beam(ray_origins, d, n_glass, params)
+            tr = trace_beam(ray_origins, d, route, color_idx=0)
 
             grid = np.zeros((n_bins, n_bins))
-            for ri in range(pts.shape[0]):
-                for mi in range(pts.shape[1]):
-                    if not valid[ri, mi]:
+            pts_np = np.asarray(tr.pupil_points)
+            ints_np = np.asarray(tr.intensities)
+            valid_np = np.asarray(tr.valid)
+
+            for ri in range(pts_np.shape[0]):
+                for mi in range(pts_np.shape[1]):
+                    if not valid_np[ri, mi]:
                         continue
-                    delta = pts[ri, mi] - pupil_center
-                    px = float(jnp.dot(delta, pupil_lx))
-                    py = float(jnp.dot(delta, pupil_ly))
+                    delta = pts_np[ri, mi] - pupil_center
+                    px = float(np.dot(delta, pupil_lx))
+                    py = float(np.dot(delta, pupil_ly))
                     bx = np.searchsorted(bin_edges, px) - 1
                     by = np.searchsorted(bin_edges, py) - 1
                     if 0 <= bx < n_bins and 0 <= by < n_bins:
-                        grid[by, bx] += float(ints[ri, mi])
+                        grid[by, bx] += float(ints_np[ri, mi])
 
             grids.append(grid)
             a_x = float(scan_angles[iy, ix, 0]) * 180 / np.pi
@@ -308,10 +209,9 @@ def plot_jax_pupil_fill(projector, params, n_glass,
     if vmax == 0:
         vmax = 1.0
 
-    # Pupil boundary circle
-    theta = np.linspace(0, 2 * np.pi, 100)
-    circle_x = (pupil_r * np.cos(theta)).tolist()
-    circle_y = (pupil_r * np.sin(theta)).tolist()
+    # Pupil boundary rectangle
+    rect_x = [-pupil_hw, pupil_hw, pupil_hw, -pupil_hw, -pupil_hw]
+    rect_y = [-pupil_hh, -pupil_hh, pupil_hh, pupil_hh, -pupil_hh]
 
     fig = go.Figure()
 
@@ -328,8 +228,8 @@ def plot_jax_pupil_fill(projector, params, n_glass,
         ))
 
     fig.add_trace(go.Scatter(
-        x=circle_x + [circle_x[0]],
-        y=circle_y + [circle_y[0]],
+        x=[float(x) for x in rect_x],
+        y=[float(y) for y in rect_y],
         mode='lines',
         line=dict(color='red', dash='dash', width=1),
         name='Pupil boundary',
@@ -344,7 +244,7 @@ def plot_jax_pupil_fill(projector, params, n_glass,
         steps.append(dict(args=[{'visible': vis}], label=label, method='restyle'))
 
     fig.update_layout(
-        title='Pupil fill per scan angle (JAX tracer)',
+        title='Pupil fill per scan angle',
         xaxis_title='mm',
         yaxis_title='mm',
         yaxis_scaleanchor='x',

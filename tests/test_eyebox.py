@@ -7,25 +7,23 @@ from apollo14.combiner import (
     DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION, DEFAULT_WAVELENGTH,
     DEFAULT_BEAM_WIDTH, DEFAULT_BEAM_HEIGHT, DEFAULT_X_FOV, DEFAULT_Y_FOV,
 )
-from apollo14.elements.glass_block import GlassBlock
 from apollo14.elements.pupil import RectangularPupil
-from apollo14.jax_tracer import params_from_system
+from apollo14.route import display_route
 from apollo14.units import mm
 
 from helios.eyebox import (
     EyeboxConfig, eyebox_sample_points, eyebox_grid_points,
     compute_eyebox_response, eyebox_merit, visible_fov,
+    EyeboxAreaConfig, eyebox_area_merit, cell_grid_from_cell_size,
 )
 
 
 @pytest.fixture
 def default_setup():
     system = build_default_system()
-    params = params_from_system(system, DEFAULT_WAVELENGTH)
-    chassis = next(e for e in system.elements if isinstance(e, GlassBlock))
-    n_glass = float(chassis.material.n(DEFAULT_WAVELENGTH))
+    route = display_route(system, DEFAULT_WAVELENGTH)
     pupil = next(e for e in system.elements if isinstance(e, RectangularPupil))
-    return params, n_glass, pupil
+    return route, pupil
 
 
 # ── Eyebox sampling ─────────────────────────────────────────────────────────
@@ -86,14 +84,14 @@ class TestEyeboxSampling:
 class TestEyeboxResponse:
 
     def test_response_shape(self, default_setup):
-        params, n_glass, pupil = default_setup
+        route, pupil = default_setup
         grid = eyebox_grid_points(
             pupil.position, pupil.normal, pupil.width / 2,
             nx=3, ny=3)
         mc = EyeboxConfig(n_fov_x=3, n_fov_y=3)
 
         response, dirs = compute_eyebox_response(
-            params, n_glass,
+            route,
             DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
             DEFAULT_BEAM_WIDTH, DEFAULT_BEAM_HEIGHT,
             DEFAULT_X_FOV, DEFAULT_Y_FOV,
@@ -103,14 +101,14 @@ class TestEyeboxResponse:
         assert dirs.shape == (9, 3)
 
     def test_response_nonnegative(self, default_setup):
-        params, n_glass, pupil = default_setup
+        route, pupil = default_setup
         grid = eyebox_grid_points(
             pupil.position, pupil.normal, pupil.width / 2,
             nx=3, ny=3)
         mc = EyeboxConfig(n_fov_x=3, n_fov_y=3)
 
         response, _ = compute_eyebox_response(
-            params, n_glass,
+            route,
             DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
             DEFAULT_BEAM_WIDTH, DEFAULT_BEAM_HEIGHT,
             DEFAULT_X_FOV, DEFAULT_Y_FOV,
@@ -120,14 +118,14 @@ class TestEyeboxResponse:
 
     def test_center_has_intensity(self, default_setup):
         """Center eyebox sample with on-axis ray should get some light."""
-        params, n_glass, pupil = default_setup
+        route, pupil = default_setup
         grid = eyebox_grid_points(
             pupil.position, pupil.normal, pupil.width / 2,
             nx=3, ny=3)
         mc = EyeboxConfig(n_fov_x=1, n_fov_y=1)
 
         response, _ = compute_eyebox_response(
-            params, n_glass,
+            route,
             DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
             DEFAULT_BEAM_WIDTH, DEFAULT_BEAM_HEIGHT,
             0.0, 0.0,  # on-axis only
@@ -220,16 +218,17 @@ class TestEyeboxDifferentiability:
 
     def test_grad_wrt_reflectances(self, default_setup):
         """Gradient of eyebox merit w.r.t. mirror reflectances."""
-        params, n_glass, pupil = default_setup
+        route, pupil = default_setup
         grid = eyebox_grid_points(
             pupil.position, pupil.normal, pupil.width / 2,
             nx=3, ny=3)
         mc = EyeboxConfig(n_fov_x=3, n_fov_y=3)
 
         def loss(reflectances):
-            p = params._replace(mirror_reflectances=reflectances)
+            new_mirrors = route.mirrors._replace(reflectance=reflectances)
+            r = route._replace(mirrors=new_mirrors)
             response, _ = compute_eyebox_response(
-                p, n_glass,
+                r,
                 DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
                 DEFAULT_BEAM_WIDTH, DEFAULT_BEAM_HEIGHT,
                 DEFAULT_X_FOV, DEFAULT_Y_FOV,
@@ -237,6 +236,132 @@ class TestEyeboxDifferentiability:
             )
             return eyebox_merit(response, mc)
 
-        grads = jax.grad(loss)(params.mirror_reflectances)
+        grads = jax.grad(loss)(route.mirrors.reflectance)
+        assert grads.shape == (6, 3)
+        assert jnp.all(jnp.isfinite(grads))
+
+
+# ── Cell grid from cell size ──────────────────────────────────────────────
+
+class TestCellGrid:
+
+    def test_cell_grid_shape(self):
+        center = jnp.array([7.0, 20.0, 17.0])
+        normal = jnp.array([0.0, 0.0, -1.0])
+        points, nx, ny = cell_grid_from_cell_size(
+            center, normal, width=10.0, height=8.0, cell_size=2.0)
+        assert nx == 5
+        assert ny == 4
+        assert points.shape == (20, 3)
+
+    def test_cell_grid_center(self):
+        center = jnp.array([7.0, 20.0, 17.0])
+        normal = jnp.array([0.0, 0.0, -1.0])
+        points, nx, ny = cell_grid_from_cell_size(
+            center, normal, width=10.0, height=10.0, cell_size=2.0)
+        # Center of a 5x5 grid is index 12
+        assert jnp.allclose(points[12], center, atol=1e-5)
+
+    def test_cell_grid_odd_size(self):
+        """Non-integer division should round up."""
+        center = jnp.array([0.0, 0.0, 0.0])
+        normal = jnp.array([0.0, 0.0, 1.0])
+        points, nx, ny = cell_grid_from_cell_size(
+            center, normal, width=7.0, height=5.0, cell_size=2.0)
+        assert nx == 4  # ceil(7/2)
+        assert ny == 3  # ceil(5/2)
+
+
+# ── Eye-box area merit ────────────────────────────────────────────────────
+
+class TestEyeboxAreaMerit:
+
+    def test_all_above_threshold_is_near_zero(self):
+        """All cells well above threshold → loss near 0."""
+        config = EyeboxAreaConfig(intensity_threshold=0.005)
+        # Strong uniform response, well above threshold after D65 normalization
+        response = jnp.ones((9, 9, 3)) * 0.1
+        loss = float(eyebox_area_merit(response, config))
+        assert loss < 0.05
+
+    def test_all_below_threshold_is_near_one(self):
+        """All cells below threshold → loss near 1."""
+        config = EyeboxAreaConfig(intensity_threshold=0.01)
+        response = jnp.ones((9, 9, 3)) * 1e-6  # far below threshold
+        loss = float(eyebox_area_merit(response, config))
+        assert loss > 0.9
+
+    def test_zero_response(self):
+        """Zero response → loss ≥ 1 (area_loss=1 + margin penalty)."""
+        config = EyeboxAreaConfig(intensity_threshold=0.01)
+        response = jnp.zeros((9, 9, 3))
+        loss = float(eyebox_area_merit(response, config))
+        assert loss >= 0.95
+
+    def test_half_cells_active(self):
+        """Half the cells above threshold → loss around 0.5."""
+        config = EyeboxAreaConfig(intensity_threshold=0.005, w_margin=0.0)
+        response = jnp.zeros((10, 9, 3))
+        # First 5 cells bright, last 5 dark
+        response = response.at[:5, :, :].set(0.1)
+        loss = float(eyebox_area_merit(response, config))
+        assert 0.3 < loss < 0.7
+
+    def test_one_dark_angle_kills_cell(self):
+        """A cell with one dead FOV angle should not be active."""
+        config = EyeboxAreaConfig(intensity_threshold=0.005, w_margin=0.0)
+        # 1 cell, 5 angles, 3 colors — all bright
+        response = jnp.ones((1, 5, 3)) * 0.1
+        loss_all = float(eyebox_area_merit(response, config))
+        # Kill one angle
+        response_dead = response.at[:, 2, :].set(0.0)
+        loss_dead = float(eyebox_area_merit(response_dead, config))
+        assert loss_dead > loss_all + 0.5  # should jump to ~1.0
+
+    def test_worst_color_matters(self):
+        """If one color is below threshold, cell should be inactive."""
+        config = EyeboxAreaConfig(intensity_threshold=0.005, w_margin=0.0)
+        # All colors strong
+        response = jnp.ones((1, 5, 3)) * 0.1
+        loss_good = float(eyebox_area_merit(response, config))
+        # Kill blue channel (index 2) — after D65 normalization, blue weight
+        # is smallest so this is the channel most easily killed
+        response_no_blue = response.at[:, :, 2].set(0.0)
+        loss_no_blue = float(eyebox_area_merit(response_no_blue, config))
+        assert loss_no_blue > loss_good + 0.5
+
+    def test_more_active_cells_is_better(self):
+        """Adding intensity to dark cells should decrease loss."""
+        config = EyeboxAreaConfig(intensity_threshold=0.005, w_margin=0.0)
+        response_3 = jnp.zeros((5, 4, 3))
+        response_3 = response_3.at[:3, :, :].set(0.1)  # 3/5 active
+        response_5 = jnp.ones((5, 4, 3)) * 0.1          # 5/5 active
+        assert float(eyebox_area_merit(response_5, config)) < float(eyebox_area_merit(response_3, config))
+
+
+class TestEyeboxAreaDifferentiability:
+
+    def test_grad_wrt_reflectances(self, default_setup):
+        """Gradient of area merit w.r.t. mirror reflectances."""
+        route, pupil = default_setup
+        grid = eyebox_grid_points(
+            pupil.position, pupil.normal, pupil.width / 2,
+            nx=3, ny=3)
+        mc = EyeboxConfig(n_fov_x=3, n_fov_y=3)
+        area_cfg = EyeboxAreaConfig()
+
+        def loss(reflectances):
+            new_mirrors = route.mirrors._replace(reflectance=reflectances)
+            r = route._replace(mirrors=new_mirrors)
+            response, _ = compute_eyebox_response(
+                r,
+                DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
+                DEFAULT_BEAM_WIDTH, DEFAULT_BEAM_HEIGHT,
+                DEFAULT_X_FOV, DEFAULT_Y_FOV,
+                grid, mc,
+            )
+            return eyebox_area_merit(response, area_cfg)
+
+        grads = jax.grad(loss)(route.mirrors.reflectance)
         assert grads.shape == (6, 3)
         assert jnp.all(jnp.isfinite(grads))
