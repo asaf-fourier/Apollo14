@@ -4,7 +4,7 @@ from typing import NamedTuple
 
 import jax.numpy as jnp
 
-from apollo14.geometry import normalize, compute_local_axes, snell_refract
+from apollo14.geometry import normalize, compute_local_axes, snell_refract, ray_rect_intersect
 
 
 class RefractState(NamedTuple):
@@ -59,17 +59,9 @@ class RefractingSurface:
             intensity: scalar (unchanged; TIR zeroes via valid flag).
             valid: bool, hit within bounds and no TIR.
         """
-        denom = jnp.dot(direction, state.normal)
-        t = jnp.dot(state.position - origin, state.normal) / (denom + 1e-30)
-        hit = origin + jnp.maximum(t, 0.0) * direction
-
-        # Bounds check
-        delta = hit - state.position
-        in_bounds = (
-            (jnp.abs(jnp.dot(delta, state.local_x)) <= state.half_extents[0]) &
-            (jnp.abs(jnp.dot(delta, state.local_y)) <= state.half_extents[1]) &
-            (t > 0)
-        )
+        hit, t, in_bounds = ray_rect_intersect(
+            origin, direction, state.position, state.normal,
+            state.local_x, state.local_y, state.half_extents)
 
         # Snell refraction (normal faces incoming ray)
         facing = jnp.where(jnp.dot(direction, state.normal) < 0,

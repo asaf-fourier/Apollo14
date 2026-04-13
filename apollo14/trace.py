@@ -122,16 +122,10 @@ def trace_beam(origins, direction, route: Route, color_idx=0) -> TraceResult:
             route.aperture, origin, direction, route.has_aperture)
 
         # Entry face intersection + bounds check (direction already refracted)
-        denom = jnp.dot(direction, route.entry_face.normal)
-        t = jnp.dot(route.entry_face.position - origin, route.entry_face.normal) / (denom + 1e-30)
-        entry_hit = origin + jnp.maximum(t, 0.0) * direction
-
-        delta = entry_hit - route.entry_face.position
-        entry_valid = (
-            (jnp.abs(jnp.dot(delta, route.entry_face.local_x)) <= route.entry_face.half_extents[0]) &
-            (jnp.abs(jnp.dot(delta, route.entry_face.local_y)) <= route.entry_face.half_extents[1]) &
-            (t > 0)
-        )
+        entry_hit, _, entry_valid = ray_rect_intersect(
+            origin, direction, route.entry_face.position, route.entry_face.normal,
+            route.entry_face.local_x, route.entry_face.local_y,
+            route.entry_face.half_extents)
         intensity = jnp.where(entry_valid, intensity, 0.0)
 
         # Mirror scan using shared d_glass

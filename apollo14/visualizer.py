@@ -9,6 +9,7 @@ from apollo14.elements.glass_block import GlassBlock, GlassFace
 from apollo14.elements.aperture import RectangularAperture
 from apollo14.elements.pupil import Pupil, RectangularPupil
 from apollo14.trace import TraceResult
+from apollo14.binning import bin_hits_to_grid_np
 from apollo14.geometry import compute_local_axes
 
 
@@ -182,23 +183,8 @@ def plot_route_pupil_fill(projector, route, pupil_element,
             ray_origins, _, _, _ = projector.generate_rays(direction=d)
 
             tr = trace_beam(ray_origins, d, route, color_idx=0)
-
-            grid = np.zeros((n_bins, n_bins))
-            pts_np = np.asarray(tr.pupil_points)
-            ints_np = np.asarray(tr.intensities)
-            valid_np = np.asarray(tr.valid)
-
-            for ri in range(pts_np.shape[0]):
-                for mi in range(pts_np.shape[1]):
-                    if not valid_np[ri, mi]:
-                        continue
-                    delta = pts_np[ri, mi] - pupil_center
-                    px = float(np.dot(delta, pupil_lx))
-                    py = float(np.dot(delta, pupil_ly))
-                    bx = np.searchsorted(bin_edges, px) - 1
-                    by = np.searchsorted(bin_edges, py) - 1
-                    if 0 <= bx < n_bins and 0 <= by < n_bins:
-                        grid[by, bx] += float(ints_np[ri, mi])
+            grid = bin_hits_to_grid_np(tr, pupil_center, pupil_lx, pupil_ly,
+                                       bin_edges, bin_edges)
 
             grids.append(grid)
             a_x = float(scan_angles[iy, ix, 0]) * 180 / np.pi

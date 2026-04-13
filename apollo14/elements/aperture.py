@@ -5,7 +5,7 @@ from typing import NamedTuple
 
 import jax.numpy as jnp
 
-from apollo14.geometry import normalize, compute_local_axes
+from apollo14.geometry import normalize, compute_local_axes, ray_rect_intersect
 
 
 class ApertureState(NamedTuple):
@@ -58,13 +58,7 @@ class RectangularAperture:
         Returns:
             intensity: scalar, 1.0 if ray passes through opening (or no aperture), else 0.0.
         """
-        denom = jnp.dot(direction, state.normal)
-        t = jnp.dot(state.position - origin, state.normal) / (denom + 1e-30)
-        hit = origin + jnp.maximum(t, 0.0) * direction
-
-        delta = hit - state.position
-        in_opening = (
-            (jnp.abs(jnp.dot(delta, state.local_x)) <= state.half_extents[0]) &
-            (jnp.abs(jnp.dot(delta, state.local_y)) <= state.half_extents[1])
-        )
+        hit, t, in_opening = ray_rect_intersect(
+            origin, direction, state.position, state.normal,
+            state.local_x, state.local_y, state.half_extents)
         return jnp.where(has_aperture, jnp.where(in_opening, 1.0, 0.0), 1.0)

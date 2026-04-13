@@ -46,6 +46,36 @@ def snell_refract(direction, normal, n1, n2):
     return out_dir, is_tir
 
 
+def ray_rect_intersect(origin, direction, position, normal, local_x, local_y, half_extents):
+    """Intersect a ray with a bounded rectangular plane. Pure JAX.
+
+    Args:
+        origin: (3,) ray start.
+        direction: (3,) ray direction (normalized).
+        position: (3,) center of the rectangle.
+        normal: (3,) plane normal.
+        local_x: (3,) first local axis on the plane.
+        local_y: (3,) second local axis on the plane.
+        half_extents: (2,) [half_width, half_height].
+
+    Returns:
+        hit: (3,) intersection point on the plane.
+        t: scalar, ray parameter (distance along direction).
+        in_bounds: bool, whether the hit is within the rectangle and t > 0.
+    """
+    denom = jnp.dot(direction, normal)
+    t = jnp.dot(position - origin, normal) / (denom + 1e-30)
+    hit = origin + jnp.maximum(t, 0.0) * direction
+
+    delta = hit - position
+    in_bounds = (
+        (jnp.abs(jnp.dot(delta, local_x)) <= half_extents[0]) &
+        (jnp.abs(jnp.dot(delta, local_y)) <= half_extents[1]) &
+        (t > 0)
+    )
+    return hit, t, in_bounds
+
+
 def compute_local_axes(normal):
     """Compute two orthogonal axes on the plane defined by normal."""
     n = normalize(normal)

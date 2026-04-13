@@ -5,7 +5,7 @@ from typing import NamedTuple
 
 import jax.numpy as jnp
 
-from apollo14.geometry import normalize, compute_local_axes
+from apollo14.geometry import normalize, compute_local_axes, ray_rect_intersect
 
 
 class DetectorState(NamedTuple):
@@ -59,16 +59,9 @@ class RectangularPupil:
             intensity: scalar (unchanged).
             valid: bool, whether the ray hit within detector bounds.
         """
-        denom = jnp.dot(direction, state.normal)
-        t = jnp.dot(state.position - origin, state.normal) / (denom + 1e-30)
-        hit = origin + jnp.maximum(t, 0.0) * direction
-
-        delta = hit - state.position
-        valid = (
-            (jnp.abs(jnp.dot(delta, state.local_x)) <= state.half_extents[0]) &
-            (jnp.abs(jnp.dot(delta, state.local_y)) <= state.half_extents[1]) &
-            (t > 0)
-        )
+        hit, t, valid = ray_rect_intersect(
+            origin, direction, state.position, state.normal,
+            state.local_x, state.local_y, state.half_extents)
         return hit, intensity, valid
 
 
