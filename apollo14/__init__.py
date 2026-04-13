@@ -16,5 +16,4 @@ from apollo14.trace import (
     prepare_beam,
     trace,
     trace_beam,
-    trace_batch,
 )

@@ -26,8 +26,8 @@ class Beam(NamedTuple):
 class TraceResult(NamedTuple):
     """Result of tracing one ray through a beam.
 
-    Shapes are (N, ...) for N surfaces, or with extra leading batch dims
-    when produced via ``trace_beam`` / ``trace_batch``.
+    Shapes are ``(N, ...)`` for N surfaces, with a leading ``R`` batch dim
+    when produced via ``trace_beam``.
     """
     hits: jnp.ndarray              # (..., N, 3) raw plane intersection at each step
     valids: jnp.ndarray            # (..., N) bool — whether each step was valid
@@ -82,11 +82,3 @@ def trace_beam(beam: Beam, origins, direction,
     return jax.vmap(
         lambda o: trace(beam, o, direction, color_idx)
     )(origins)
-
-
-def trace_batch(beam: Beam, origins, directions,
-                color_idx: int = 0) -> TraceResult:
-    """Trace N rays with per-ray directions through a beam."""
-    return jax.vmap(
-        lambda o, d: trace(beam, o, d, color_idx)
-    )(origins, directions)

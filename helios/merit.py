@@ -8,14 +8,16 @@ where the last axis is [R, G, B] intensity arriving at each pupil sample.
 """
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Sequence, Tuple
 
 import jax.numpy as jnp
 
-from apollo14.system import OpticalSystem
 from apollo14.projector import Projector, scan_directions
-from apollo14.tracer import trace_nonsequential
-from apollo14.geometry import normalize, compute_local_axes
+from apollo14.trace import Beam, trace_beam, prepare_beam
+from apollo14.binning import bin_hits_to_nearest
+from apollo14.route import build_route, branch_path, absorb
+from apollo14.geometry import planar_grid_points
+from apollo14.system import OpticalSystem
 from apollo14.units import nm
 
 
@@ -34,24 +36,37 @@ _D65_RAW = jnp.array([78.0, 107.0, 82.0])  # approximate D65 at 630/525/460 nm
 D65_WEIGHTS = _D65_RAW / _D65_RAW.sum()
 
 
-# ── Pupil sampling ────────────────────────────────────────────────────────────
+# ── Beam construction helper ─────────────────────────────────────────────────
 
-def pupil_sample_grid(center, normal, radius, nx, ny):
-    """Generate a grid of sample points on the pupil plane.
+def build_combiner_pupil_beams(system: OpticalSystem,
+                               wavelengths: Sequence[float],
+                               num_mirrors: int = 6,
+                               pupil_name: str = "pupil",
+                               chassis_name: str = "chassis",
+                               ) -> list[list[Beam]]:
+    """Build reflected-branch beams that terminate on the pupil.
 
-    Returns:
-        positions: (ny, nx, 3) array of 3D sample positions
+    One branch per mirror (reflect off it, exit the chassis, absorb at the
+    pupil), prepared once per wavelength. The returned list is shaped
+    ``(n_wavelengths, num_mirrors)``.
     """
-    lx, ly = compute_local_axes(normal)
+    main_path: list = [
+        "aperture",
+        (chassis_name, "back"),
+    ]
+    main_path.extend(f"mirror_{i}" for i in range(num_mirrors))
+    main_path.append((chassis_name, "front"))
 
-    xs = jnp.linspace(-radius, radius, nx)
-    ys = jnp.linspace(-radius, radius, ny)
-    gx, gy = jnp.meshgrid(xs, ys)  # (ny, nx)
+    tail = [(chassis_name, "front"), absorb(pupil_name)]
+    branch_routes = [
+        build_route(system, branch_path(main_path, at=f"mirror_{i}", tail=tail))
+        for i in range(num_mirrors)
+    ]
 
-    positions = (center[None, None, :]
-                 + gx[:, :, None] * lx[None, None, :]
-                 + gy[:, :, None] * ly[None, None, :])
-    return positions
+    return [
+        [prepare_beam(r, float(wl)) for r in branch_routes]
+        for wl in wavelengths
+    ]
 
 
 # ── Simulation ────────────────────────────────────────────────────────────────
@@ -74,90 +89,51 @@ class MeritConfig:
             self.d65_weights = D65_WEIGHTS
 
 
-def simulate_pupil_response(system: OpticalSystem, projector: Projector,
+def simulate_pupil_response(beams_per_color: Sequence[Sequence[Beam]],
+                            projector: Projector,
                             pupil_center, pupil_normal, pupil_radius,
                             config: MeritConfig,
                             x_fov: float, y_fov: float,
                             ) -> jnp.ndarray:
     """Trace R/G/B rays across pupil positions and FOV angles.
 
-    For each (pupil_sample, angle, color), fires a ray from the projector
-    and checks if it arrives at that pupil sample location.
+    Args:
+        beams_per_color: ``(n_colors, n_branches)`` — pupil-terminated beams
+            (e.g. from ``build_combiner_pupil_beams``). Each color's inner
+            list is summed over branches at the pupil.
 
     Returns:
         intensity: (n_pupil_y, n_pupil_x, n_angle_y, n_angle_x, 3) array
     """
-    pupil_positions = pupil_sample_grid(
-        pupil_center, pupil_normal, pupil_radius,
+    flat_positions = planar_grid_points(
+        pupil_center, pupil_normal, pupil_radius, pupil_radius,
         config.pupil_nx, config.pupil_ny,
-    )  # (pny, pnx, 3)
+    )  # (pny*pnx, 3)
 
-    scan_dirs, scan_angles = scan_directions(
+    scan_dirs, _ = scan_directions(
         projector.direction, x_fov, y_fov,
         config.angle_nx, config.angle_ny,
-    )  # (any, anx, 3), (any, anx, 2)
+    )  # (any, anx, 3)
 
-    n_wl = config.wavelengths.shape[0]
+    n_wl = len(beams_per_color)
     result = jnp.zeros((config.pupil_ny, config.pupil_nx,
-                         config.angle_ny, config.angle_nx, n_wl))
+                        config.angle_ny, config.angle_nx, n_wl))
 
     for ai_y in range(config.angle_ny):
         for ai_x in range(config.angle_nx):
             direction = scan_dirs[ai_y, ai_x]
-            origins, directions, intensities, _ = projector.generate_rays(direction=direction)
+            origins, _, _, _ = projector.generate_rays(direction=direction)
 
-            for wi in range(n_wl):
-                wl = config.wavelengths[wi]
-
-                for ri in range(origins.shape[0]):
-                    tr = trace_nonsequential(
-                        system, origins[ri], directions[ri], wl,
-                        intensity=float(intensities[ri]),
-                    )
-                    if tr.pupil_hit is None:
-                        continue
-
-                    hit_pt = tr.pupil_hit.point
-                    hit_intensity = float(tr.pupil_hit.intensity)
-
-                    # Assign to nearest pupil sample
-                    pi_y, pi_x = _nearest_pupil_index(
-                        hit_pt, pupil_positions,
-                        config.pupil_ny, config.pupil_nx,
-                    )
-                    if pi_y >= 0:
-                        result = result.at[pi_y, pi_x, ai_y, ai_x, wi].add(hit_intensity)
+            for wi, branch_beams in enumerate(beams_per_color):
+                binned = jnp.zeros(flat_positions.shape[0])
+                for beam in branch_beams:
+                    tr = trace_beam(beam, origins, direction, color_idx=wi)
+                    binned = binned + bin_hits_to_nearest(
+                        tr, flat_positions, stop_grad=False)
+                binned_2d = binned.reshape(config.pupil_ny, config.pupil_nx)
+                result = result.at[:, :, ai_y, ai_x, wi].add(binned_2d)
 
     return result
-
-
-def _nearest_pupil_index(hit_point, pupil_positions, pny, pnx):
-    """Find the nearest pupil grid sample to a hit point.
-
-    Returns (iy, ix) or (-1, -1) if outside the grid spacing.
-    """
-    flat_pos = pupil_positions.reshape(-1, 3)
-    dists = jnp.linalg.norm(flat_pos - hit_point[None, :], axis=1)
-    idx = jnp.argmin(dists)
-    min_dist = dists[idx]
-
-    # Reject if too far from any sample (> half the grid spacing)
-    if pnx > 1:
-        spacing_x = jnp.linalg.norm(pupil_positions[0, 1] - pupil_positions[0, 0])
-    else:
-        spacing_x = 1e10
-    if pny > 1:
-        spacing_y = jnp.linalg.norm(pupil_positions[1, 0] - pupil_positions[0, 0])
-    else:
-        spacing_y = 1e10
-    max_dist = jnp.maximum(spacing_x, spacing_y) * 0.75
-
-    if min_dist > max_dist:
-        return -1, -1
-
-    iy = int(idx) // pnx
-    ix = int(idx) % pnx
-    return iy, ix
 
 
 # ── Merit function ────────────────────────────────────────────────────────────
@@ -185,7 +161,8 @@ def merit_mse(simulated: jnp.ndarray, target: jnp.ndarray) -> float:
     return float(jnp.mean((simulated - target) ** 2))
 
 
-def evaluate_merit(system: OpticalSystem, projector: Projector,
+def evaluate_merit(beams_per_color: Sequence[Sequence[Beam]],
+                   projector: Projector,
                    pupil_center, pupil_normal, pupil_radius,
                    x_fov: float, y_fov: float,
                    config: MeritConfig = None) -> Tuple[float, jnp.ndarray, jnp.ndarray]:
@@ -199,7 +176,7 @@ def evaluate_merit(system: OpticalSystem, projector: Projector,
         config = MeritConfig()
 
     simulated = simulate_pupil_response(
-        system, projector, pupil_center, pupil_normal, pupil_radius,
+        beams_per_color, projector, pupil_center, pupil_normal, pupil_radius,
         config, x_fov, y_fov,
     )
     target = build_target(config)

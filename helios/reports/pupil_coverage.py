@@ -8,11 +8,13 @@ import numpy as np
 import plotly.graph_objects as go
 
 from apollo14.system import OpticalSystem
-from apollo14.elements.glass_block import GlassBlock
 from apollo14.elements.pupil import RectangularPupil
-from apollo14.geometry import compute_local_axes, normalize
-from apollo14.jax_tracer import trace_combiner_beam, combiner_path_from_system
+from apollo14.geometry import compute_local_axes
+from apollo14.trace import prepare_beam, trace_beam
+from apollo14.binning import bin_hits_to_grid_np
 from apollo14.projector import Projector, scan_directions
+
+from helios.merit import build_combiner_pupil_beams
 
 
 def pupil_coverage_report(
@@ -46,16 +48,13 @@ def pupil_coverage_report(
     Returns:
         Plotly Figure with the heatmap.
     """
-    import jax.numpy as jnp
-
-    path = combiner_path_from_system(system, wavelength)
+    beams = build_combiner_pupil_beams(system, [wavelength])[0]
 
     pupil_elem = next(
         e for e in system.elements if isinstance(e, RectangularPupil)
     )
     pupil_center = np.asarray(pupil_elem.position)
-    pupil_normal = normalize(np.asarray(pupil_elem.normal))
-    pupil_lx, pupil_ly = compute_local_axes(pupil_normal)
+    pupil_lx, pupil_ly = compute_local_axes(np.asarray(pupil_elem.normal))
     pupil_lx, pupil_ly = np.asarray(pupil_lx), np.asarray(pupil_ly)
     pupil_hw = pupil_elem.width / 2
     pupil_hh = pupil_elem.height / 2
@@ -81,29 +80,12 @@ def pupil_coverage_report(
             d = scan_dirs[iy, ix]
             ray_origins, _, _, _ = projector.generate_rays(direction=d)
 
-            # Trace all 3 colors and average (approximate white)
+            # Single wavelength — sum over branches.
             angle_grid = np.zeros((ny_cells, nx_cells))
-            for ci in range(3):
-                pts, ints, valid, _, _ = trace_combiner_beam(
-                    ray_origins, d, path, color_idx=ci)
-
-                pts_np = np.asarray(pts)
-                ints_np = np.asarray(ints)
-                valid_np = np.asarray(valid)
-
-                for ri in range(pts_np.shape[0]):
-                    for mi in range(pts_np.shape[1]):
-                        if not valid_np[ri, mi]:
-                            continue
-                        delta = pts_np[ri, mi] - pupil_center
-                        px = float(np.dot(delta, pupil_lx))
-                        py = float(np.dot(delta, pupil_ly))
-                        bx = np.searchsorted(x_edges, px) - 1
-                        by = np.searchsorted(y_edges, py) - 1
-                        if 0 <= bx < nx_cells and 0 <= by < ny_cells:
-                            angle_grid[by, bx] += float(ints_np[ri, mi])
-
-            angle_grid /= 3.0  # average over R/G/B
+            for beam in beams:
+                tr = trace_beam(beam, ray_origins, d, color_idx=1)
+                angle_grid += bin_hits_to_grid_np(
+                    tr, pupil_center, pupil_lx, pupil_ly, x_edges, y_edges)
             grid_sum += angle_grid
             grid_count += (angle_grid > 0).astype(float)
 

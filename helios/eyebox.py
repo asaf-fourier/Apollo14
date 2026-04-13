@@ -18,41 +18,7 @@ The merit decomposes into three weighted terms:
 Fully differentiable — use ``jax.grad`` on ``eyebox_merit`` to get
 gradients w.r.t. mirror reflectances or positions.
 
-Usage::
-
-    from helios.eyebox import (
-        eyebox_sample_points, compute_eyebox_response,
-        eyebox_merit, EyeboxConfig,
-    )
-    from apollo14.jax_tracer import params_from_system
-    from apollo14.combiner import build_default_system, DEFAULT_WAVELENGTH
-
-    system = build_default_system()
-    params = params_from_system(system, DEFAULT_WAVELENGTH)
-
-    from apollo14.elements.pupil import RectangularPupil
-    pupil = next(e for e in system.elements if isinstance(e, RectangularPupil))
-
-    grid = eyebox_grid_points(pupil.position, pupil.normal, radius=3.0)
-    mc = EyeboxConfig()
-
-    from apollo14.combiner import (
-        DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
-        DEFAULT_BEAM_WIDTH, DEFAULT_BEAM_HEIGHT,
-        DEFAULT_X_FOV, DEFAULT_Y_FOV,
-    )
-    from apollo14.elements.glass_block import GlassBlock
-    chassis = next(e for e in system.elements if isinstance(e, GlassBlock))
-    n_glass = float(chassis.material.n(DEFAULT_WAVELENGTH))
-
-    response, dirs = compute_eyebox_response(
-        params, n_glass,
-        DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
-        DEFAULT_BEAM_WIDTH, DEFAULT_BEAM_HEIGHT,
-        DEFAULT_X_FOV, DEFAULT_Y_FOV,
-        grid, mc,
-    )
-    loss = eyebox_merit(response, mc)
+See ``tests/test_helios.py`` for usage.
 """
 
 from dataclasses import dataclass
@@ -60,9 +26,10 @@ from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 
-from apollo14.geometry import compute_local_axes, normalize
-from apollo14.jax_tracer import trace_beam
-from apollo14.projector import scan_directions
+from apollo14.geometry import planar_grid_points
+from apollo14.trace import Beam, trace_beam
+from apollo14.binning import bin_hits_to_nearest
+from apollo14.projector import Projector, scan_directions
 
 from helios.merit import D65_WEIGHTS
 
@@ -95,76 +62,26 @@ class EyeboxConfig:
 
 # ── Eyebox sampling ─────────────────────────────────────────────────────────
 
-def eyebox_sample_points(center, normal, radius):
-    """Sample the eyebox at center + 4 corners of an inscribed square.
-
-    Returns:
-        (5, 3) array of sample positions on the pupil plane.
-    """
-    lx, ly = compute_local_axes(normal)
-    r = radius / jnp.sqrt(2.0)  # inscribed square corner distance
-    return jnp.stack([
-        center,
-        center + r * lx + r * ly,
-        center + r * lx - r * ly,
-        center - r * lx + r * ly,
-        center - r * lx - r * ly,
-    ])
-
-
 def eyebox_grid_points(center, normal, radius, nx, ny):
-    """Generate a dense grid of sample points on the eyebox plane.
-
-    Returns:
-        (nx*ny, 3) array of sample positions on the pupil plane.
-    """
-    lx, ly = compute_local_axes(normal)
-    xs = jnp.linspace(-radius, radius, nx)
-    ys = jnp.linspace(-radius, radius, ny)
-    gx, gy = jnp.meshgrid(xs, ys)  # (ny, nx)
-    positions = (center[None, None, :]
-                 + gx[:, :, None] * lx[None, None, :]
-                 + gy[:, :, None] * ly[None, None, :])
-    return positions.reshape(-1, 3)
+    """Dense ``(nx, ny)`` grid on the eyebox plane, spanning ±``radius``."""
+    return planar_grid_points(center, normal, radius, radius, nx, ny)
 
 
 # ── Response computation ────────────────────────────────────────────────────
 
-def _beam_origins(projector_pos, direction, beam_width, beam_height, nx, ny):
-    """Generate a grid of ray origins for a collimated beam.
-
-    Returns:
-        (nx*ny, 3) array of ray start positions.
-    """
-    d = normalize(direction)
-    # Build a local basis perpendicular to the beam direction
-    up = jnp.where(jnp.abs(d[1]) < 0.99,
-                   jnp.array([0.0, 1.0, 0.0]),
-                   jnp.array([1.0, 0.0, 0.0]))
-    lx = normalize(jnp.cross(d, up))
-    ly = normalize(jnp.cross(lx, d))
-
-    xs = jnp.linspace(-beam_width / 2, beam_width / 2, nx)
-    ys = jnp.linspace(-beam_height / 2, beam_height / 2, ny)
-    gx, gy = jnp.meshgrid(xs, ys)
-    offsets = gx.ravel()[:, None] * lx[None, :] + gy.ravel()[:, None] * ly[None, :]
-    return projector_pos[None, :] + offsets
-
-
-def compute_eyebox_response(params, n_glass, projector_pos, projector_dir,
+def compute_eyebox_response(beams_per_color, projector_pos, projector_dir,
                             beam_width, beam_height,
                             x_fov, y_fov, eyebox_points, config=None):
     """Compute intensity at each eyebox sample for each FOV angle and color.
 
     For each FOV angle, traces a dense beam of rays (n_beam_x × n_beam_y)
-    from the projector. Each ray hits M mirrors producing hit points on
-    the pupil plane. Hits are hard-binned to the nearest eyebox grid
-    point. Gradients flow through intensity values; spatial assignment
-    is fixed (``stop_gradient`` on argmin).
+    from the projector through every pupil-terminated branch beam, binning
+    hits to the nearest eyebox grid point. Gradients flow through intensity
+    values; spatial assignment is fixed (``stop_gradient`` on argmin).
 
     Args:
-        params: CombinerParams with system geometry
-        n_glass: refractive index of chassis glass
+        beams_per_color: ``(n_colors, n_branches)`` list of pupil-terminated
+            ``Beam``s — e.g. from ``helios.merit.build_combiner_pupil_beams``.
         projector_pos: (3,) projector position
         projector_dir: (3,) projector central direction (normalized)
         beam_width: physical width of beam cross-section
@@ -181,36 +98,30 @@ def compute_eyebox_response(params, n_glass, projector_pos, projector_dir,
     if config is None:
         config = EyeboxConfig()
 
+    # Use Projector for beam origin generation (consistent basis computation)
+    proj = Projector.uniform(
+        position=projector_pos, direction=projector_dir,
+        beam_width=beam_width, beam_height=beam_height,
+        wavelength=0.0,  # unused for origin generation
+        nx=config.n_beam_x, ny=config.n_beam_y,
+    )
+
     dirs, _ = scan_directions(projector_dir, x_fov, y_fov,
                               config.n_fov_x, config.n_fov_y)
     flat_dirs = dirs.reshape(-1, 3)
     n_angles = flat_dirs.shape[0]
-    S = eyebox_points.shape[0]
 
     color_responses = []
-    for ci in range(3):
+    for ci, branch_beams in enumerate(beams_per_color):
         angle_responses = []
         for ai in range(n_angles):
             d = flat_dirs[ai]
-            origins = _beam_origins(projector_pos, d, beam_width, beam_height,
-                                   config.n_beam_x, config.n_beam_y)
-            # trace_beam: shared direction, multiple origins
-            pts, ints, valid, _, _ = trace_beam(origins, d, n_glass, params, ci)
-            # pts: (R, M, 3), ints: (R, M), valid: (R, M)
-            # Flatten rays × mirrors → (R*M,)
-            R, M = ints.shape
-            pts_flat = pts.reshape(R * M, 3)
-            ints_flat = ints.reshape(R * M)
-            valid_flat = valid.reshape(R * M)
-
-            # Hard binning: nearest grid point
-            delta = pts_flat[:, None, :] - eyebox_points[None, :, :]  # (R*M, S, 3)
-            dist_sq = jnp.sum(delta ** 2, axis=-1)  # (R*M, S)
-            nearest = jax.lax.stop_gradient(jnp.argmin(dist_sq, axis=-1))  # (R*M,)
-
-            one_hot = jax.nn.one_hot(nearest, S)  # (R*M, S)
-            weighted = jnp.where(valid_flat[:, None], ints_flat[:, None] * one_hot, 0.0)
-            binned = jnp.sum(weighted, axis=0)  # (S,)
+            origins, _, _, _ = proj.generate_rays(direction=d)
+            binned = jnp.zeros(eyebox_points.shape[0])
+            for beam in branch_beams:
+                tr = trace_beam(beam, origins, d, color_idx=ci)
+                binned = binned + bin_hits_to_nearest(
+                    tr, eyebox_points, stop_grad=True)
             angle_responses.append(binned)
 
         per_color = jnp.stack(angle_responses, axis=1)  # (S, A)
@@ -287,6 +198,90 @@ def eyebox_merit(response, config=None):
     return (config.w_uniformity * (spatial_var + angular_var) +
             config.w_intensity * intensity_err +
             config.w_coverage * coverage_penalty)
+
+
+# ── Diagnostics ─────────────────────────────────────────────────────────────
+
+# ── Eye-box area merit ─────────────────────────────────────────────────────
+
+@dataclass
+class EyeboxAreaConfig:
+    """Configuration for eye-box area maximization merit.
+
+    The merit dissects the pupil into a grid (default 2×2 mm cells).
+    Each cell's score is the worst-case intensity across all FOV angles,
+    using the worst color channel (D65-normalized).  A cell is "in the
+    eye-box" only if that score exceeds ``intensity_threshold``.
+
+    The loss is ``1 - active_fraction``, so 0 = all cells active (best).
+    A soft sigmoid makes the threshold differentiable.
+    """
+    intensity_threshold: float = 0.005  # min acceptable D65-normalized intensity
+    d65_weights: jnp.ndarray = None     # (3,) per-color normalization
+    sigmoid_sharpness: float = 50.0     # sigmoid steepness at threshold
+    w_area: float = 1.0                 # weight for area loss
+    w_margin: float = 0.1              # weight for above-threshold margin bonus
+
+    def __post_init__(self):
+        if self.d65_weights is None:
+            self.d65_weights = D65_WEIGHTS
+
+
+def eyebox_area_merit(response, config=None):
+    """Eye-box area merit: maximize the fraction of cells with full FOV.
+
+    For each cell, computes the worst-case intensity across all FOV
+    angles and all color channels (D65-normalized).  Cells above the
+    threshold are "active".  The loss penalizes inactive cells and
+    gives a small bonus for pushing active cells further above threshold.
+
+    Args:
+        response: (S, A, 3) from ``compute_eyebox_response``
+        config: EyeboxAreaConfig (uses defaults if None)
+
+    Returns:
+        scalar loss (lower is better; 0 = all cells active)
+    """
+    if config is None:
+        config = EyeboxAreaConfig()
+
+    # D65-normalize: equalize color channels so min-over-colors means
+    # "worst color relative to its white-balance target"
+    d65 = config.d65_weights[None, None, :]  # (1, 1, 3)
+    normalized = response / (d65 + 1e-12)    # (S, A, 3)
+
+    # Worst color per (cell, angle)
+    worst_color = jnp.min(normalized, axis=-1)  # (S, A)
+
+    # Worst angle per cell — the bottleneck that determines eye-box membership
+    cell_min = jnp.min(worst_color, axis=-1)    # (S,)
+
+    # Soft active count via sigmoid, scaled relative to threshold
+    sigma = config.sigmoid_sharpness
+    threshold = config.intensity_threshold
+    active = jax.nn.sigmoid(sigma * (cell_min / (threshold + 1e-12) - 1.0))  # (S,)
+
+    active_fraction = jnp.mean(active)
+    area_loss = 1.0 - active_fraction
+
+    # Margin term: encourage borderline cells to push further above threshold.
+    # Uses (1 - active) weighting so it focuses on cells near/below threshold.
+    shortfall = jax.nn.relu(threshold - cell_min)  # (S,) how far below threshold
+    margin_loss = jnp.mean(shortfall) / (threshold + 1e-12)
+
+    return config.w_area * area_loss + config.w_margin * margin_loss
+
+
+def cell_grid_from_cell_size(center, normal, width, height, cell_size):
+    """Cell-sized grid on the eyebox plane.
+
+    Computes ``(nx, ny)`` from ``cell_size`` so each cell is approximately
+    ``cell_size × cell_size`` mm. Returns ``(points, nx, ny)``.
+    """
+    nx = max(1, int(jnp.ceil(width / cell_size)))
+    ny = max(1, int(jnp.ceil(height / cell_size)))
+    points = planar_grid_points(center, normal, width / 2, height / 2, nx, ny)
+    return points, nx, ny
 
 
 # ── Diagnostics ─────────────────────────────────────────────────────────────

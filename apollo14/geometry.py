@@ -87,6 +87,22 @@ def compute_local_axes(normal):
     return local_x, local_y
 
 
+def planar_grid_points(center, normal, half_x, half_y, nx, ny):
+    """Generate a regular (nx, ny) grid of points on a plane.
+
+    The grid spans ``[-half_x, half_x] × [-half_y, half_y]`` in the plane's
+    local axes. Returns a flat ``(nx*ny, 3)`` array of world positions.
+    """
+    lx, ly = compute_local_axes(normal)
+    xs = jnp.linspace(-half_x, half_x, nx)
+    ys = jnp.linspace(-half_y, half_y, ny)
+    gx, gy = jnp.meshgrid(xs, ys)  # (ny, nx)
+    positions = (center[None, None, :]
+                 + gx[:, :, None] * lx[None, None, :]
+                 + gy[:, :, None] * ly[None, None, :])
+    return positions.reshape(-1, 3)
+
+
 def point_in_rect(local_x_coord, local_y_coord, half_width, half_height):
     """Check if a point (in local 2D coords) is within a rectangle."""
     return (jnp.abs(local_x_coord) <= half_width + FP_EPSILON) & (
