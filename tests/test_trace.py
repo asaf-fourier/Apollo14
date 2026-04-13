@@ -14,7 +14,7 @@ from apollo14.trace import (
     build_route,
     combiner_main_path,
     prepare_beam,
-    trace_ray,
+    trace,
     trace_beam,
 )
 
@@ -81,7 +81,7 @@ class TestTraceRay:
         route = combiner_main_path(system)
         beam = prepare_beam(route, DEFAULT_WAVELENGTH)
 
-        result = trace_ray(beam,
+        result = trace(beam,
                            DEFAULT_LIGHT_POSITION,
                            DEFAULT_LIGHT_DIRECTION)
 
@@ -96,7 +96,7 @@ class TestTraceRay:
         system = build_default_system()
         route = combiner_main_path(system)
         beam = prepare_beam(route, DEFAULT_WAVELENGTH)
-        result = trace_ray(beam,
+        result = trace(beam,
                            DEFAULT_LIGHT_POSITION,
                            DEFAULT_LIGHT_DIRECTION)
         # Transmitting through 6 partial mirrors must reduce intensity.
@@ -108,10 +108,10 @@ class TestTraceRay:
         route = combiner_main_path(system)
         beam_full = prepare_beam(route, DEFAULT_WAVELENGTH, intensity=1.0)
         beam_half = prepare_beam(route, DEFAULT_WAVELENGTH, intensity=0.5)
-        r_full = trace_ray(beam_full,
+        r_full = trace(beam_full,
                            DEFAULT_LIGHT_POSITION,
                            DEFAULT_LIGHT_DIRECTION)
-        r_half = trace_ray(beam_half,
+        r_half = trace(beam_half,
                            DEFAULT_LIGHT_POSITION,
                            DEFAULT_LIGHT_DIRECTION)
         assert jnp.isclose(r_half.final_intensity, 0.5 * r_full.final_intensity)
@@ -122,7 +122,7 @@ class TestTraceRay:
 
         def run(wavelength, o, d):
             beam = prepare_beam(route, wavelength)
-            return trace_ray(beam, o, d).final_intensity
+            return trace(beam, o, d).final_intensity
 
         jitted = jax.jit(run)
         val = jitted(DEFAULT_WAVELENGTH,
@@ -137,7 +137,7 @@ class TestTraceRay:
         def loss(reflectances):
             new_route = route._replace(reflectance=reflectances)
             beam = prepare_beam(new_route, DEFAULT_WAVELENGTH)
-            r = trace_ray(beam,
+            r = trace(beam,
                           DEFAULT_LIGHT_POSITION,
                           DEFAULT_LIGHT_DIRECTION)
             return r.final_intensity

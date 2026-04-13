@@ -2,7 +2,7 @@
 
 A route is a flat stacked ``Surface`` — one ``lax.scan`` worth of surfaces,
 built once, wavelength-agnostic. ``prepare_beam`` turns it into a ``Beam``
-for a specific wavelength + initial intensity; ``trace_ray`` consumes the
+for a specific wavelength + initial intensity; ``trace`` consumes the
 beam.
 
 Branching (reflected daughter rays, multi-path combiner) is out of scope
@@ -14,7 +14,7 @@ from typing import NamedTuple, Sequence, Union
 import jax
 import jax.numpy as jnp
 
-from apollo14.surface import Surface, TRANSMIT, surface_step, interp_n
+from apollo14.surface import Surface, TRANSMIT, REFLECT, surface_step, interp_n
 from apollo14.system import OpticalSystem
 
 
@@ -67,6 +67,35 @@ def _parse_entry(entry: PathEntry) -> tuple:
     return entry, TRANSMIT
 
 
+def branch_path(main_path: Sequence[PathEntry], at: str,
+                tail: Sequence[PathEntry], mode: int = REFLECT) -> list:
+    """Splice a branch onto a main path.
+
+    Returns the main path's prefix up to (but not including) the element
+    ``at``, followed by ``(at, mode)`` and the ``tail`` entries. Use it to
+    express a reflected side-path without retyping the shared prefix:
+
+        branch = branch_path(
+            main_path, at="mirror_0",
+            tail=[("chassis", "front"), ("pupil", ABSORB)],
+        )
+
+    Branching is physical — the ray splits at ``at``. Tracing the main
+    path and each branch route independently gives you every outgoing
+    beam; their intensities are complementary via ``reflectance`` /
+    ``1 - reflectance`` at the split.
+    """
+    prefix = []
+    for entry in main_path:
+        ref = entry if not (isinstance(entry, tuple) and len(entry) == 2
+                            and isinstance(entry[1], int)) else entry[0]
+        name = ref if isinstance(ref, str) else ref[0]
+        if name == at:
+            break
+        prefix.append(entry)
+    return prefix + [(at, mode)] + list(tail)
+
+
 def build_route(system: OpticalSystem, path: Sequence[PathEntry]) -> Surface:
     """Build a stacked wavelength-agnostic ``Surface`` from a flat path.
 
@@ -107,9 +136,9 @@ def prepare_beam(route: Surface, wavelength, intensity=1.0) -> Beam:
 
 # ── Tracing ──────────────────────────────────────────────────────────────────
 
-def trace_ray(beam: Beam, origin, direction,
-              color_idx: int = 0) -> TraceResult:
-    """Trace one ray along the beam via a single ``lax.scan``."""
+def trace(beam: Beam, origin, direction,
+          color_idx: int = 0) -> TraceResult:
+    """Trace one ray through the beam via a single ``lax.scan``."""
     def step(carry, state):
         pos, d, inten = carry
         out_pos, out_dir, out_inten, hit, valid = surface_step(
@@ -133,7 +162,7 @@ def trace_beam(beam: Beam, origins, direction,
                color_idx: int = 0) -> TraceResult:
     """Trace N rays sharing one direction through a beam."""
     return jax.vmap(
-        lambda o: trace_ray(beam, o, direction, color_idx)
+        lambda o: trace(beam, o, direction, color_idx)
     )(origins)
 
 
@@ -141,7 +170,7 @@ def trace_batch(beam: Beam, origins, directions,
                 color_idx: int = 0) -> TraceResult:
     """Trace N rays with per-ray directions through a beam."""
     return jax.vmap(
-        lambda o, d: trace_ray(beam, o, d, color_idx)
+        lambda o, d: trace(beam, o, d, color_idx)
     )(origins, directions)
 
 

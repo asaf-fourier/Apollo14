@@ -14,7 +14,10 @@ from apollo14.combiner import (
     build_default_system,
     DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION, DEFAULT_WAVELENGTH,
 )
-from apollo14.trace import build_route, combiner_main_path, prepare_beam, trace_beam
+from apollo14.trace import (
+    build_route, branch_path, combiner_main_path, prepare_beam, trace_beam,
+)
+from apollo14.surface import ABSORB
 from apollo14.projector import Projector, scan_directions
 from apollo14.visualizer import plot_system
 from apollo14.units import mm, deg
@@ -40,12 +43,22 @@ explicit_path = [
     "mirror_5",
     ("chassis", "front"),
 ]
-explicit_route = build_route(system, explicit_path)
 
+explicit_route = build_route(system, explicit_path)
 beam = prepare_beam(explicit_route, DEFAULT_WAVELENGTH)
 
+# Branch route: everything up to mirror_0, reflect off it, then through
+# the exit face and into the pupil. A branch is just another linear route.
+branch_0_path = branch_path(
+    explicit_path, at="mirror_0",
+    tail=[("chassis", "front"), ("pupil", ABSORB)],
+)
+branch_0_route = build_route(system, branch_0_path)
+branch_0_beam = prepare_beam(branch_0_route, DEFAULT_WAVELENGTH)
+
 print(f"System route length: {route.position.shape[0]} "
-      f"(explicit: {explicit_route.position.shape[0]})")
+      f"(explicit: {explicit_route.position.shape[0]}, "
+      f"branch_0: {branch_0_route.position.shape[0]})")
 
 # ── Projector + scan grid ───────────────────────────────────────────────────
 
@@ -74,15 +87,17 @@ print(f"Beam: {projector.nx}x{projector.ny} rays, "
 
 # ── Trace one batched beam per scan angle ──────────────────────────────────
 
-print("\n── Tracing main path at each scan angle ──")
+print("\n── Tracing main path + branch_0 at each scan angle ──")
 
 trace_results = []
 for iy in range(num_y):
     for ix in range(num_x):
         direction = scan_dirs[iy, ix]
         origins, _, _, _ = projector.generate_rays(direction=direction)
-        tr = trace_beam(beam, origins, direction, color_idx=0)
-        trace_results.append(tr)
+        tr_main = trace_beam(beam, origins, direction, color_idx=0)
+        tr_branch = trace_beam(branch_0_beam, origins, direction, color_idx=0)
+        trace_results.append(tr_main)
+        trace_results.append(tr_branch)
 
 # ── 3D visualization with angle slider ─────────────────────────────────────
 

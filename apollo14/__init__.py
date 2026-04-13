@@ -4,9 +4,10 @@ from apollo14.trace import (
     Beam,
     TraceResult,
     build_route,
+    branch_path,
     prepare_beam,
     combiner_main_path,
-    trace_ray,
+    trace,
     trace_beam,
     trace_batch,
 )
