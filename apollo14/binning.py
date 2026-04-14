@@ -6,10 +6,13 @@ by the single-path tracer: one exit hit (``final_pos``) per ray, with a
 scalar ``final_intensity`` and the last-step validity flag.
 """
 
+from typing import NamedTuple
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 
+from apollo14.geometry import compute_local_axes
 from apollo14.trace import TraceResult
 
 
@@ -46,6 +49,65 @@ def bin_hits_to_nearest(trace_result: TraceResult, grid_points, stop_grad=True):
     weighted = jnp.where(valid_flat[:, None],
                          ints_flat[:, None] * one_hot, 0.0)
     return jnp.sum(weighted, axis=0)                        # (S,)
+
+
+class PupilGrid(NamedTuple):
+    """Precomputed pupil-plane binning grid.
+
+    Built once from a ``RectangularPupil`` and reused across many
+    trace results (e.g. one per FOV angle). Holds the in-plane frame,
+    bin edges, and the outer half-extents used to draw the pupil boundary.
+    """
+    center: np.ndarray        # (3,)
+    local_x: np.ndarray       # (3,)
+    local_y: np.ndarray       # (3,)
+    edges_x: np.ndarray       # (nx+1,)
+    edges_y: np.ndarray       # (ny+1,)
+    half_width: float
+    half_height: float
+
+    @property
+    def nx(self) -> int:
+        return len(self.edges_x) - 1
+
+    @property
+    def ny(self) -> int:
+        return len(self.edges_y) - 1
+
+    @property
+    def centers_x(self) -> np.ndarray:
+        return (self.edges_x[:-1] + self.edges_x[1:]) / 2
+
+    @property
+    def centers_y(self) -> np.ndarray:
+        return (self.edges_y[:-1] + self.edges_y[1:]) / 2
+
+
+def make_pupil_grid(pupil_element, cell_size: float) -> PupilGrid:
+    """Build a ``PupilGrid`` from a ``RectangularPupil`` at ``cell_size`` mm."""
+    half_w = float(pupil_element.width) / 2
+    half_h = float(pupil_element.height) / 2
+    nx = max(1, int(np.ceil(pupil_element.width / cell_size)))
+    ny = max(1, int(np.ceil(pupil_element.height / cell_size)))
+    lx, ly = compute_local_axes(np.asarray(pupil_element.normal))
+    return PupilGrid(
+        center=np.asarray(pupil_element.position),
+        local_x=np.asarray(lx),
+        local_y=np.asarray(ly),
+        edges_x=np.linspace(-half_w, half_w, nx + 1),
+        edges_y=np.linspace(-half_h, half_h, ny + 1),
+        half_width=half_w,
+        half_height=half_h,
+    )
+
+
+def bin_hits_to_pupil_grid(trace_result: TraceResult,
+                           grid: PupilGrid) -> np.ndarray:
+    """Bin per-ray exit hits into a prebuilt ``PupilGrid``. NumPy."""
+    return bin_hits_to_grid_np(
+        trace_result, grid.center, grid.local_x, grid.local_y,
+        grid.edges_x, grid.edges_y,
+    )
 
 
 def bin_hits_to_grid_np(trace_result: TraceResult, center, local_x, local_y,

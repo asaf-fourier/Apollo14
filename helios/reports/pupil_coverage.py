@@ -9,9 +9,8 @@ import plotly.graph_objects as go
 
 from apollo14.system import OpticalSystem
 from apollo14.elements.pupil import RectangularPupil
-from apollo14.geometry import compute_local_axes
-from apollo14.trace import prepare_beam, trace_beam
-from apollo14.binning import bin_hits_to_grid_np
+from apollo14.trace import trace_beam
+from apollo14.binning import make_pupil_grid, bin_hits_to_pupil_grid
 from apollo14.projector import Projector, scan_directions
 
 from helios.merit import build_combiner_pupil_beams
@@ -53,27 +52,15 @@ def pupil_coverage_report(
     pupil_elem = next(
         e for e in system.elements if isinstance(e, RectangularPupil)
     )
-    pupil_center = np.asarray(pupil_elem.position)
-    pupil_lx, pupil_ly = compute_local_axes(np.asarray(pupil_elem.normal))
-    pupil_lx, pupil_ly = np.asarray(pupil_lx), np.asarray(pupil_ly)
-    pupil_hw = pupil_elem.width / 2
-    pupil_hh = pupil_elem.height / 2
+    grid = make_pupil_grid(pupil_elem, cell_size)
 
-    # Grid setup
-    nx_cells = max(1, int(np.ceil(pupil_elem.width / cell_size)))
-    ny_cells = max(1, int(np.ceil(pupil_elem.height / cell_size)))
-    x_edges = np.linspace(-pupil_hw, pupil_hw, nx_cells + 1)
-    y_edges = np.linspace(-pupil_hh, pupil_hh, ny_cells + 1)
-    x_centers = (x_edges[:-1] + x_edges[1:]) / 2
-    y_centers = (y_edges[:-1] + y_edges[1:]) / 2
-
-    scan_dirs, scan_angles = scan_directions(
+    scan_dirs, _ = scan_directions(
         projector.direction, x_fov, y_fov, num_x_angles, num_y_angles,
     )
 
     n_angles = num_x_angles * num_y_angles
-    grid_sum = np.zeros((ny_cells, nx_cells))
-    grid_count = np.zeros((ny_cells, nx_cells))
+    grid_sum = np.zeros((grid.ny, grid.nx))
+    grid_count = np.zeros((grid.ny, grid.nx))
 
     for iy in range(num_y_angles):
         for ix in range(num_x_angles):
@@ -81,11 +68,10 @@ def pupil_coverage_report(
             ray_origins, _, _, _ = projector.generate_rays(direction=d)
 
             # Single wavelength — sum over branches.
-            angle_grid = np.zeros((ny_cells, nx_cells))
+            angle_grid = np.zeros((grid.ny, grid.nx))
             for beam in beams:
                 tr = trace_beam(beam, ray_origins, d, color_idx=1)
-                angle_grid += bin_hits_to_grid_np(
-                    tr, pupil_center, pupil_lx, pupil_ly, x_edges, y_edges)
+                angle_grid += bin_hits_to_pupil_grid(tr, grid)
             grid_sum += angle_grid
             grid_count += (angle_grid > 0).astype(float)
 
@@ -93,8 +79,12 @@ def pupil_coverage_report(
     avg_grid = np.where(grid_count > 0, grid_sum / n_angles, 0.0)
 
     # Pupil boundary rectangle
-    rect_x = [-pupil_hw, pupil_hw, pupil_hw, -pupil_hw, -pupil_hw]
-    rect_y = [-pupil_hh, -pupil_hh, pupil_hh, pupil_hh, -pupil_hh]
+    hw, hh = grid.half_width, grid.half_height
+    rect_x = [-hw, hw, hw, -hw, -hw]
+    rect_y = [-hh, -hh, hh, hh, -hh]
+    x_centers = grid.centers_x
+    y_centers = grid.centers_y
+    nx_cells, ny_cells = grid.nx, grid.ny
 
     fig = go.Figure()
 
