@@ -8,7 +8,7 @@ in a 3D ``plot_system`` view with a per-angle slider.
 Per-color intensity reaching the pupil across the FOV is printed as a
 summary. Chromatic effects come from two places: the per-color reflectance
 on each partial mirror and the per-wavelength refractive index resolved by
-``prepare_beam``.
+``prepare_route``.
 """
 
 import jax.numpy as jnp
@@ -19,7 +19,7 @@ from apollo14.combiner import (
     DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
 )
 from apollo14.route import build_route, branch_path, absorb
-from apollo14.trace import prepare_beam, trace_beam
+from apollo14.trace import prepare_route, trace_rays
 from apollo14.projector import Projector, scan_directions
 from apollo14.visualizer import plot_system, plot_pupil_fill
 from apollo14.units import mm, nm, deg
@@ -55,9 +55,13 @@ branch_paths = {
 main_route = build_route(system, main_path)
 branch_routes = {name: build_route(system, p) for name, p in branch_paths.items()}
 
-print(f"Main route: {main_route.position.shape[0]} surfaces")
+def _describe(route):
+    kinds = [type(s).__name__ for s in route.segments]
+    return f"{len(route.segments)} segments [{', '.join(kinds)}]"
+
+print(f"Main route: {_describe(main_route)}")
 for name, r in branch_routes.items():
-    print(f"  branch {name}: {r.position.shape[0]} surfaces")
+    print(f"  branch {name}: {_describe(r)}")
 
 # ── RGB beams ──────────────────────────────────────────────────────────────
 
@@ -68,9 +72,9 @@ RGB_WAVELENGTHS = {
 }
 RGB_COLOR_IDX = {"R": 0, "G": 1, "B": 2}
 
-main_beams = {c: prepare_beam(main_route, wl) for c, wl in RGB_WAVELENGTHS.items()}
-branch_beams = {
-    c: {name: prepare_beam(r, wl) for name, r in branch_routes.items()}
+main_routes = {c: prepare_route(main_route, wl) for c, wl in RGB_WAVELENGTHS.items()}
+branch_routes_rgb = {
+    c: {name: prepare_route(r, wl) for name, r in branch_routes.items()}
     for c, wl in RGB_WAVELENGTHS.items()
 }
 
@@ -116,12 +120,12 @@ for iy in range(num_y):
 
         for c, ci in RGB_COLOR_IDX.items():
             # Main path (doesn't reach the pupil — recorded for completeness).
-            _ = trace_beam(main_beams[c], origins, direction, color_idx=ci)
+            _ = trace_rays(main_routes[c], origins, direction, color_idx=ci)
 
             # Each reflected branch contributes to the pupil.
             total = 0.0
-            for name, bbeam in branch_beams[c].items():
-                tr = trace_beam(bbeam, origins, direction, color_idx=ci)
+            for name, broute in branch_routes_rgb[c].items():
+                tr = trace_rays(broute, origins, direction, color_idx=ci)
                 last_valid = tr.valids[..., -1]
                 total += float(
                     jnp.where(last_valid, tr.final_intensity, 0.0).sum()
@@ -130,9 +134,10 @@ for iy in range(num_y):
                     viz_traces.append(tr)
             result[iy, ix, ci] = total
 
-        if c == "G":
-            tr_main = trace_beam(main_beams["G"], origins, direction, color_idx=1)
-            viz_traces.append(tr_main)
+        # Main-path viz trace for the green channel (one per angle).
+        tr_main = trace_rays(main_routes["G"], origins, direction,
+                             color_idx=RGB_COLOR_IDX["G"])
+        viz_traces.append(tr_main)
 
 # ── Summary ────────────────────────────────────────────────────────────────
 
@@ -166,7 +171,7 @@ print("\n── Rendering pupil fill (green channel) ──")
 pupil_element = system.resolve("pupil")
 
 fig_pupil = plot_pupil_fill(
-    list(branch_beams["G"].values()),
+    list(branch_routes_rgb["G"].values()),
     projector, pupil_element,
     x_fov, y_fov, num_x, num_y,
     color_idx=RGB_COLOR_IDX["G"],
