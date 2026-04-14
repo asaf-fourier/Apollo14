@@ -44,9 +44,13 @@ main_path = [
 ]
 
 # One reflected branch per mirror: everything up to that mirror, reflect,
-# then out through the exit face and into the pupil. Each branch is just
-# another linear route, traced independently.
-branch_tail = [("chassis", "front"), absorb("pupil")]
+# then out through the top of the chassis and into the pupil. Each branch
+# is just another linear route, traced independently.
+#
+# Exit face is "top" (not "front"): after reflecting off a ~48°-tilted
+# partial mirror, the ray direction is mostly +z, so it leaves the
+# chassis through the top slab.
+branch_tail = [("chassis", "top"), absorb("pupil")]
 branch_paths = {
     f"mirror_{i}": branch_path(main_path, at=f"mirror_{i}", tail=branch_tail)
     for i in range(6)

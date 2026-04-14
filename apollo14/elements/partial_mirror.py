@@ -87,6 +87,8 @@ def mirror_transmit_one(mirror_params, ray: Ray, color_idx):
     The mirror coating is a thin layer inside a single medium, so the
     transmitted direction is unchanged — only the intensity attenuates.
     """
+    alive_in = ray.intensity > 0
+
     hit, _, in_bounds = ray_rect_intersect(
         ray.pos, ray.dir,
         mirror_params.position, mirror_params.normal,
@@ -96,13 +98,16 @@ def mirror_transmit_one(mirror_params, ray: Ray, color_idx):
     r = mirror_params.reflectance[color_idx]
     new_intensity = ray.intensity * (1.0 - r)
 
-    out_intensity = jnp.where(in_bounds, new_intensity, 0.0)
-    out_pos = jnp.where(in_bounds, hit, ray.pos)
-    return Ray(pos=out_pos, dir=ray.dir, intensity=out_intensity), hit, in_bounds
+    valid = in_bounds & alive_in
+    out_intensity = jnp.where(valid, new_intensity, 0.0)
+    out_pos = jnp.where(valid, hit, ray.pos)
+    return Ray(pos=out_pos, dir=ray.dir, intensity=out_intensity), hit, valid
 
 
 def mirror_reflect_one(seg: ReflectMirrorSeg, ray: Ray, color_idx):
     """Reflect off one partial mirror (branch fork point)."""
+    alive_in = ray.intensity > 0
+
     hit, _, in_bounds = ray_rect_intersect(
         ray.pos, ray.dir,
         seg.position, seg.normal, seg.local_x, seg.local_y, seg.half_extents)
@@ -113,7 +118,8 @@ def mirror_reflect_one(seg: ReflectMirrorSeg, ray: Ray, color_idx):
     r = seg.reflectance[color_idx]
     new_intensity = ray.intensity * r
 
-    out_intensity = jnp.where(in_bounds, new_intensity, 0.0)
-    out_pos = jnp.where(in_bounds, hit, ray.pos)
-    out_dir = jnp.where(in_bounds, reflected, ray.dir)
-    return Ray(pos=out_pos, dir=out_dir, intensity=out_intensity), hit, in_bounds
+    valid = in_bounds & alive_in
+    out_intensity = jnp.where(valid, new_intensity, 0.0)
+    out_pos = jnp.where(valid, hit, ray.pos)
+    out_dir = jnp.where(valid, reflected, ray.dir)
+    return Ray(pos=out_pos, dir=out_dir, intensity=out_intensity), hit, valid

@@ -65,7 +65,13 @@ def aperture_interact(seg: ApertureSeg, ray: Ray, color_idx):
     - hit inner hole → pass unchanged
     - hit outer frame outside hole → absorbed (intensity 0)
     - miss outer frame → no-op, ray continues unchanged
+
+    Also propagates upstream death: if the incoming ray is already dead
+    (``intensity == 0``) it stays put and stays invalid, so the tracer
+    doesn't resurrect corpse rays at later segments.
     """
+    alive_in = ray.intensity > 0
+
     hit, _, in_outer = ray_rect_intersect(
         ray.pos, ray.dir, seg.position, seg.normal,
         seg.local_x, seg.local_y, seg.half_extents)
@@ -76,10 +82,10 @@ def aperture_interact(seg: ApertureSeg, ray: Ray, color_idx):
     blocked = in_outer & (~in_inner)
     out_intensity = jnp.where(blocked, 0.0, ray.intensity)
 
-    # Position only advances when the ray engaged the stop (hit outer).
-    out_pos = jnp.where(in_outer, hit, ray.pos)
+    # Position only advances when a live ray actually engaged the stop.
+    advance = in_outer & alive_in
+    out_pos = jnp.where(advance, hit, ray.pos)
 
     out_ray = Ray(pos=out_pos, dir=ray.dir, intensity=out_intensity)
-    # Valid = the ray is still alive after this step.
-    valid = ~blocked
+    valid = (~blocked) & alive_in
     return out_ray, hit, valid

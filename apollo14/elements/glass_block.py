@@ -87,6 +87,8 @@ def face_interact(seg: FaceSeg, ray: Ray, color_idx):
     ``seg.n1`` and ``seg.n2`` must be scalar arrays — callers use
     ``prepare_route`` to resolve them from ``MaterialData``.
     """
+    alive_in = ray.intensity > 0
+
     hit, _, in_bounds = ray_rect_intersect(
         ray.pos, ray.dir, seg.position, seg.normal,
         seg.local_x, seg.local_y, seg.half_extents)
@@ -95,7 +97,7 @@ def face_interact(seg: FaceSeg, ray: Ray, color_idx):
                        seg.normal, -seg.normal)
     refracted, is_tir = snell_refract(ray.dir, facing, seg.n1, seg.n2)
 
-    valid = in_bounds & ~is_tir
+    valid = in_bounds & ~is_tir & alive_in
     out_intensity = jnp.where(valid, ray.intensity, 0.0)
     out_pos = jnp.where(valid, hit, ray.pos)
     out_dir = jnp.where(valid, refracted, ray.dir)

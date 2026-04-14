@@ -80,8 +80,10 @@ def build_default_system() -> OpticalSystem:
         name="aperture",
         position=DEFAULT_LIGHT_POSITION - jnp.array([0.0, 0.5 * mm, 0.0]),
         normal=DEFAULT_LIGHT_DIRECTION,
-        width=4.0 * mm,
-        height=1.0 * mm,
+        width=6.0 * mm,
+        height=3.0 * mm,
+        inner_width=4.0 * mm,
+        inner_height=2.0 * mm,
     ))
 
     # ── Mirrors ──────────────────────────────────────────────────────────

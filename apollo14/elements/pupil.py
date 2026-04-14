@@ -37,14 +37,17 @@ Pupil = RectangularPupil
 
 
 def pupil_interact(seg: PupilSeg, ray: Ray, color_idx):
-    """Terminal: record the hit, mark valid if within bounds.
+    """Terminal: record the hit, mark valid if within bounds and alive.
     Intensity and direction are preserved (the pupil doesn't alter the ray).
     """
+    alive_in = ray.intensity > 0
+
     hit, _, in_bounds = ray_rect_intersect(
         ray.pos, ray.dir, seg.position, seg.normal,
         seg.local_x, seg.local_y, seg.half_extents)
 
-    out_intensity = jnp.where(in_bounds, ray.intensity, 0.0)
-    out_pos = jnp.where(in_bounds, hit, ray.pos)
+    valid = in_bounds & alive_in
+    out_intensity = jnp.where(valid, ray.intensity, 0.0)
+    out_pos = jnp.where(valid, hit, ray.pos)
     out_ray = Ray(pos=out_pos, dir=ray.dir, intensity=out_intensity)
-    return out_ray, hit, in_bounds
+    return out_ray, hit, valid
