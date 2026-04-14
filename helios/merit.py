@@ -13,7 +13,8 @@ from typing import Sequence, Tuple
 import jax.numpy as jnp
 
 from apollo14.projector import Projector, scan_directions
-from apollo14.trace import Beam, trace_beam, prepare_beam
+from apollo14.route import Route
+from apollo14.trace import trace_rays, prepare_route
 from apollo14.binning import bin_hits_to_nearest
 from apollo14.route import build_route, branch_path, absorb
 from apollo14.geometry import planar_grid_points
@@ -36,18 +37,18 @@ _D65_RAW = jnp.array([78.0, 107.0, 82.0])  # approximate D65 at 630/525/460 nm
 D65_WEIGHTS = _D65_RAW / _D65_RAW.sum()
 
 
-# ── Beam construction helper ─────────────────────────────────────────────────
+# ── Route construction helper ────────────────────────────────────────────────
 
-def build_combiner_pupil_beams(system: OpticalSystem,
-                               wavelengths: Sequence[float],
-                               num_mirrors: int = 6,
-                               pupil_name: str = "pupil",
-                               chassis_name: str = "chassis",
-                               ) -> list[list[Beam]]:
-    """Build reflected-branch beams that terminate on the pupil.
+def build_combiner_pupil_routes(system: OpticalSystem,
+                                wavelengths: Sequence[float],
+                                num_mirrors: int = 6,
+                                pupil_name: str = "pupil",
+                                chassis_name: str = "chassis",
+                                ) -> list[list[Route]]:
+    """Build reflected-branch routes that terminate on the pupil.
 
     One branch per mirror (reflect off it, exit the chassis, absorb at the
-    pupil), prepared once per wavelength. The returned list is shaped
+    pupil), wavelength-resolved once per color. The returned list is shaped
     ``(n_wavelengths, num_mirrors)``.
     """
     main_path: list = [
@@ -64,7 +65,7 @@ def build_combiner_pupil_beams(system: OpticalSystem,
     ]
 
     return [
-        [prepare_beam(r, float(wl)) for r in branch_routes]
+        [prepare_route(r, float(wl)) for r in branch_routes]
         for wl in wavelengths
     ]
 
@@ -89,7 +90,7 @@ class MeritConfig:
             self.d65_weights = D65_WEIGHTS
 
 
-def simulate_pupil_response(beams_per_color: Sequence[Sequence[Beam]],
+def simulate_pupil_response(routes_per_color: Sequence[Sequence[Route]],
                             projector: Projector,
                             pupil_center, pupil_normal, pupil_radius,
                             config: MeritConfig,
@@ -98,8 +99,8 @@ def simulate_pupil_response(beams_per_color: Sequence[Sequence[Beam]],
     """Trace R/G/B rays across pupil positions and FOV angles.
 
     Args:
-        beams_per_color: ``(n_colors, n_branches)`` — pupil-terminated beams
-            (e.g. from ``build_combiner_pupil_beams``). Each color's inner
+        routes_per_color: ``(n_colors, n_branches)`` — pupil-terminated routes
+            (e.g. from ``build_combiner_pupil_routes``). Each color's inner
             list is summed over branches at the pupil.
 
     Returns:
@@ -115,7 +116,7 @@ def simulate_pupil_response(beams_per_color: Sequence[Sequence[Beam]],
         config.angle_nx, config.angle_ny,
     )  # (any, anx, 3)
 
-    n_wl = len(beams_per_color)
+    n_wl = len(routes_per_color)
     result = jnp.zeros((config.pupil_ny, config.pupil_nx,
                         config.angle_ny, config.angle_nx, n_wl))
 
@@ -124,10 +125,10 @@ def simulate_pupil_response(beams_per_color: Sequence[Sequence[Beam]],
             direction = scan_dirs[ai_y, ai_x]
             origins, _, _, _ = projector.generate_rays(direction=direction)
 
-            for wi, branch_beams in enumerate(beams_per_color):
+            for wi, branch_routes in enumerate(routes_per_color):
                 binned = jnp.zeros(flat_positions.shape[0])
-                for beam in branch_beams:
-                    tr = trace_beam(beam, origins, direction, color_idx=wi)
+                for route in branch_routes:
+                    tr = trace_rays(route, origins, direction, color_idx=wi)
                     binned = binned + bin_hits_to_nearest(
                         tr, flat_positions, stop_grad=False)
                 binned_2d = binned.reshape(config.pupil_ny, config.pupil_nx)
@@ -161,7 +162,7 @@ def merit_mse(simulated: jnp.ndarray, target: jnp.ndarray) -> float:
     return float(jnp.mean((simulated - target) ** 2))
 
 
-def evaluate_merit(beams_per_color: Sequence[Sequence[Beam]],
+def evaluate_merit(routes_per_color: Sequence[Sequence[Route]],
                    projector: Projector,
                    pupil_center, pupil_normal, pupil_radius,
                    x_fov: float, y_fov: float,
@@ -176,7 +177,7 @@ def evaluate_merit(beams_per_color: Sequence[Sequence[Beam]],
         config = MeritConfig()
 
     simulated = simulate_pupil_response(
-        beams_per_color, projector, pupil_center, pupil_normal, pupil_radius,
+        routes_per_color, projector, pupil_center, pupil_normal, pupil_radius,
         config, x_fov, y_fov,
     )
     target = build_target(config)

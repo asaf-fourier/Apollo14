@@ -19,35 +19,35 @@ from helios import (
     compute_eyebox_response, eyebox_merit, eyebox_area_merit,
     eyebox_grid_points, cell_grid_from_cell_size,
 )
-from helios.merit import build_combiner_pupil_beams, DEFAULT_WAVELENGTHS
+from helios.merit import build_combiner_pupil_routes, DEFAULT_WAVELENGTHS
 
 
 def _make_fixtures():
     system = build_default_system()
     pupil = next(e for e in system.elements if isinstance(e, RectangularPupil))
-    beams = build_combiner_pupil_beams(
+    routes = build_combiner_pupil_routes(
         system, [float(w) for w in DEFAULT_WAVELENGTHS])
     projector = Projector.uniform(
         position=DEFAULT_LIGHT_POSITION, direction=DEFAULT_LIGHT_DIRECTION,
         beam_width=DEFAULT_BEAM_WIDTH, beam_height=DEFAULT_BEAM_HEIGHT,
         wavelength=550e-6, nx=3, ny=3,
     )
-    return system, pupil, beams, projector
+    return system, pupil, routes, projector
 
 
 class TestMerit:
 
-    def test_build_beams_shape(self):
+    def test_build_routes_shape(self):
         system = build_default_system()
-        beams = build_combiner_pupil_beams(system, [550e-6])
-        assert len(beams) == 1
-        assert len(beams[0]) == 6  # six mirrors → six branches
+        routes = build_combiner_pupil_routes(system, [550e-6])
+        assert len(routes) == 1
+        assert len(routes[0]) == 6  # six mirrors → six branches
 
     def test_evaluate_merit_shapes(self):
-        _, pupil, beams, projector = _make_fixtures()
+        _, pupil, routes, projector = _make_fixtures()
         cfg = MeritConfig(pupil_nx=2, pupil_ny=2, angle_nx=3, angle_ny=3)
         mse, sim, tgt = evaluate_merit(
-            beams, projector, pupil.position, pupil.normal, 3.0 * mm,
+            routes, projector, pupil.position, pupil.normal, 3.0 * mm,
             DEFAULT_X_FOV, DEFAULT_Y_FOV, cfg,
         )
         assert sim.shape == (2, 2, 3, 3, 3)
@@ -58,12 +58,12 @@ class TestMerit:
 class TestEyebox:
 
     def test_compute_response_shape(self):
-        _, pupil, beams, _ = _make_fixtures()
+        _, pupil, routes, _ = _make_fixtures()
         cfg = EyeboxConfig(n_fov_x=3, n_fov_y=3, n_beam_x=3, n_beam_y=3)
         pts = eyebox_grid_points(pupil.position, pupil.normal, 3.0 * mm,
                                  nx=3, ny=3)
         resp, dirs = compute_eyebox_response(
-            beams, DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
+            routes, DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
             DEFAULT_BEAM_WIDTH, DEFAULT_BEAM_HEIGHT,
             DEFAULT_X_FOV, DEFAULT_Y_FOV, pts, cfg,
         )
@@ -71,12 +71,12 @@ class TestEyebox:
         assert dirs.shape == (9, 3)
 
     def test_eyebox_merit_scalar(self):
-        _, pupil, beams, _ = _make_fixtures()
+        _, pupil, routes, _ = _make_fixtures()
         cfg = EyeboxConfig(n_fov_x=3, n_fov_y=3, n_beam_x=3, n_beam_y=3)
         pts = eyebox_grid_points(pupil.position, pupil.normal, 3.0 * mm,
                                  nx=3, ny=3)
         resp, _ = compute_eyebox_response(
-            beams, DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
+            routes, DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
             DEFAULT_BEAM_WIDTH, DEFAULT_BEAM_HEIGHT,
             DEFAULT_X_FOV, DEFAULT_Y_FOV, pts, cfg,
         )
@@ -85,12 +85,12 @@ class TestEyebox:
         assert jnp.isfinite(loss)
 
     def test_eyebox_area_merit_scalar(self):
-        _, pupil, beams, _ = _make_fixtures()
+        _, pupil, routes, _ = _make_fixtures()
         cfg = EyeboxConfig(n_fov_x=3, n_fov_y=3, n_beam_x=3, n_beam_y=3)
         pts, nx, ny = cell_grid_from_cell_size(
             pupil.position, pupil.normal, 6.0 * mm, 6.0 * mm, 2.0 * mm)
         resp, _ = compute_eyebox_response(
-            beams, DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
+            routes, DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
             DEFAULT_BEAM_WIDTH, DEFAULT_BEAM_HEIGHT,
             DEFAULT_X_FOV, DEFAULT_Y_FOV, pts, cfg,
         )
@@ -99,12 +99,14 @@ class TestEyebox:
         assert jnp.isfinite(loss)
 
     def test_grad_through_reflectance(self):
-        """Gradients must flow through prepare_beam → trace_beam."""
-        from apollo14.trace import prepare_beam, trace_beam
-        from apollo14.route import combiner_main_path
+        """Gradients must flow through prepare_route → trace_rays."""
+        from apollo14.trace import prepare_route, trace_rays
+        from apollo14.route import combiner_main_path, Route
+        from apollo14.elements.partial_mirror import MirrorStackSeg
 
         system = build_default_system()
         route = combiner_main_path(system)
+        stack = next(s for s in route.segments if isinstance(s, MirrorStackSeg))
 
         projector = Projector.uniform(
             position=DEFAULT_LIGHT_POSITION, direction=DEFAULT_LIGHT_DIRECTION,
@@ -115,10 +117,14 @@ class TestEyebox:
             direction=DEFAULT_LIGHT_DIRECTION)
 
         def loss(refl):
-            beam = prepare_beam(route._replace(reflectance=refl), 550e-6)
-            tr = trace_beam(beam, origins, DEFAULT_LIGHT_DIRECTION, color_idx=1)
+            new_segs = tuple(
+                s._replace(reflectance=refl) if isinstance(s, MirrorStackSeg) else s
+                for s in route.segments
+            )
+            prepared = prepare_route(Route(segments=new_segs), 550e-6)
+            tr = trace_rays(prepared, origins, DEFAULT_LIGHT_DIRECTION, color_idx=1)
             return jnp.sum(tr.final_intensity)
 
-        grads = jax.grad(loss)(route.reflectance)
-        assert grads.shape == route.reflectance.shape
+        grads = jax.grad(loss)(stack.reflectance)
+        assert grads.shape == stack.reflectance.shape
         assert jnp.any(grads != 0.0)

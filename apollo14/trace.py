@@ -1,12 +1,13 @@
-"""Generic single-path sequential tracer.
+"""Segmented single-path sequential tracer.
 
-A route (built in ``apollo14.route``) is a flat stacked ``Surface`` — one
-``lax.scan`` worth of surfaces, wavelength-agnostic. ``prepare_beam`` turns
-it into a ``Beam`` for a specific wavelength + initial intensity; ``trace``
-consumes the beam.
+A ``Route`` is a tuple of typed segment pytrees (see ``apollo14.route``).
+``prepare_route`` resolves wavelength-dependent face materials to scalar
+indices. ``trace`` walks the segments in Python, dispatching each to the
+matching element's ``jax_interact`` function; consecutive transmit
+mirrors are handled by ``lax.scan`` for compile-time efficiency.
 
 Branching (reflected daughter rays, multi-path combiner) is authored as
-separate routes, not as branching inside the scan.
+separate routes, not as branching inside the tracer.
 """
 
 from typing import NamedTuple
@@ -14,71 +15,122 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
-from apollo14.surface import Surface, surface_step, interp_n
-
-
-class Beam(NamedTuple):
-    """A route prepared for a specific wavelength and initial intensity."""
-    surfaces: Surface              # stacked; n1/n2 are scalar (wavelength-resolved)
-    intensity: jnp.ndarray         # scalar initial intensity
+from apollo14.materials import MaterialData
+from apollo14.ray import Ray
+from apollo14.route import Route
+from apollo14.elements.aperture import ApertureSeg, aperture_interact
+from apollo14.elements.glass_block import FaceSeg, face_interact
+from apollo14.elements.partial_mirror import (
+    MirrorStackSeg, ReflectMirrorSeg,
+    mirror_transmit_one, mirror_reflect_one,
+)
+from apollo14.elements.pupil import PupilSeg, pupil_interact
 
 
 class TraceResult(NamedTuple):
-    """Result of tracing one ray through a beam.
+    """Result of tracing one ray (or a batch of rays) through a ``Route``.
 
-    Shapes are ``(N, ...)`` for N surfaces, with a leading ``R`` batch dim
-    when produced via ``trace_beam``.
+    Shapes are ``(..., N, 3)`` / ``(..., N)`` for N interaction steps,
+    with a leading batch dim when produced via ``trace_rays``.
     """
-    hits: jnp.ndarray              # (..., N, 3) raw plane intersection at each step
-    valids: jnp.ndarray            # (..., N) bool — whether each step was valid
-    final_pos: jnp.ndarray         # (..., 3) position after the final step
-    final_dir: jnp.ndarray         # (..., 3) direction after the final step
-    final_intensity: jnp.ndarray   # (...,) intensity after the final step
+    hits: jnp.ndarray
+    valids: jnp.ndarray
+    final_pos: jnp.ndarray
+    final_dir: jnp.ndarray
+    final_intensity: jnp.ndarray
 
 
-# ── Beam preparation ─────────────────────────────────────────────────────────
+# ── Route preparation ────────────────────────────────────────────────────────
 
-def prepare_beam(route: Surface, wavelength, intensity=1.0) -> Beam:
-    """Resolve a route's per-surface n1/n2 at ``wavelength`` and pair it
-    with an initial ``intensity``.
+def _interp_n(mat: MaterialData, wavelength):
+    return jnp.interp(wavelength, mat.wavelengths, mat.n_values)
 
-    The route itself is wavelength-agnostic — call this once per wavelength
-    (and per intensity if you vary angle/wavelength dependent power).
+
+def _resolve_face(seg: FaceSeg, wavelength) -> FaceSeg:
+    return seg._replace(
+        n1=_interp_n(seg.n1, wavelength),
+        n2=_interp_n(seg.n2, wavelength),
+    )
+
+
+def prepare_route(route: Route, wavelength) -> Route:
+    """Resolve every ``FaceSeg``'s ``MaterialData`` to a scalar n at
+    ``wavelength``. Mirror/aperture/pupil segments pass through unchanged.
     """
-    n1 = jax.vmap(lambda m: interp_n(m, wavelength))(route.n1)
-    n2 = jax.vmap(lambda m: interp_n(m, wavelength))(route.n2)
-    ready = route._replace(n1=n1, n2=n2)
-    return Beam(surfaces=ready,
-                intensity=jnp.asarray(intensity, dtype=jnp.float32))
+    new_segs = tuple(
+        _resolve_face(s, wavelength) if isinstance(s, FaceSeg) else s
+        for s in route.segments
+    )
+    return Route(segments=new_segs)
 
 
 # ── Tracing ──────────────────────────────────────────────────────────────────
 
-def trace(beam: Beam, origin, direction,
-          color_idx: int = 0) -> TraceResult:
-    """Trace one ray through the beam via a single ``lax.scan``."""
-    def step(carry, state):
-        pos, d, inten = carry
-        out_pos, out_dir, out_inten, hit, valid = surface_step(
-            state, pos, d, inten, color_idx)
-        return (out_pos, out_dir, out_inten), (hit, valid)
+def trace(route: Route, ray: Ray, color_idx: int = 0) -> TraceResult:
+    """Trace one ``Ray`` through a wavelength-resolved ``Route``."""
+    hits_accum = []
+    valids_accum = []
 
-    init = (origin, direction, beam.intensity)
-    (final_pos, final_dir, final_inten), (hits, valids) = jax.lax.scan(
-        step, init, beam.surfaces)
+    def _push(hit, valid):
+        hits_accum.append(hit[None, :])
+        valids_accum.append(valid[None])
+
+    for seg in route.segments:
+        if isinstance(seg, ApertureSeg):
+            ray, hit, valid = aperture_interact(seg, ray, color_idx)
+            _push(hit, valid)
+
+        elif isinstance(seg, FaceSeg):
+            ray, hit, valid = face_interact(seg, ray, color_idx)
+            _push(hit, valid)
+
+        elif isinstance(seg, MirrorStackSeg):
+            def step(r, params):
+                r_out, hit, valid = mirror_transmit_one(params, r, color_idx)
+                return r_out, (hit, valid)
+            ray, (stack_hits, stack_valids) = jax.lax.scan(step, ray, seg)
+            hits_accum.append(stack_hits)
+            valids_accum.append(stack_valids)
+
+        elif isinstance(seg, ReflectMirrorSeg):
+            ray, hit, valid = mirror_reflect_one(seg, ray, color_idx)
+            _push(hit, valid)
+
+        elif isinstance(seg, PupilSeg):
+            ray, hit, valid = pupil_interact(seg, ray, color_idx)
+            _push(hit, valid)
+
+        else:
+            raise TypeError(f"Unknown segment type: {type(seg).__name__}")
+
+    hits = jnp.concatenate(hits_accum, axis=0)
+    valids = jnp.concatenate(valids_accum, axis=0)
 
     return TraceResult(
         hits=hits,
         valids=valids,
-        final_pos=final_pos,
-        final_dir=final_dir,
-        final_intensity=final_inten,
+        final_pos=ray.pos,
+        final_dir=ray.dir,
+        final_intensity=ray.intensity,
     )
 
 
-def trace_beam(beam: Beam, origins, direction,
-               color_idx: int = 0) -> TraceResult:
-    """Trace N rays sharing one direction through a beam."""
-    return jax.vmap(
-        lambda o: trace(beam, o, direction, color_idx)
-    )(origins)
+def trace_rays(route: Route, origins, direction,
+               color_idx: int = 0, intensity=1.0) -> TraceResult:
+    """Trace N rays sharing one direction through a ``Route``.
+
+    Convenience wrapper that builds a ``Ray`` per origin and vmaps
+    ``trace`` over them.
+    """
+    direction = jnp.asarray(direction, dtype=jnp.float32)
+    intensity = jnp.asarray(intensity, dtype=jnp.float32)
+
+    def one(o):
+        ray = Ray(
+            pos=jnp.asarray(o, dtype=jnp.float32),
+            dir=direction,
+            intensity=intensity,
+        )
+        return trace(route, ray, color_idx)
+
+    return jax.vmap(one)(origins)

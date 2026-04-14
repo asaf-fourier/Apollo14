@@ -9,11 +9,11 @@ import plotly.graph_objects as go
 
 from apollo14.system import OpticalSystem
 from apollo14.elements.pupil import RectangularPupil
-from apollo14.trace import trace_beam
+from apollo14.trace import trace_rays
 from apollo14.binning import make_pupil_grid, bin_hits_to_pupil_grid
 from apollo14.projector import Projector, scan_directions
 
-from helios.merit import build_combiner_pupil_beams
+from helios.merit import build_combiner_pupil_routes
 
 
 def pupil_coverage_report(
@@ -47,7 +47,7 @@ def pupil_coverage_report(
     Returns:
         Plotly Figure with the heatmap.
     """
-    beams = build_combiner_pupil_beams(system, [wavelength])[0]
+    routes = build_combiner_pupil_routes(system, [wavelength])[0]
 
     pupil_elem = next(
         e for e in system.elements if isinstance(e, RectangularPupil)
@@ -69,8 +69,8 @@ def pupil_coverage_report(
 
             # Single wavelength — sum over branches.
             angle_grid = np.zeros((grid.ny, grid.nx))
-            for beam in beams:
-                tr = trace_beam(beam, ray_origins, d, color_idx=1)
+            for route in routes:
+                tr = trace_rays(route, ray_origins, d, color_idx=1)
                 angle_grid += bin_hits_to_pupil_grid(tr, grid)
             grid_sum += angle_grid
             grid_count += (angle_grid > 0).astype(float)

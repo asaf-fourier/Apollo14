@@ -27,7 +27,7 @@ import jax
 import jax.numpy as jnp
 
 from apollo14.geometry import planar_grid_points
-from apollo14.trace import Beam, trace_beam
+from apollo14.trace import trace_rays
 from apollo14.binning import bin_hits_to_nearest
 from apollo14.projector import Projector, scan_directions
 
@@ -69,19 +69,19 @@ def eyebox_grid_points(center, normal, radius, nx, ny):
 
 # ── Response computation ────────────────────────────────────────────────────
 
-def compute_eyebox_response(beams_per_color, projector_pos, projector_dir,
+def compute_eyebox_response(routes_per_color, projector_pos, projector_dir,
                             beam_width, beam_height,
                             x_fov, y_fov, eyebox_points, config=None):
     """Compute intensity at each eyebox sample for each FOV angle and color.
 
     For each FOV angle, traces a dense beam of rays (n_beam_x × n_beam_y)
-    from the projector through every pupil-terminated branch beam, binning
+    from the projector through every pupil-terminated branch route, binning
     hits to the nearest eyebox grid point. Gradients flow through intensity
     values; spatial assignment is fixed (``stop_gradient`` on argmin).
 
     Args:
-        beams_per_color: ``(n_colors, n_branches)`` list of pupil-terminated
-            ``Beam``s — e.g. from ``helios.merit.build_combiner_pupil_beams``.
+        routes_per_color: ``(n_colors, n_branches)`` list of pupil-terminated
+            ``Route``s — e.g. from ``helios.merit.build_combiner_pupil_routes``.
         projector_pos: (3,) projector position
         projector_dir: (3,) projector central direction (normalized)
         beam_width: physical width of beam cross-section
@@ -112,14 +112,14 @@ def compute_eyebox_response(beams_per_color, projector_pos, projector_dir,
     n_angles = flat_dirs.shape[0]
 
     color_responses = []
-    for ci, branch_beams in enumerate(beams_per_color):
+    for ci, branch_routes in enumerate(routes_per_color):
         angle_responses = []
         for ai in range(n_angles):
             d = flat_dirs[ai]
             origins, _, _, _ = proj.generate_rays(direction=d)
             binned = jnp.zeros(eyebox_points.shape[0])
-            for beam in branch_beams:
-                tr = trace_beam(beam, origins, d, color_idx=ci)
+            for route in branch_routes:
+                tr = trace_rays(route, origins, d, color_idx=ci)
                 binned = binned + bin_hits_to_nearest(
                     tr, eyebox_points, stop_grad=True)
             angle_responses.append(binned)

@@ -1,4 +1,4 @@
-"""Tests for the generic single-path tracer."""
+"""Tests for the segmented single-path tracer."""
 
 import jax
 import jax.numpy as jnp
@@ -9,34 +9,52 @@ from apollo14.combiner import (
     DEFAULT_LIGHT_DIRECTION,
     DEFAULT_WAVELENGTH,
 )
-from apollo14.surface import TRANSMIT, REFLECT
-from apollo14.route import build_route, combiner_main_path
-from apollo14.trace import prepare_beam, trace, trace_beam
+from apollo14.route import build_route, combiner_main_path, Route
+from apollo14.elements.aperture import ApertureSeg  # noqa: F401
+from apollo14.elements.glass_block import FaceSeg
+from apollo14.elements.partial_mirror import MirrorStackSeg
+from apollo14.elements.pupil import PupilSeg  # noqa: F401
+from apollo14.ray import Ray
+from apollo14.trace import prepare_route, trace, trace_rays
+
+
+def _mirror_stack(route):
+    return next(s for s in route.segments if isinstance(s, MirrorStackSeg))
+
+
+def _replace_mirror_reflectance(route, new_refl):
+    new_segs = tuple(
+        s._replace(reflectance=new_refl) if isinstance(s, MirrorStackSeg) else s
+        for s in route.segments
+    )
+    return Route(segments=new_segs)
 
 
 class TestBuildRoute:
 
-    def test_main_path_shape(self):
+    def test_main_path_segments(self):
         system = build_default_system()
         route = combiner_main_path(system)
-        # aperture + back face + 6 mirrors + front face = 9 surfaces
-        assert route.position.shape[0] == 9
-        assert route.position.shape[1] == 3
+        kinds = [type(s).__name__ for s in route.segments]
+        # aperture + back face + 1 mirror stack (6 mirrors fused) + front face
+        assert kinds == ["ApertureSeg", "FaceSeg", "MirrorStackSeg", "FaceSeg"]
 
-    def test_mirrors_use_glass_medium(self):
+    def test_mirror_stack_length(self):
         system = build_default_system()
         route = combiner_main_path(system)
-        # Entries 2..7 are the mirrors; both n1/n2 should be the glass material.
-        mirror_n1 = route.n1.n_values[2:8]
-        mirror_n2 = route.n2.n_values[2:8]
-        assert jnp.all(mirror_n1 == mirror_n2)
-        # Mirror n is not air (single 1.0 sample).
-        assert mirror_n1.shape[-1] > 1 or not jnp.all(mirror_n1 == 1.0)
+        stack = _mirror_stack(route)
+        assert stack.position.shape == (6, 3)
+        assert stack.reflectance.shape == (6, 3)
 
-    def test_mode_defaults_to_transmit(self):
+    def test_faces_use_glass(self):
         system = build_default_system()
         route = combiner_main_path(system)
-        assert jnp.all(route.mode == TRANSMIT)
+        faces = [s for s in route.segments if isinstance(s, FaceSeg)]
+        assert len(faces) == 2
+        # Back face enters glass: n1=air(1), n2=glass(>1).
+        back = faces[0]
+        # Before prepare_route, n1/n2 are MaterialData (have n_values arrays).
+        assert back.n2.n_values.shape[-1] > 1
 
     def test_custom_path(self):
         system = build_default_system()
@@ -47,77 +65,68 @@ class TestBuildRoute:
             "mirror_1",
             ("chassis", "front"),
         ])
-        assert route.position.shape[0] == 5
+        # aperture + face + (2-mirror stack) + face
+        kinds = [type(s).__name__ for s in route.segments]
+        assert kinds == ["ApertureSeg", "FaceSeg", "MirrorStackSeg", "FaceSeg"]
+        stack = _mirror_stack(route)
+        assert stack.position.shape[0] == 2
 
 
-class TestPrepareBeam:
+def _default_ray(intensity=1.0):
+    return Ray(
+        pos=jnp.asarray(DEFAULT_LIGHT_POSITION, dtype=jnp.float32),
+        dir=jnp.asarray(DEFAULT_LIGHT_DIRECTION, dtype=jnp.float32),
+        intensity=jnp.asarray(intensity, dtype=jnp.float32),
+    )
 
-    def test_beam_scalar_n(self):
+
+class TestPrepareRoute:
+
+    def test_face_scalar_n(self):
         system = build_default_system()
         route = combiner_main_path(system)
-        beam = prepare_beam(route, DEFAULT_WAVELENGTH)
-        # After resolution, n1/n2 are (N,) scalar arrays, not MaterialData.
-        N = route.position.shape[0]
-        assert beam.surfaces.n1.shape == (N,)
-        assert beam.surfaces.n2.shape == (N,)
-        assert float(beam.intensity) == 1.0
-
-    def test_beam_custom_intensity(self):
-        system = build_default_system()
-        route = combiner_main_path(system)
-        beam = prepare_beam(route, DEFAULT_WAVELENGTH, intensity=0.3)
-        assert jnp.isclose(beam.intensity, 0.3)
+        prepared = prepare_route(route, DEFAULT_WAVELENGTH)
+        faces = [s for s in prepared.segments if isinstance(s, FaceSeg)]
+        assert faces[0].n1.shape == ()
+        assert faces[0].n2.shape == ()
 
 
 class TestTraceRay:
 
     def test_single_ray_shapes(self):
         system = build_default_system()
-        route = combiner_main_path(system)
-        beam = prepare_beam(route, DEFAULT_WAVELENGTH)
+        route = prepare_route(combiner_main_path(system), DEFAULT_WAVELENGTH)
+        result = trace(route, _default_ray())
 
-        result = trace(beam,
-                           DEFAULT_LIGHT_POSITION,
-                           DEFAULT_LIGHT_DIRECTION)
-
-        N = route.position.shape[0]
-        assert result.hits.shape == (N, 3)
-        assert result.valids.shape == (N,)
+        # aperture(1) + face(1) + mirrors(6) + face(1) = 9 steps
+        assert result.hits.shape == (9, 3)
+        assert result.valids.shape == (9,)
         assert result.final_pos.shape == (3,)
         assert result.final_dir.shape == (3,)
         assert result.final_intensity.shape == ()
 
     def test_intensity_attenuates(self):
         system = build_default_system()
-        route = combiner_main_path(system)
-        beam = prepare_beam(route, DEFAULT_WAVELENGTH)
-        result = trace(beam,
-                           DEFAULT_LIGHT_POSITION,
-                           DEFAULT_LIGHT_DIRECTION)
-        # Transmitting through 6 partial mirrors must reduce intensity.
+        route = prepare_route(combiner_main_path(system), DEFAULT_WAVELENGTH)
+        result = trace(route, _default_ray())
         assert float(result.final_intensity) < 1.0
         assert float(result.final_intensity) > 0.0
 
     def test_initial_intensity_respected(self):
         system = build_default_system()
-        route = combiner_main_path(system)
-        beam_full = prepare_beam(route, DEFAULT_WAVELENGTH, intensity=1.0)
-        beam_half = prepare_beam(route, DEFAULT_WAVELENGTH, intensity=0.5)
-        r_full = trace(beam_full,
-                           DEFAULT_LIGHT_POSITION,
-                           DEFAULT_LIGHT_DIRECTION)
-        r_half = trace(beam_half,
-                           DEFAULT_LIGHT_POSITION,
-                           DEFAULT_LIGHT_DIRECTION)
+        route = prepare_route(combiner_main_path(system), DEFAULT_WAVELENGTH)
+        r_full = trace(route, _default_ray(intensity=1.0))
+        r_half = trace(route, _default_ray(intensity=0.5))
         assert jnp.isclose(r_half.final_intensity, 0.5 * r_full.final_intensity)
 
     def test_jit_compiles(self):
         system = build_default_system()
-        route = combiner_main_path(system)
+        raw_route = combiner_main_path(system)
 
         def run(wavelength, o, d):
-            beam = prepare_beam(route, wavelength)
-            return trace(beam, o, d).final_intensity
+            route = prepare_route(raw_route, wavelength)
+            ray = Ray(pos=o, dir=d, intensity=jnp.asarray(1.0, jnp.float32))
+            return trace(route, ray).final_intensity
 
         jitted = jax.jit(run)
         val = jitted(DEFAULT_WAVELENGTH,
@@ -128,32 +137,28 @@ class TestTraceRay:
     def test_grad_through_reflectance(self):
         system = build_default_system()
         route = combiner_main_path(system)
+        stack = _mirror_stack(route)
 
         def loss(reflectances):
-            new_route = route._replace(reflectance=reflectances)
-            beam = prepare_beam(new_route, DEFAULT_WAVELENGTH)
-            r = trace(beam,
-                          DEFAULT_LIGHT_POSITION,
-                          DEFAULT_LIGHT_DIRECTION)
-            return r.final_intensity
+            new_route = _replace_mirror_reflectance(route, reflectances)
+            prepared = prepare_route(new_route, DEFAULT_WAVELENGTH)
+            return trace(prepared, _default_ray()).final_intensity
 
-        grads = jax.grad(loss)(route.reflectance)
-        assert grads.shape == route.reflectance.shape
+        grads = jax.grad(loss)(stack.reflectance)
+        assert grads.shape == stack.reflectance.shape
         assert jnp.any(grads != 0.0)
 
 
-class TestTraceBeam:
+class TestTraceRays:
 
-    def test_beam_shapes(self):
+    def test_batch_shapes(self):
         system = build_default_system()
-        route = combiner_main_path(system)
-        beam = prepare_beam(route, DEFAULT_WAVELENGTH)
+        route = prepare_route(combiner_main_path(system), DEFAULT_WAVELENGTH)
         origins = DEFAULT_LIGHT_POSITION + jnp.array([
             [0.0, 0.0, 0.0],
             [0.5, 0.0, 0.0],
             [-0.5, 0.0, 0.0],
         ])
-        result = trace_beam(beam, origins, DEFAULT_LIGHT_DIRECTION)
-        N = route.position.shape[0]
-        assert result.hits.shape == (3, N, 3)
+        result = trace_rays(route, origins, DEFAULT_LIGHT_DIRECTION)
+        assert result.hits.shape == (3, 9, 3)
         assert result.final_intensity.shape == (3,)

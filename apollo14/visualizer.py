@@ -113,19 +113,19 @@ def plot_system(system: OpticalSystem, trace_results: list[TraceResult] = None,
     return fig
 
 
-def plot_pupil_fill(beams, projector, pupil_element,
+def plot_pupil_fill(routes, projector, pupil_element,
                     x_fov, y_fov, num_x_angles, num_y_angles,
                     color_idx: int = 0, pixel_size: float = 0.5,
                     show: bool = True):
     """Plot pupil intensity heatmaps with a slider to step through scan angles.
 
-    Traces each ``Beam`` in ``beams`` at every scan angle and sums their
-    pupil hits into a 2D grid. Use one beam per reflected branch to see
+    Traces each ``Route`` in ``routes`` at every scan angle and sums their
+    pupil hits into a 2D grid. Use one route per reflected branch to see
     the combined pupil fill from the whole combiner stack.
 
     Args:
-        beams: iterable of ``Beam`` — each is assumed to terminate on the
-            pupil (e.g. via ``absorb(pupil.name)``).
+        routes: iterable of wavelength-resolved ``Route`` — each is
+            assumed to terminate on the pupil (e.g. via ``absorb(pupil.name)``).
         projector: ``Projector`` — generates origins and sweeps the FOV.
         pupil_element: ``RectangularPupil`` — pupil geometry for binning.
         x_fov, y_fov: scan extents in radians.
@@ -136,10 +136,10 @@ def plot_pupil_fill(beams, projector, pupil_element,
     Returns:
         Plotly Figure with one heatmap per scan angle and an angle slider.
     """
-    from apollo14.trace import trace_beam
+    from apollo14.trace import trace_rays
     from apollo14.projector import scan_directions
 
-    beams = list(beams)
+    routes = list(routes)
 
     pupil_center = np.asarray(pupil_element.position)
     pupil_normal = np.asarray(pupil_element.normal)
@@ -167,8 +167,8 @@ def plot_pupil_fill(beams, projector, pupil_element,
             ray_origins, _, _, _ = projector.generate_rays(direction=d)
 
             grid = np.zeros((n_bins, n_bins))
-            for beam in beams:
-                tr = trace_beam(beam, ray_origins, d, color_idx=color_idx)
+            for route in routes:
+                tr = trace_rays(route, ray_origins, d, color_idx=color_idx)
                 grid += bin_hits_to_grid_np(
                     tr, pupil_center, pupil_lx, pupil_ly,
                     bin_edges, bin_edges,

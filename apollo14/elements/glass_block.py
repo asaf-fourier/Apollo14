@@ -1,28 +1,45 @@
 """Glass block element — refractive volume defined by planar faces."""
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, NamedTuple
 
 import jax.numpy as jnp
 
-from apollo14.surface import Surface, TRANSMIT
-from apollo14.geometry import normalize, compute_local_axes
+from apollo14.geometry import (
+    normalize, compute_local_axes, ray_rect_intersect, snell_refract,
+)
 from apollo14.materials import Material, air
+from apollo14.ray import Ray
+
+
+class FaceSeg(NamedTuple):
+    """Refracting face (glass-block face or boundary plane).
+
+    ``n1``/``n2`` hold ``MaterialData`` before ``prepare_route`` and scalar
+    arrays after.
+    """
+    position: jnp.ndarray
+    normal: jnp.ndarray
+    local_x: jnp.ndarray
+    local_y: jnp.ndarray
+    half_extents: jnp.ndarray
+    n1: jnp.ndarray
+    n2: jnp.ndarray
 
 
 @dataclass
 class GlassFace:
     """One planar face of a glass block.
 
-    Owns its geometry and a back-reference to the parent block's material,
-    set by ``GlassBlock.__post_init__``. That back-reference is what lets
-    ``to_generic_surface`` pick n1/n2 based on whether the ray is entering
-    or leaving the glass.
+    Owns its geometry and a back-reference to the parent block's material
+    (wired up by ``GlassBlock.__post_init__``). ``build_segment`` uses
+    that back-reference to pick ``n1``/``n2`` depending on whether the
+    ray is entering or leaving the glass.
     """
     name: str
-    position: jnp.ndarray   # (3,) point on the plane
-    normal: jnp.ndarray     # (3,) outward-pointing normal
-    vertices: jnp.ndarray   # (N, 3) ordered polygon vertices
+    position: jnp.ndarray
+    normal: jnp.ndarray
+    vertices: jnp.ndarray
 
     def __post_init__(self):
         self.normal = normalize(self.normal)
@@ -32,16 +49,15 @@ class GlassFace:
         deltas = self.vertices - self.position
         self._verts_x = jnp.array([jnp.dot(d, local_x) for d in deltas])
         self._verts_y = jnp.array([jnp.dot(d, local_y) for d in deltas])
-        self._block_material: Material = None  # wired up by GlassBlock
+        self._block_material: Material = None  # wired by GlassBlock
 
     @property
-    def half_extents(self):
-        """Rectangular half-extents from the vertex bounding box."""
+    def half_extents(self) -> jnp.ndarray:
         hw = float(jnp.max(jnp.abs(self._verts_x)))
         hh = float(jnp.max(jnp.abs(self._verts_y)))
-        return hw, hh
+        return jnp.array([hw, hh], dtype=jnp.float32)
 
-    def to_generic_surface(self, current_material, mode=TRANSMIT):
+    def build_segment(self, current_material, mode):
         glass = self._block_material
         if glass is None:
             raise RuntimeError(
@@ -49,30 +65,48 @@ class GlassFace:
                 "construct it via GlassBlock so the back-reference is wired.")
 
         if current_material.name == glass.name:
-            incoming, outgoing = glass, air     # inside glass → exiting
+            incoming, outgoing = glass, air
         else:
-            incoming, outgoing = current_material, glass  # entering
+            incoming, outgoing = current_material, glass
 
-        hw, hh = self.half_extents
-        surf = Surface(
+        seg = FaceSeg(
             position=self.position,
             normal=self.normal,
-            half_extents=jnp.array([hw, hh], dtype=jnp.float32),
             local_x=self._local_x,
             local_y=self._local_y,
+            half_extents=self.half_extents,
             n1=incoming.data,
             n2=outgoing.data,
-            reflectance=jnp.zeros(3, dtype=jnp.float32),
-            mode=jnp.int8(mode),
         )
-        return surf, outgoing
+        return seg, outgoing
+
+
+def face_interact(seg: FaceSeg, ray: Ray, color_idx):
+    """Refract through a glass face using Snell's law.
+
+    ``seg.n1`` and ``seg.n2`` must be scalar arrays — callers use
+    ``prepare_route`` to resolve them from ``MaterialData``.
+    """
+    hit, _, in_bounds = ray_rect_intersect(
+        ray.pos, ray.dir, seg.position, seg.normal,
+        seg.local_x, seg.local_y, seg.half_extents)
+
+    facing = jnp.where(jnp.dot(ray.dir, seg.normal) < 0,
+                       seg.normal, -seg.normal)
+    refracted, is_tir = snell_refract(ray.dir, facing, seg.n1, seg.n2)
+
+    valid = in_bounds & ~is_tir
+    out_intensity = jnp.where(valid, ray.intensity, 0.0)
+    out_pos = jnp.where(valid, hit, ray.pos)
+    out_dir = jnp.where(valid, refracted, ray.dir)
+    return Ray(pos=out_pos, dir=out_dir, intensity=out_intensity), hit, valid
 
 
 @dataclass
 class GlassBlock:
     """A refractive glass volume defined by planar faces."""
     name: str
-    position: jnp.ndarray   # (3,) center
+    position: jnp.ndarray
     material: Material
     faces: List[GlassFace] = field(default_factory=list)
 
@@ -127,7 +161,7 @@ class GlassBlock:
         return cls(name=name, position=jnp.array([0.0, 0.0, 0.0]),
                    material=material, faces=faces)
 
-    def to_generic_surface(self, current_material, mode=TRANSMIT):
+    def build_segment(self, current_material, mode):
         raise TypeError(
             "GlassBlock is a volume — resolve a named face with "
             "system.resolve(('<block>', '<face>')) for route building.")
