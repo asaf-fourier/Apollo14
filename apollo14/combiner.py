@@ -89,7 +89,7 @@ def build_default_system() -> OpticalSystem:
         width=6.0 * mm,
         height=3.0 * mm,
         inner_width=4.0 * mm,
-        inner_height=2.0 * mm,
+        inner_height=1.0 * mm,
     ))
 
     # ── Mirrors ──────────────────────────────────────────────────────────

@@ -29,9 +29,13 @@ def load_spectrum_csv(path, column: str = "W") -> Tuple[jnp.ndarray, jnp.ndarray
 class Projector:
     """A projector that emits a 2D grid of collimated rays.
 
-    The intensity_map is a 2D array (ny, nx) with values in [0, 1] representing
-    the relative intensity of each pixel. The grid spans the beam_width x beam_height
-    area, with each pixel emitting a collimated ray in the given direction.
+    ``nx``/``ny`` set the ray grid dimensions — the beam is sampled on an
+    ``nx × ny`` lattice spanning ``beam_width × beam_height``. All rays
+    start at intensity 1.0 before spectral and angular scaling.
+
+    Angular roll-off is modelled as a linear falloff in the projector's
+    local x/y axes, specified as ``fraction per radian``. For example, a
+    2% drop at 6° maps to ``falloff_x = 0.02 / (6 * deg)``.
 
     For angular scanning, the direction can be rotated per scan step.
     """
@@ -39,27 +43,33 @@ class Projector:
     direction: jnp.ndarray    # (3,) main emission direction (normalized)
     beam_width: float         # physical width of the beam cross-section
     beam_height: float        # physical height of the beam cross-section
-    intensity_map: jnp.ndarray  # (ny, nx) pixel intensities in [0, 1]
+    nx: int                   # number of rays across the beam width
+    ny: int                   # number of rays across the beam height
+    falloff_x: float = 0.0    # linear angular falloff along local x (per rad)
+    falloff_y: float = 0.0    # linear angular falloff along local y (per rad)
     spectrum: Optional[Tuple[jnp.ndarray, jnp.ndarray]] = None
     """Optional ``(wavelengths, radiance)`` spectral emission curve.
     Units: wavelengths in internal length units, radiance in W/sr/m²/nm."""
 
     @classmethod
     def uniform(cls, position, direction, beam_width, beam_height,
-                nx: int, ny: int, intensity: float = 1.0, spectrum=None):
+                nx: int, ny: int, spectrum=None,
+                falloff_x: float = 0.0, falloff_y: float = 0.0):
         """Create a projector with uniform intensity across all pixels."""
         return cls(
             position=position,
             direction=normalize(direction),
             beam_width=beam_width,
             beam_height=beam_height,
-            intensity_map=jnp.full((ny, nx), intensity),
+            nx=nx, ny=ny,
+            falloff_x=falloff_x, falloff_y=falloff_y,
             spectrum=spectrum,
         )
 
     @classmethod
     def from_csv(cls, path, position, direction, beam_width, beam_height,
-                 nx: int, ny: int, column: str = "W", intensity: float = 1.0):
+                 nx: int, ny: int, column: str = "W",
+                 falloff_x: float = 0.0, falloff_y: float = 0.0):
         """Build a projector whose spectrum comes from a measured CSV.
 
         The CSV is expected to have a ``wavelength`` column (in nm) and one
@@ -72,17 +82,10 @@ class Projector:
             direction=normalize(direction),
             beam_width=beam_width,
             beam_height=beam_height,
-            intensity_map=jnp.full((ny, nx), intensity),
+            nx=nx, ny=ny,
+            falloff_x=falloff_x, falloff_y=falloff_y,
             spectrum=(wls, rad),
         )
-
-    @property
-    def nx(self) -> int:
-        return self.intensity_map.shape[1]
-
-    @property
-    def ny(self) -> int:
-        return self.intensity_map.shape[0]
 
     def _compute_basis(self, direction=None):
         """Compute the beam cross-section basis vectors for a given direction."""
@@ -94,6 +97,39 @@ class Projector:
         local_y = normalize(jnp.cross(local_x, d))
         return local_x, local_y
 
+    def _angular_gain(self, direction) -> jnp.ndarray:
+        """Scalar emission gain for a beam aimed along ``direction``.
+
+        Models a real projector's angular roll-off: when the beam is steered
+        off its nominal optical axis (``self.direction``), the emitter puts
+        out less light. Returns a scalar in ``[0, 1]`` that multiplies every
+        ray's intensity — so all rays in one beam share the same gain
+        (consistent with a collimated beam where the "angle" is a property
+        of the whole bundle, not individual rays).
+
+        The angle is decomposed into two components by projecting
+        ``direction`` onto the projector's base local x/y axes::
+
+            ax = arcsin(direction · base_x)   # tilt around base_y
+            ay = arcsin(direction · base_y)   # tilt around base_x
+
+        A linear falloff is then applied independently on each axis::
+
+            gain = (1 - falloff_x · |ax|) · (1 - falloff_y · |ay|)
+
+        clipped to ``[0, 1]``. For ``direction == self.direction`` the dot
+        products are zero, so ``gain == 1``. The clip on the dot products
+        guards ``arcsin`` against tiny numerical overshoot past ±1.
+        """
+        base_x, base_y = self._compute_basis(self.direction)
+        ax = jnp.arcsin(jnp.clip(jnp.dot(direction, base_x), -1.0, 1.0))
+        ay = jnp.arcsin(jnp.clip(jnp.dot(direction, base_y), -1.0, 1.0))
+        return jnp.clip(
+            (1.0 - self.falloff_x * jnp.abs(ax))
+            * (1.0 - self.falloff_y * jnp.abs(ay)),
+            0.0, 1.0,
+        )
+
     def generate_rays(self, direction=None, wavelength=None) -> Ray:
         """Generate a batched ``Ray`` for the beam cross-section.
 
@@ -101,10 +137,9 @@ class Projector:
         ``dir`` of shape ``(3,)`` (collimated beam), and ``intensity``
         of shape ``(N,)``.
 
-        When ``wavelength`` is given and the projector has a ``spectrum``,
-        per-pixel intensities are multiplied by the spectral radiance at
-        that wavelength — so the same projector instance can emit into
-        multiple wavelength bins without rebuilding.
+        Intensity is ``spectrum(wavelength) × angular_gain(direction)``,
+        where ``angular_gain`` is a linear falloff from the projector's
+        base direction along its local x/y axes.
         """
         d = normalize(direction if direction is not None else self.direction)
         local_x, local_y = self._compute_basis(d)
@@ -118,7 +153,8 @@ class Projector:
         offsets = gx_flat[:, None] * local_x[None, :] + gy_flat[:, None] * local_y[None, :]
         origins = self.position[None, :] + offsets  # (N, 3)
 
-        intensities = self.intensity_map.ravel()
+        intensities = jnp.full((self.nx * self.ny,), self._angular_gain(d))
+
         if wavelength is not None and self.spectrum is not None:
             spec_wls, spec_rad = self.spectrum
             intensities = intensities * jnp.interp(
@@ -139,7 +175,8 @@ class PlayNitrideLed(Projector):
 
     @classmethod
     def create(cls, position, direction, beam_width, beam_height,
-               nx: int, ny: int, color: str, intensity: float = 1.0):
+               nx: int, ny: int, color: str,
+               falloff_x: float = 0.0, falloff_y: float = 0.0):
         if color not in ("R", "G", "B", "W"):
             raise ValueError(f"color must be one of R/G/B/W, got {color!r}")
         wls, rad = load_spectrum_csv(_PLAYNITRIDE_CSV, column=color)
@@ -148,7 +185,8 @@ class PlayNitrideLed(Projector):
             direction=normalize(direction),
             beam_width=beam_width,
             beam_height=beam_height,
-            intensity_map=jnp.full((ny, nx), intensity),
+            nx=nx, ny=ny,
+            falloff_x=falloff_x, falloff_y=falloff_y,
             spectrum=(wls, rad),
         )
 

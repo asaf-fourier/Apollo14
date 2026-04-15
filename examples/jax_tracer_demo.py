@@ -79,14 +79,22 @@ for name, r in branch_routes.items():
 
 RGB_COLOR_IDX = {"R": 0, "G": 1, "B": 2}
 
+PROJECTOR_NX = 75
+PROJECTOR_NY = 75
+
+# Blue has a linear angular falloff of 2% per 6° in both axes.
+BLUE_FALLOFF = 0.02 / (6.0 * deg)
+FALLOFFS = {"R": (0.0, 0.0), "G": (0.0, 0.0), "B": (BLUE_FALLOFF, BLUE_FALLOFF)}
+
 projectors = {
     c: PlayNitrideLed.create(
         position=DEFAULT_LIGHT_POSITION,
         direction=DEFAULT_LIGHT_DIRECTION,
         beam_width=4.0 * mm,
-        beam_height=2.0 * mm,
-        nx=5, ny=5,
+        beam_height=1.2 * mm,
+        nx=PROJECTOR_NX, ny=PROJECTOR_NY,
         color=c,
+        falloff_x=FALLOFFS[c][0], falloff_y=FALLOFFS[c][1],
     )
     for c in RGB_COLOR_IDX
 }
@@ -125,11 +133,10 @@ viz_branch_routes = {
 
 # ── Scan grid ──────────────────────────────────────────────────────────────
 
-x_fov = 8.0 * deg
-y_fov = 8.0 * deg
-step = 2.0 * deg
-num_x = int(x_fov / step) + 1
-num_y = int(y_fov / step) + 1
+x_fov = 6.0 * deg
+y_fov = 6.0 * deg
+num_x = 15
+num_y = 15
 
 scan_dirs, scan_angles = scan_directions(
     DEFAULT_LIGHT_DIRECTION, x_fov, y_fov, num_x, num_y,
@@ -146,48 +153,31 @@ print(f"Projector: {projectors['R'].nx}x{projectors['R'].ny} rays, "
       f"{projectors['R'].beam_height/mm:.0f} mm")
 
 
-# Blue channel has a linear angular falloff of ~2% per degree in both
-# x and y. Precomputed on-device as a per-angle gain vector so it can
-# multiply ray intensity inside the vmapped trace without a host sync.
-BLUE_FALLOFF_PER_DEG = 0.02
-_ax_deg = flat_angles[:, 0] / deg
-_ay_deg = flat_angles[:, 1] / deg
-blue_gain_per_angle = jnp.clip(
-    (1.0 - BLUE_FALLOFF_PER_DEG * jnp.abs(_ax_deg))
-    * (1.0 - BLUE_FALLOFF_PER_DEG * jnp.abs(_ay_deg)),
-    0.0, 1.0,
-)  # (A,)
-gain_per_angle_by_color = {
-    "R": jnp.ones(A, dtype=jnp.float32),
-    "G": jnp.ones(A, dtype=jnp.float32),
-    "B": blue_gain_per_angle.astype(jnp.float32),
-}
-
 # ── Vmapped trace kernel: (wavelength × angle × ray) per branch ───────────
 #
 # One JIT-compiled function per (color, branch_route_shape) pair. Closes
-# over the color-specific projector, wavelength grid, and angular gain so
-# the compiled kernel has no Python dispatch overhead — 31×25 = 775
-# (wavelength, angle) combinations run as one XLA program per branch.
+# over the color-specific projector and wavelength grid so the compiled
+# kernel has no Python dispatch overhead — 31×225 = 6,975 (wavelength,
+# angle) combinations run as one XLA program per branch. Angular falloff
+# is baked into the projector itself.
 
-def make_branch_tracer(projector, wavelengths, directions, gain_per_angle):
+def make_branch_tracer(projector, wavelengths, directions):
     """Build a jitted function that sums pupil intensity per angle for one
     branch route, marginalised over all scan wavelengths.
 
     The returned function takes a raw (pre-``prepare_route``) route and
     returns an ``(A,)`` per-angle total summed over the wavelength scan.
     """
-    def per_angle(prepared, wavelength, direction, gain):
+    def per_angle(prepared, wavelength, direction):
         ray = projector.generate_rays(direction=direction, wavelength=wavelength)
-        ray = ray._replace(intensity=ray.intensity * gain)
         tr = trace_rays(prepared, ray, wavelength=wavelength)
         last_valid = tr.valids[..., -1]
         return jnp.where(last_valid, tr.final_intensity, 0.0).sum()
 
     def per_wavelength(raw_route, wavelength):
         prepared = prepare_route(raw_route, wavelength)
-        return jax.vmap(per_angle, in_axes=(None, None, 0, 0))(
-            prepared, wavelength, directions, gain_per_angle)  # (A,)
+        return jax.vmap(per_angle, in_axes=(None, None, 0))(
+            prepared, wavelength, directions)  # (A,)
 
     def trace_branch(raw_route):
         per_wl = jax.vmap(per_wavelength, in_axes=(None, 0))(
@@ -198,15 +188,20 @@ def make_branch_tracer(projector, wavelengths, directions, gain_per_angle):
 
 
 branch_tracers = {
-    c: make_branch_tracer(
-        projectors[c], scan_wavelengths[c], flat_dirs,
-        gain_per_angle_by_color[c],
-    )
+    c: make_branch_tracer(projectors[c], scan_wavelengths[c], flat_dirs)
     for c in "RGB"
 }
 
-print("\n── Tracing RGB across FOV "
-      "(6 branches × 31 wavelengths × 25 angles, vmapped) ──")
+N_RAYS = PROJECTOR_NX * PROJECTOR_NY
+W = int(scan_wavelengths["R"].shape[0])
+N_BRANCHES = len(branch_routes)
+evals_per_branch = W * A * N_RAYS
+total_evals = 3 * N_BRANCHES * evals_per_branch
+print(f"\n── Tracing RGB across FOV "
+      f"({N_BRANCHES} branches × {W} wavelengths × {A} angles × "
+      f"{N_RAYS} rays, vmapped) ──")
+print(f"   {evals_per_branch:,} ray-evals per branch kernel, "
+      f"{total_evals:,} total per full sweep")
 
 
 def run_once():
