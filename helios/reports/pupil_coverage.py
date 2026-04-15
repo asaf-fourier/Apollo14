@@ -70,7 +70,7 @@ def pupil_coverage_report(
             # Single wavelength — sum over branches.
             angle_grid = np.zeros((grid.ny, grid.nx))
             for route in routes:
-                tr = trace_rays(route, ray, color_idx=1)
+                tr = trace_rays(route, ray, wavelength=float(wavelength))
                 angle_grid += bin_hits_to_pupil_grid(tr, grid)
             grid_sum += angle_grid
             grid_count += (angle_grid > 0).astype(float)

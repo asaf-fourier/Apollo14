@@ -25,9 +25,9 @@ from apollo14.route import build_route, branch_path, absorb
 from apollo14.trace import prepare_route, trace_rays
 
 # JIT-cached tracer: route structure is stable across wavelengths (only
-# the per-face n1/n2 leaves change), so one compile per (route, color)
-# pair is reused across the full wavelength scan.
-_trace_rays_jit = jax.jit(trace_rays, static_argnames=("color_idx",))
+# per-face n1/n2 leaves and the scalar mirror wavelength change), so one
+# compile per route is reused across the full wavelength scan.
+_trace_rays_jit = jax.jit(trace_rays)
 from apollo14.projector import PlayNitrideLed, scan_directions
 from apollo14.visualizer import plot_system, plot_pupil_fill
 from apollo14.units import mm, nm, deg
@@ -191,11 +191,11 @@ for iy in range(num_y):
                     ray = ray._replace(intensity=ray.intensity * gain)
 
                 # Main path (doesn't reach the pupil — recorded for completeness).
-                _ = _trace_rays_jit(main_routes[c][wi], ray, color_idx=ci)
+                _ = _trace_rays_jit(main_routes[c][wi], ray, wavelength=wl)
 
                 # Each reflected branch contributes to the pupil.
                 for name, broute in branch_routes_rgb[c][wi].items():
-                    tr = _trace_rays_jit(broute, ray, color_idx=ci)
+                    tr = _trace_rays_jit(broute, ray, wavelength=wl)
                     last_valid = tr.valids[..., -1]
                     total += float(
                         jnp.where(last_valid, tr.final_intensity, 0.0).sum()
@@ -207,13 +207,14 @@ for iy in range(num_y):
             direction=direction, wavelength=peak_wavelengths["G"])
         green_branch_traces = []
         for name, broute in viz_branch_routes.items():
-            tr = _trace_rays_jit(broute, ray_g, color_idx=RGB_COLOR_IDX["G"])
+            tr = _trace_rays_jit(broute, ray_g,
+                                 wavelength=peak_wavelengths["G"])
             viz_traces.append(tr)
             green_branch_traces.append(tr)
         pupil_traces_per_angle.append(green_branch_traces)
 
         tr_main = _trace_rays_jit(viz_main_route, ray_g,
-                             color_idx=RGB_COLOR_IDX["G"])
+                                  wavelength=peak_wavelengths["G"])
         viz_traces.append(tr_main)
 
 trace_elapsed = time.perf_counter() - trace_t0

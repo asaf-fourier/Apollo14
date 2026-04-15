@@ -121,7 +121,7 @@ class TestEyebox:
                 for s in route.segments
             )
             prepared = prepare_route(Route(segments=new_segs), 550e-6)
-            tr = trace_rays(prepared, ray, color_idx=1)
+            tr = trace_rays(prepared, ray, wavelength=525e-6)
             return jnp.sum(tr.final_intensity)
 
         grads = jax.grad(loss)(stack.reflectance)

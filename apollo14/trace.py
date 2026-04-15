@@ -66,8 +66,14 @@ def prepare_route(route: Route, wavelength) -> Route:
 
 # ── Tracing ──────────────────────────────────────────────────────────────────
 
-def trace(route: Route, ray: Ray, color_idx: int = 0) -> TraceResult:
-    """Trace one ``Ray`` through a wavelength-resolved ``Route``."""
+def trace(route: Route, ray: Ray, wavelength: float = 0.0) -> TraceResult:
+    """Trace one ``Ray`` through a wavelength-resolved ``Route``.
+
+    ``wavelength`` is passed to each element's interact function. Elements
+    that care (partial mirrors) use it to interpolate their reflectance
+    curve; aperture/face/pupil ignore it at trace time — face index is
+    already resolved to a scalar by ``prepare_route``.
+    """
     hits_accum = []
     valids_accum = []
 
@@ -77,27 +83,27 @@ def trace(route: Route, ray: Ray, color_idx: int = 0) -> TraceResult:
 
     for seg in route.segments:
         if isinstance(seg, ApertureSeg):
-            ray, hit, valid = aperture_interact(seg, ray, color_idx)
+            ray, hit, valid = aperture_interact(seg, ray, wavelength)
             _push(hit, valid)
 
         elif isinstance(seg, FaceSeg):
-            ray, hit, valid = face_interact(seg, ray, color_idx)
+            ray, hit, valid = face_interact(seg, ray, wavelength)
             _push(hit, valid)
 
         elif isinstance(seg, MirrorStackSeg):
             def step(r, params):
-                r_out, hit, valid = mirror_transmit_one(params, r, color_idx)
+                r_out, hit, valid = mirror_transmit_one(params, r, wavelength)
                 return r_out, (hit, valid)
             ray, (stack_hits, stack_valids) = jax.lax.scan(step, ray, seg)
             hits_accum.append(stack_hits)
             valids_accum.append(stack_valids)
 
         elif isinstance(seg, ReflectMirrorSeg):
-            ray, hit, valid = mirror_reflect_one(seg, ray, color_idx)
+            ray, hit, valid = mirror_reflect_one(seg, ray, wavelength)
             _push(hit, valid)
 
         elif isinstance(seg, PupilSeg):
-            ray, hit, valid = pupil_interact(seg, ray, color_idx)
+            ray, hit, valid = pupil_interact(seg, ray, wavelength)
             _push(hit, valid)
 
         else:
@@ -115,17 +121,21 @@ def trace(route: Route, ray: Ray, color_idx: int = 0) -> TraceResult:
     )
 
 
-def trace_rays(route: Route, ray: Ray, color_idx: int = 0) -> TraceResult:
+def trace_rays(route: Route, ray: Ray, wavelength: float = 0.0) -> TraceResult:
     """Trace a batched ``Ray`` through a ``Route``.
 
     ``ray.pos`` must be ``(N, 3)`` and ``ray.intensity`` ``(N,)``; ``ray.dir``
     is ``(3,)`` and shared across all rays (collimated beam). Returns a
     ``TraceResult`` whose fields carry a leading batch dim of ``N``.
+
+    ``wavelength`` is a scalar (float or traced) that drives mirror
+    reflectance curve evaluation. Faces must already be resolved for the
+    same wavelength via ``prepare_route``.
     """
     shared_dir = jnp.asarray(ray.dir, dtype=jnp.float32)
 
     def one(pos, intensity):
         r = Ray(pos=pos, dir=shared_dir, intensity=intensity)
-        return trace(route, r, color_idx)
+        return trace(route, r, wavelength)
 
     return jax.vmap(one)(ray.pos, ray.intensity)

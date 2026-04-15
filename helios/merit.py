@@ -126,9 +126,10 @@ def simulate_pupil_response(routes_per_color: Sequence[Sequence[Route]],
             ray = projector.generate_rays(direction=direction)
 
             for wi, branch_routes in enumerate(routes_per_color):
+                wl = float(config.wavelengths[wi])
                 binned = jnp.zeros(flat_positions.shape[0])
                 for route in branch_routes:
-                    tr = trace_rays(route, ray, color_idx=wi)
+                    tr = trace_rays(route, ray, wavelength=wl)
                     binned = binned + bin_hits_to_nearest(
                         tr, flat_positions, stop_grad=False)
                 binned_2d = binned.reshape(config.pupil_ny, config.pupil_nx)

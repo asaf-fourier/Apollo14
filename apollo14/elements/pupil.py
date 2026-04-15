@@ -36,7 +36,7 @@ class RectangularPupil(PlanarElement):
 Pupil = RectangularPupil
 
 
-def pupil_interact(seg: PupilSeg, ray: Ray, color_idx):
+def pupil_interact(seg: PupilSeg, ray: Ray, wavelength):
     """Terminal: record the hit, mark valid if within bounds and alive.
     Intensity and direction are preserved (the pupil doesn't alter the ray).
     """

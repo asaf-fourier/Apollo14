@@ -1,4 +1,10 @@
-"""Partial mirror — splits light into reflected and transmitted fractions."""
+"""Partial mirror — splits light into reflected and transmitted fractions.
+
+Reflectance is stored as a sampled spectral curve: a shared ``wavelengths``
+grid and a per-mirror ``reflectance`` array. At trace time the effective
+reflectance is ``jnp.interp(wavelength, wavelengths, reflectance)`` —
+differentiable w.r.t. the control values and continuous in wavelength.
+"""
 
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -9,6 +15,14 @@ from apollo14.elements.planar import PlanarElement
 from apollo14.geometry import ray_rect_intersect, reflect
 from apollo14.ray import Ray
 from apollo14.route import TRANSMIT, REFLECT
+from apollo14.units import nm
+
+
+# Default spectral sample grid: R/G/B micro-LED peaks, sorted ascending so
+# ``jnp.interp`` can consume it directly. Every new mirror inherits this
+# grid unless the caller overrides it.
+DEFAULT_MIRROR_WAVELENGTHS = jnp.array([460.0, 525.0, 630.0],
+                                        dtype=jnp.float32) * nm
 
 
 class _SingleMirror(NamedTuple):
@@ -22,7 +36,8 @@ class _SingleMirror(NamedTuple):
     local_x: jnp.ndarray        # (3,)
     local_y: jnp.ndarray        # (3,)
     half_extents: jnp.ndarray   # (2,)
-    reflectance: jnp.ndarray    # (3,)
+    wavelengths: jnp.ndarray    # (K,) spectral sample grid (ascending)
+    reflectance: jnp.ndarray    # (K,) reflectance at each sample
 
 
 class MirrorStackSeg(NamedTuple):
@@ -32,7 +47,8 @@ class MirrorStackSeg(NamedTuple):
     local_x: jnp.ndarray        # (M, 3)
     local_y: jnp.ndarray        # (M, 3)
     half_extents: jnp.ndarray   # (M, 2)
-    reflectance: jnp.ndarray    # (M, 3)
+    wavelengths: jnp.ndarray    # (M, K) — each row identical in practice
+    reflectance: jnp.ndarray    # (M, K)
 
 
 class ReflectMirrorSeg(NamedTuple):
@@ -42,20 +58,28 @@ class ReflectMirrorSeg(NamedTuple):
     local_x: jnp.ndarray
     local_y: jnp.ndarray
     half_extents: jnp.ndarray
-    reflectance: jnp.ndarray    # (3,)
+    wavelengths: jnp.ndarray    # (K,)
+    reflectance: jnp.ndarray    # (K,)
 
 
 @dataclass
 class PartialMirror(PlanarElement):
-    reflectance: jnp.ndarray = None  # (3,) per-color
+    reflectance: jnp.ndarray = None   # (K,) sampled reflectance curve
+    wavelengths: jnp.ndarray = None   # (K,) wavelength grid (ascending)
 
     def __post_init__(self):
         super().__post_init__()
+        if self.wavelengths is None:
+            self.wavelengths = DEFAULT_MIRROR_WAVELENGTHS
+        else:
+            self.wavelengths = jnp.asarray(self.wavelengths, dtype=jnp.float32)
+
+        k = self.wavelengths.shape[0]
         if self.reflectance is None:
-            self.reflectance = jnp.array([0.05, 0.05, 0.05], dtype=jnp.float32)
+            self.reflectance = jnp.full((k,), 0.05, dtype=jnp.float32)
         else:
             r = jnp.asarray(self.reflectance, dtype=jnp.float32)
-            self.reflectance = jnp.broadcast_to(r, (3,)).copy()
+            self.reflectance = jnp.broadcast_to(r, (k,)).copy()
 
     def build_segment(self, current_material, mode):
         if mode == REFLECT:
@@ -65,6 +89,7 @@ class PartialMirror(PlanarElement):
                 local_x=self._local_x,
                 local_y=self._local_y,
                 half_extents=self.half_extents,
+                wavelengths=self.wavelengths,
                 reflectance=self.reflectance,
             )
             return seg, current_material
@@ -76,12 +101,18 @@ class PartialMirror(PlanarElement):
             local_x=self._local_x,
             local_y=self._local_y,
             half_extents=self.half_extents,
+            wavelengths=self.wavelengths,
             reflectance=self.reflectance,
         )
         return seg, current_material
 
 
-def mirror_transmit_one(mirror_params, ray: Ray, color_idx):
+def _interp_reflectance(wavelengths, reflectance, wavelength):
+    """``jnp.interp`` with a consistent float32 output."""
+    return jnp.interp(wavelength, wavelengths, reflectance)
+
+
+def mirror_transmit_one(mirror_params, ray: Ray, wavelength):
     """Transmit through one partial mirror (used inside ``lax.scan``).
 
     The mirror coating is a thin layer inside a single medium, so the
@@ -95,7 +126,8 @@ def mirror_transmit_one(mirror_params, ray: Ray, color_idx):
         mirror_params.local_x, mirror_params.local_y,
         mirror_params.half_extents)
 
-    r = mirror_params.reflectance[color_idx]
+    r = _interp_reflectance(
+        mirror_params.wavelengths, mirror_params.reflectance, wavelength)
     new_intensity = ray.intensity * (1.0 - r)
 
     valid = in_bounds & alive_in
@@ -104,7 +136,7 @@ def mirror_transmit_one(mirror_params, ray: Ray, color_idx):
     return Ray(pos=out_pos, dir=ray.dir, intensity=out_intensity), hit, valid
 
 
-def mirror_reflect_one(seg: ReflectMirrorSeg, ray: Ray, color_idx):
+def mirror_reflect_one(seg: ReflectMirrorSeg, ray: Ray, wavelength):
     """Reflect off one partial mirror (branch fork point)."""
     alive_in = ray.intensity > 0
 
@@ -115,7 +147,7 @@ def mirror_reflect_one(seg: ReflectMirrorSeg, ray: Ray, color_idx):
     facing = jnp.where(jnp.dot(ray.dir, seg.normal) < 0,
                        seg.normal, -seg.normal)
     reflected = reflect(ray.dir, facing)
-    r = seg.reflectance[color_idx]
+    r = _interp_reflectance(seg.wavelengths, seg.reflectance, wavelength)
     new_intensity = ray.intensity * r
 
     valid = in_bounds & alive_in

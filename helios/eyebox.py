@@ -31,7 +31,7 @@ from apollo14.trace import trace_rays
 from apollo14.binning import bin_hits_to_nearest
 from apollo14.projector import Projector, scan_directions
 
-from helios.merit import D65_WEIGHTS
+from helios.merit import D65_WEIGHTS, DEFAULT_WAVELENGTHS
 
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -71,7 +71,8 @@ def eyebox_grid_points(center, normal, radius, nx, ny):
 
 def compute_eyebox_response(routes_per_color, projector_pos, projector_dir,
                             beam_width, beam_height,
-                            x_fov, y_fov, eyebox_points, config=None):
+                            x_fov, y_fov, eyebox_points, config=None,
+                            wavelengths=None):
     """Compute intensity at each eyebox sample for each FOV angle and color.
 
     For each FOV angle, traces a dense beam of rays (n_beam_x × n_beam_y)
@@ -97,6 +98,12 @@ def compute_eyebox_response(routes_per_color, projector_pos, projector_dir,
     """
     if config is None:
         config = EyeboxConfig()
+    if wavelengths is None:
+        wavelengths = DEFAULT_WAVELENGTHS
+    if len(wavelengths) != len(routes_per_color):
+        raise ValueError(
+            f"wavelengths ({len(wavelengths)}) must match routes_per_color "
+            f"({len(routes_per_color)}) in length")
 
     # Use Projector for beam origin generation (consistent basis computation)
     proj = Projector.uniform(
@@ -112,13 +119,14 @@ def compute_eyebox_response(routes_per_color, projector_pos, projector_dir,
 
     color_responses = []
     for ci, branch_routes in enumerate(routes_per_color):
+        wl = float(wavelengths[ci])
         angle_responses = []
         for ai in range(n_angles):
             d = flat_dirs[ai]
             ray = proj.generate_rays(direction=d)
             binned = jnp.zeros(eyebox_points.shape[0])
             for route in branch_routes:
-                tr = trace_rays(route, ray, color_idx=ci)
+                tr = trace_rays(route, ray, wavelength=wl)
                 binned = binned + bin_hits_to_nearest(
                     tr, eyebox_points, stop_grad=True)
             angle_responses.append(binned)

@@ -4,7 +4,9 @@ import jax.numpy as jnp
 
 from apollo14.units import mm, nm, deg
 from apollo14.materials import air, agc_m074
-from apollo14.elements.partial_mirror import PartialMirror
+from apollo14.elements.partial_mirror import (
+    PartialMirror, DEFAULT_MIRROR_WAVELENGTHS,
+)
 from apollo14.elements.glass_block import GlassBlock
 from apollo14.elements.aperture import RectangularAperture
 from apollo14.elements.pupil import RectangularPupil
@@ -24,7 +26,7 @@ DEFAULT_NUM_X_STEPS = 5
 DEFAULT_NUM_Y_STEPS = 5
 
 
-def compensated_reflectances(ratio, num_mirrors):
+def compensated_reflectances(ratio, num_mirrors, num_samples: int = None):
     """Compute per-mirror reflectances compensated for upstream losses.
 
     Each mirror reflects ``ratio`` of the *original* beam intensity. Because
@@ -35,19 +37,23 @@ def compensated_reflectances(ratio, num_mirrors):
 
     Args:
         ratio: Target fraction of original intensity reflected by each mirror.
-            Either a scalar (same for all colors) or a (3,) array [R,G,B].
+            Either a scalar (broadcast across all spectral samples) or a
+            ``(K,)`` curve sampled on the mirror's wavelength grid.
         num_mirrors: Number of mirrors (M).
+        num_samples: Only used when ``ratio`` is a scalar — the length of
+            the spectral grid to broadcast to. Defaults to the length of
+            ``DEFAULT_MIRROR_WAVELENGTHS``.
 
     Returns:
-        (M, 3) array of per-mirror, per-color reflectances.
+        ``(M, K)`` array of per-mirror spectral reflectance curves.
     """
-    ratio = jnp.atleast_1d(jnp.asarray(ratio))
-    if ratio.shape == ():
-        ratio = jnp.broadcast_to(ratio, (3,))
-    elif ratio.shape == (1,):
-        ratio = jnp.broadcast_to(ratio, (3,))
+    ratio = jnp.asarray(ratio)
+    if ratio.ndim == 0:
+        k = num_samples if num_samples is not None \
+            else int(DEFAULT_MIRROR_WAVELENGTHS.shape[0])
+        ratio = jnp.broadcast_to(ratio, (k,))
     i = jnp.arange(num_mirrors)[:, None]  # (M, 1)
-    return ratio[None, :] / (1.0 - i * ratio[None, :])  # (M, 3)
+    return ratio[None, :] / (1.0 - i * ratio[None, :])  # (M, K)
 
 
 def build_default_system() -> OpticalSystem:
@@ -95,8 +101,10 @@ def build_default_system() -> OpticalSystem:
     mirror_x_width = float(cx)
     mirror_y_width = float(cz / jnp.cos(mirror_angle))
 
-    # Per-mirror compensated reflectances (equal absolute intensity per mirror)
-    base_reflectance = jnp.array([0.05, 0.05, 0.05])
+    # Per-mirror compensated reflectances — flat 5% curve across the default
+    # spectral grid (equal absolute intensity per mirror).
+    mirror_wavelengths = DEFAULT_MIRROR_WAVELENGTHS
+    base_reflectance = jnp.full_like(mirror_wavelengths, 0.05)
     refl_table = compensated_reflectances(base_reflectance, num_mirrors)
 
     first_mirror_center = chassis_center + jnp.array([0.0, 5.0 * mm, 0.0])
@@ -115,6 +123,7 @@ def build_default_system() -> OpticalSystem:
             width=mirror_x_width,
             height=mirror_y_width,
             reflectance=refl_table[i],
+            wavelengths=mirror_wavelengths,
         ))
 
     # ── Pupil ────────────────────────────────────────────────────────────

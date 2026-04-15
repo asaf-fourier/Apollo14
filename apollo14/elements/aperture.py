@@ -60,7 +60,7 @@ class RectangularAperture(PlanarElement):
         return seg, current_material
 
 
-def aperture_interact(seg: ApertureSeg, ray: Ray, color_idx):
+def aperture_interact(seg: ApertureSeg, ray: Ray, wavelength):
     """Framed aperture:
     - hit inner hole → pass unchanged
     - hit outer frame outside hole → absorbed (intensity 0)

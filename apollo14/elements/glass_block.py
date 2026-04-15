@@ -81,7 +81,7 @@ class GlassFace:
         return seg, outgoing
 
 
-def face_interact(seg: FaceSeg, ray: Ray, color_idx):
+def face_interact(seg: FaceSeg, ray: Ray, wavelength):
     """Refract through a glass face using Snell's law.
 
     ``seg.n1`` and ``seg.n2`` must be scalar arrays — callers use
