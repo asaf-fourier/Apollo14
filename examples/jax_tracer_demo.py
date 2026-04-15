@@ -11,19 +11,24 @@ on each partial mirror and the per-wavelength refractive index resolved by
 ``prepare_route``.
 """
 
-from pathlib import Path
+import time
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
-import apollo14
 from apollo14.combiner import (
     build_default_system,
     DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
 )
 from apollo14.route import build_route, branch_path, absorb
 from apollo14.trace import prepare_route, trace_rays
-from apollo14.projector import Projector, scan_directions
+
+# JIT-cached tracer: route structure is stable across wavelengths (only
+# the per-face n1/n2 leaves change), so one compile per (route, color)
+# pair is reused across the full wavelength scan.
+_trace_rays_jit = jax.jit(trace_rays, static_argnames=("color_idx",))
+from apollo14.projector import PlayNitrideLed, scan_directions
 from apollo14.visualizer import plot_system, plot_pupil_fill
 from apollo14.units import mm, nm, deg
 
@@ -70,22 +75,61 @@ print(f"Main route: {_describe(main_route)}")
 for name, r in branch_routes.items():
     print(f"  branch {name}: {_describe(r)}")
 
-# ── RGB beams ──────────────────────────────────────────────────────────────
+# ── RGB projectors (PlayNitride micro-LEDs) ───────────────────────────────
 
-RGB_WAVELENGTHS = {
-    "R": 650.0 * nm,
-    "G": 550.0 * nm,
-    "B": 450.0 * nm,
-}
 RGB_COLOR_IDX = {"R": 0, "G": 1, "B": 2}
 
-main_routes = {c: prepare_route(main_route, wl) for c, wl in RGB_WAVELENGTHS.items()}
-branch_routes_rgb = {
-    c: {name: prepare_route(r, wl) for name, r in branch_routes.items()}
-    for c, wl in RGB_WAVELENGTHS.items()
+projectors = {
+    c: PlayNitrideLed.create(
+        position=DEFAULT_LIGHT_POSITION,
+        direction=DEFAULT_LIGHT_DIRECTION,
+        beam_width=4.0 * mm,
+        beam_height=2.0 * mm,
+        nx=5, ny=5,
+        color=c,
+    )
+    for c in RGB_COLOR_IDX
 }
 
-# ── Projector + scan grid ──────────────────────────────────────────────────
+
+def _peak_wavelength(proj):
+    wls, rad = proj.spectrum
+    return float(wls[int(jnp.argmax(rad))])
+
+
+# 30 nm window in 1 nm steps, centred on each channel's measured peak.
+SCAN_OFFSETS = jnp.arange(-15, 16) * nm  # 31 samples
+scan_wavelengths = {
+    c: [_peak_wavelength(p) + float(off) for off in SCAN_OFFSETS]
+    for c, p in projectors.items()
+}
+peak_wavelengths = {c: _peak_wavelength(p) for c, p in projectors.items()}
+
+for c in "RGB":
+    lo = scan_wavelengths[c][0] / nm
+    hi = scan_wavelengths[c][-1] / nm
+    print(f"{c} peak {peak_wavelengths[c]/nm:.0f} nm — "
+          f"scan {lo:.0f}..{hi:.0f} nm ({len(scan_wavelengths[c])} samples)")
+
+# Prepare one (main, branches) route set per (color, wavelength).
+main_routes = {
+    c: [prepare_route(main_route, wl) for wl in scan_wavelengths[c]]
+    for c in RGB_COLOR_IDX
+}
+branch_routes_rgb = {
+    c: [{name: prepare_route(r, wl) for name, r in branch_routes.items()}
+        for wl in scan_wavelengths[c]]
+    for c in RGB_COLOR_IDX
+}
+
+# Extra single-wavelength route set for the 3D visualisation (green peak).
+viz_main_route = prepare_route(main_route, peak_wavelengths["G"])
+viz_branch_routes = {
+    name: prepare_route(r, peak_wavelengths["G"])
+    for name, r in branch_routes.items()
+}
+
+# ── Scan grid ──────────────────────────────────────────────────────────────
 
 x_fov = 8.0 * deg
 y_fov = 8.0 * deg
@@ -97,74 +141,86 @@ scan_dirs, scan_angles = scan_directions(
     DEFAULT_LIGHT_DIRECTION, x_fov, y_fov, num_x, num_y,
 )
 
-PROJECTOR_CSV = (
-    Path(apollo14.__file__).parent / "data/projector"
-    / "PlayNitride_(-1-3)_APL05prc.csv"
-)
-projector = Projector.from_csv(
-    PROJECTOR_CSV,
-    position=DEFAULT_LIGHT_POSITION,
-    direction=DEFAULT_LIGHT_DIRECTION,
-    beam_width=4.0 * mm,
-    beam_height=2.0 * mm,
-    nx=5, ny=5,
-)
-
-
 print(f"\nScan: {num_x}x{num_y} angles, FOV {x_fov/deg:.0f}x{y_fov/deg:.0f} deg")
-print(f"Projector: {projector.nx}x{projector.ny} rays, "
-      f"{projector.beam_width/mm:.0f}x{projector.beam_height/mm:.0f} mm")
+print(f"Projector: {projectors['R'].nx}x{projectors['R'].ny} rays, "
+      f"{projectors['R'].beam_width/mm:.0f}x"
+      f"{projectors['R'].beam_height/mm:.0f} mm")
 
-# ── Trace main + branches per color, per angle ─────────────────────────────
 
-print("\n── Tracing RGB across FOV (main + 6 branches) ──")
+# Blue channel has a linear angular falloff of ~2% per degree in both
+# x and y (applied as a scalar on ray intensity — the tracer is linear).
+BLUE_FALLOFF_PER_DEG = 0.02
 
-# Intensity reaching the pupil per (color, angle), summed over branches.
+
+def blue_angular_gain(ax_rad, ay_rad):
+    ax_deg = float(ax_rad) / deg
+    ay_deg = float(ay_rad) / deg
+    gain = (1.0 - BLUE_FALLOFF_PER_DEG * abs(ax_deg)) \
+         * (1.0 - BLUE_FALLOFF_PER_DEG * abs(ay_deg))
+    return max(gain, 0.0)
+
+# ── Trace main + branches per color, per wavelength, per angle ────────────
+
+print("\n── Tracing RGB across FOV (main + 6 branches, 31 wavelengths/color) ──")
+
+# Intensity reaching the pupil per (color, angle), summed over wavelengths
+# and branches.
 result = np.zeros((num_y, num_x, 3))
 
-# Visualization traces — just one color so the 3D view isn't overwhelming.
+# Visualization traces — green peak only, so the 3D view isn't overwhelming.
 viz_traces = []
 
-# Per-angle green-branch traces for the pupil-fill plot: one list of
-# 6 branch TraceResults per scan angle, row-major over (iy, ix).
+# Per-angle green-branch traces (peak wavelength) for the pupil-fill plot.
 pupil_traces_per_angle = []
+
+trace_t0 = time.perf_counter()
 
 for iy in range(num_y):
     for ix in range(num_x):
         direction = scan_dirs[iy, ix]
-
-        green_branch_traces = []
+        ax_rad, ay_rad = scan_angles[iy, ix]
 
         for c, ci in RGB_COLOR_IDX.items():
-            # Per-color Ray batch — intensity comes from the projector's
-            # measured spectrum sampled at this wavelength.
-            ray = projector.generate_rays(direction=direction,
-                                          wavelength=RGB_WAVELENGTHS[c])
+            proj = projectors[c]
+            gain = blue_angular_gain(ax_rad, ay_rad) if c == "B" else 1.0
 
-            # Main path (doesn't reach the pupil — recorded for completeness).
-            _ = trace_rays(main_routes[c], ray, color_idx=ci)
-
-            # Each reflected branch contributes to the pupil.
             total = 0.0
-            for name, broute in branch_routes_rgb[c].items():
-                tr = trace_rays(broute, ray, color_idx=ci)
-                last_valid = tr.valids[..., -1]
-                total += float(
-                    jnp.where(last_valid, tr.final_intensity, 0.0).sum()
-                )
-                if c == "G":
-                    viz_traces.append(tr)
-                    green_branch_traces.append(tr)
+            for wi, wl in enumerate(scan_wavelengths[c]):
+                ray = proj.generate_rays(direction=direction, wavelength=wl)
+                if gain != 1.0:
+                    ray = ray._replace(intensity=ray.intensity * gain)
+
+                # Main path (doesn't reach the pupil — recorded for completeness).
+                _ = _trace_rays_jit(main_routes[c][wi], ray, color_idx=ci)
+
+                # Each reflected branch contributes to the pupil.
+                for name, broute in branch_routes_rgb[c][wi].items():
+                    tr = _trace_rays_jit(broute, ray, color_idx=ci)
+                    last_valid = tr.valids[..., -1]
+                    total += float(
+                        jnp.where(last_valid, tr.final_intensity, 0.0).sum()
+                    )
             result[iy, ix, ci] = total
 
+        # Green-peak traces for visualisation + pupil fill (single wavelength).
+        ray_g = projectors["G"].generate_rays(
+            direction=direction, wavelength=peak_wavelengths["G"])
+        green_branch_traces = []
+        for name, broute in viz_branch_routes.items():
+            tr = _trace_rays_jit(broute, ray_g, color_idx=RGB_COLOR_IDX["G"])
+            viz_traces.append(tr)
+            green_branch_traces.append(tr)
         pupil_traces_per_angle.append(green_branch_traces)
 
-        # Main-path viz trace for the green channel (one per angle).
-        ray_g = projector.generate_rays(direction=direction,
-                                        wavelength=RGB_WAVELENGTHS["G"])
-        tr_main = trace_rays(main_routes["G"], ray_g,
+        tr_main = _trace_rays_jit(viz_main_route, ray_g,
                              color_idx=RGB_COLOR_IDX["G"])
         viz_traces.append(tr_main)
+
+trace_elapsed = time.perf_counter() - trace_t0
+n_angles = num_x * num_y
+print(f"\nTrace step elapsed: {trace_elapsed:.2f} s "
+      f"({1e3*trace_elapsed/n_angles:.1f} ms/angle, "
+      f"{n_angles} angles)")
 
 # ── Summary ────────────────────────────────────────────────────────────────
 
@@ -187,7 +243,7 @@ print("\n── Rendering 3D view (green channel) ──")
 # viz_traces has 7 entries per scan angle (6 branches + main).
 fig = plot_system(system, trace_results=viz_traces,
                   scan_angles=np.asarray(scan_angles),
-                  projector=projector, show=False)
+                  projector=projectors["G"], show=False)
 fig.show()
 fig.write_html("examples/reports/jax_tracer_demo.html")
 print("Saved: jax_tracer_demo.html")

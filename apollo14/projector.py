@@ -127,6 +127,32 @@ class Projector:
         return Ray(pos=origins, dir=d, intensity=intensities)
 
 
+_PLAYNITRIDE_CSV = Path(__file__).parent / "data" / "projector" / "PlayNitride_(-1-3)_APL05prc.csv"
+
+
+class PlayNitrideLed(Projector):
+    """Projector whose spectrum is the measured PlayNitride micro-LED curve.
+
+    ``color`` selects which channel column to read: ``"R"``, ``"G"``, ``"B"``,
+    or ``"W"`` (white).
+    """
+
+    @classmethod
+    def create(cls, position, direction, beam_width, beam_height,
+               nx: int, ny: int, color: str, intensity: float = 1.0):
+        if color not in ("R", "G", "B", "W"):
+            raise ValueError(f"color must be one of R/G/B/W, got {color!r}")
+        wls, rad = load_spectrum_csv(_PLAYNITRIDE_CSV, column=color)
+        return cls(
+            position=position,
+            direction=normalize(direction),
+            beam_width=beam_width,
+            beam_height=beam_height,
+            intensity_map=jnp.full((ny, nx), intensity),
+            spectrum=(wls, rad),
+        )
+
+
 def scan_directions(base_direction, x_fov, y_fov, num_x, num_y):
     """Generate a grid of scan directions covering the given FOV.
 
