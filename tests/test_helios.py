@@ -30,7 +30,7 @@ def _make_fixtures():
     projector = Projector.uniform(
         position=DEFAULT_LIGHT_POSITION, direction=DEFAULT_LIGHT_DIRECTION,
         beam_width=DEFAULT_BEAM_WIDTH, beam_height=DEFAULT_BEAM_HEIGHT,
-        wavelength=550e-6, nx=3, ny=3,
+        nx=3, ny=3,
     )
     return system, pupil, routes, projector
 
@@ -111,10 +111,9 @@ class TestEyebox:
         projector = Projector.uniform(
             position=DEFAULT_LIGHT_POSITION, direction=DEFAULT_LIGHT_DIRECTION,
             beam_width=DEFAULT_BEAM_WIDTH, beam_height=DEFAULT_BEAM_HEIGHT,
-            wavelength=550e-6, nx=3, ny=3,
+            nx=3, ny=3,
         )
-        origins, _, _, _ = projector.generate_rays(
-            direction=DEFAULT_LIGHT_DIRECTION)
+        ray = projector.generate_rays(direction=DEFAULT_LIGHT_DIRECTION)
 
         def loss(refl):
             new_segs = tuple(
@@ -122,7 +121,7 @@ class TestEyebox:
                 for s in route.segments
             )
             prepared = prepare_route(Route(segments=new_segs), 550e-6)
-            tr = trace_rays(prepared, origins, DEFAULT_LIGHT_DIRECTION, color_idx=1)
+            tr = trace_rays(prepared, ray, color_idx=1)
             return jnp.sum(tr.final_intensity)
 
         grads = jax.grad(loss)(stack.reflectance)

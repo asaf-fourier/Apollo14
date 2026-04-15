@@ -123,12 +123,12 @@ def simulate_pupil_response(routes_per_color: Sequence[Sequence[Route]],
     for ai_y in range(config.angle_ny):
         for ai_x in range(config.angle_nx):
             direction = scan_dirs[ai_y, ai_x]
-            origins, _, _, _ = projector.generate_rays(direction=direction)
+            ray = projector.generate_rays(direction=direction)
 
             for wi, branch_routes in enumerate(routes_per_color):
                 binned = jnp.zeros(flat_positions.shape[0])
                 for route in branch_routes:
-                    tr = trace_rays(route, origins, direction, color_idx=wi)
+                    tr = trace_rays(route, ray, color_idx=wi)
                     binned = binned + bin_hits_to_nearest(
                         tr, flat_positions, stop_grad=False)
                 binned_2d = binned.reshape(config.pupil_ny, config.pupil_nx)

@@ -115,22 +115,17 @@ def trace(route: Route, ray: Ray, color_idx: int = 0) -> TraceResult:
     )
 
 
-def trace_rays(route: Route, origins, direction,
-               color_idx: int = 0, intensity=1.0) -> TraceResult:
-    """Trace N rays sharing one direction through a ``Route``.
+def trace_rays(route: Route, ray: Ray, color_idx: int = 0) -> TraceResult:
+    """Trace a batched ``Ray`` through a ``Route``.
 
-    Convenience wrapper that builds a ``Ray`` per origin and vmaps
-    ``trace`` over them.
+    ``ray.pos`` must be ``(N, 3)`` and ``ray.intensity`` ``(N,)``; ``ray.dir``
+    is ``(3,)`` and shared across all rays (collimated beam). Returns a
+    ``TraceResult`` whose fields carry a leading batch dim of ``N``.
     """
-    direction = jnp.asarray(direction, dtype=jnp.float32)
-    intensity = jnp.asarray(intensity, dtype=jnp.float32)
+    shared_dir = jnp.asarray(ray.dir, dtype=jnp.float32)
 
-    def one(o):
-        ray = Ray(
-            pos=jnp.asarray(o, dtype=jnp.float32),
-            dir=direction,
-            intensity=intensity,
-        )
-        return trace(route, ray, color_idx)
+    def one(pos, intensity):
+        r = Ray(pos=pos, dir=shared_dir, intensity=intensity)
+        return trace(route, r, color_idx)
 
-    return jax.vmap(one)(origins)
+    return jax.vmap(one)(ray.pos, ray.intensity)

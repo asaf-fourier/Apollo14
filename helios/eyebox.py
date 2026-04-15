@@ -102,7 +102,6 @@ def compute_eyebox_response(routes_per_color, projector_pos, projector_dir,
     proj = Projector.uniform(
         position=projector_pos, direction=projector_dir,
         beam_width=beam_width, beam_height=beam_height,
-        wavelength=0.0,  # unused for origin generation
         nx=config.n_beam_x, ny=config.n_beam_y,
     )
 
@@ -116,10 +115,10 @@ def compute_eyebox_response(routes_per_color, projector_pos, projector_dir,
         angle_responses = []
         for ai in range(n_angles):
             d = flat_dirs[ai]
-            origins, _, _, _ = proj.generate_rays(direction=d)
+            ray = proj.generate_rays(direction=d)
             binned = jnp.zeros(eyebox_points.shape[0])
             for route in branch_routes:
-                tr = trace_rays(route, origins, d, color_idx=ci)
+                tr = trace_rays(route, ray, color_idx=ci)
                 binned = binned + bin_hits_to_nearest(
                     tr, eyebox_points, stop_grad=True)
             angle_responses.append(binned)

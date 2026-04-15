@@ -159,6 +159,11 @@ class TestTraceRays:
             [0.5, 0.0, 0.0],
             [-0.5, 0.0, 0.0],
         ])
-        result = trace_rays(route, origins, DEFAULT_LIGHT_DIRECTION)
+        ray_batch = Ray(
+            pos=origins,
+            dir=DEFAULT_LIGHT_DIRECTION,
+            intensity=jnp.ones(3),
+        )
+        result = trace_rays(route, ray_batch)
         assert result.hits.shape == (3, 9, 3)
         assert result.final_intensity.shape == (3,)

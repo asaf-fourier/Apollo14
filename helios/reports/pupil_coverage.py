@@ -65,12 +65,12 @@ def pupil_coverage_report(
     for iy in range(num_y_angles):
         for ix in range(num_x_angles):
             d = scan_dirs[iy, ix]
-            ray_origins, _, _, _ = projector.generate_rays(direction=d)
+            ray = projector.generate_rays(direction=d)
 
             # Single wavelength — sum over branches.
             angle_grid = np.zeros((grid.ny, grid.nx))
             for route in routes:
-                tr = trace_rays(route, ray_origins, d, color_idx=1)
+                tr = trace_rays(route, ray, color_idx=1)
                 angle_grid += bin_hits_to_pupil_grid(tr, grid)
             grid_sum += angle_grid
             grid_count += (angle_grid > 0).astype(float)

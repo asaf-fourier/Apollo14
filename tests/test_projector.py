@@ -9,14 +9,13 @@ def test_uniform_projector_ray_count():
         position=jnp.array([0.0, 0.0, 0.0]),
         direction=jnp.array([0.0, -1.0, 0.0]),
         beam_width=4.0, beam_height=2.0,
-        wavelength=0.00055,
         nx=5, ny=3,
     )
-    origins, directions, intensities, pixels = proj.generate_rays()
-    assert origins.shape == (15, 3)
-    assert directions.shape == (15, 3)
-    assert intensities.shape == (15,)
-    assert jnp.all(intensities == 1.0)
+    ray = proj.generate_rays()
+    assert ray.pos.shape == (15, 3)
+    assert ray.dir.shape == (3,)
+    assert ray.intensity.shape == (15,)
+    assert jnp.all(ray.intensity == 1.0)
 
 
 def test_custom_intensity_map():
@@ -25,12 +24,11 @@ def test_custom_intensity_map():
         position=jnp.array([0.0, 10.0, 0.0]),
         direction=jnp.array([0.0, -1.0, 0.0]),
         beam_width=2.0, beam_height=2.0,
-        wavelength=0.00055,
         intensity_map=imap,
     )
-    origins, directions, intensities, pixels = proj.generate_rays()
-    assert origins.shape == (4, 3)
-    assert jnp.allclose(intensities, imap.ravel())
+    ray = proj.generate_rays()
+    assert ray.pos.shape == (4, 3)
+    assert jnp.allclose(ray.intensity, imap.ravel())
 
 
 def test_rays_are_collimated():
@@ -38,13 +36,11 @@ def test_rays_are_collimated():
         position=jnp.array([7.0, 31.0, 1.0]),
         direction=jnp.array([0.0, -1.0, 0.0]),
         beam_width=4.0, beam_height=2.0,
-        wavelength=0.00055,
         nx=4, ny=4,
     )
-    origins, directions, intensities, _ = proj.generate_rays()
-    # All directions should be identical (collimated)
-    for i in range(directions.shape[0]):
-        assert jnp.allclose(directions[i], directions[0])
+    ray = proj.generate_rays()
+    # Direction is a single shared (3,) vector for a collimated beam.
+    assert ray.dir.shape == (3,)
 
 
 def test_ray_origins_span_beam():
@@ -52,12 +48,11 @@ def test_ray_origins_span_beam():
         position=jnp.array([0.0, 0.0, 0.0]),
         direction=jnp.array([0.0, -1.0, 0.0]),
         beam_width=4.0, beam_height=2.0,
-        wavelength=0.00055,
         nx=10, ny=10,
     )
-    origins, _, _, _ = proj.generate_rays()
+    ray = proj.generate_rays()
     # Origins should span roughly beam_width x beam_height
-    span = origins.max(axis=0) - origins.min(axis=0)
+    span = ray.pos.max(axis=0) - ray.pos.min(axis=0)
     # The beam is in the plane perpendicular to direction (0,-1,0) → x-z plane
     assert span.max() > 3.5  # close to beam_width=4
 

@@ -11,10 +11,11 @@ from apollo14.elements.pupil import Pupil, RectangularPupil
 from apollo14.trace import TraceResult
 from apollo14.binning import bin_hits_to_grid_np
 from apollo14.geometry import compute_local_axes
+from apollo14.units import mm
 
 
 def plot_system(system: OpticalSystem, trace_results: list[TraceResult] = None,
-                scan_angles=None, show=True):
+                scan_angles=None, projector=None, show=True):
     """Render the optical system in 3D with Plotly.
 
     When *scan_angles* is provided it must be a (num_y, num_x, 2) array of
@@ -40,6 +41,9 @@ def plot_system(system: OpticalSystem, trace_results: list[TraceResult] = None,
             _add_aperture(static_traces, elem)
         elif isinstance(elem, (Pupil, RectangularPupil)):
             _add_pupil(static_traces, elem)
+
+    if projector is not None:
+        _add_projector(static_traces, projector)
 
     # ── dynamic ray traces (grouped per angle) ───────────────────────────
     if trace_results and scan_angles is not None:
@@ -113,34 +117,28 @@ def plot_system(system: OpticalSystem, trace_results: list[TraceResult] = None,
     return fig
 
 
-def plot_pupil_fill(routes, projector, pupil_element,
-                    x_fov, y_fov, num_x_angles, num_y_angles,
-                    color_idx: int = 0, pixel_size: float = 0.5,
-                    show: bool = True):
+def plot_pupil_fill(trace_results_per_angle, scan_angles, pupil_element,
+                    pixel_size: float = 0.5, show: bool = True):
     """Plot pupil intensity heatmaps with a slider to step through scan angles.
 
-    Traces each ``Route`` in ``routes`` at every scan angle and sums their
-    pupil hits into a 2D grid. Use one route per reflected branch to see
-    the combined pupil fill from the whole combiner stack.
+    Pure renderer — takes already-computed trace results and bins their
+    final hits onto the pupil plane. The caller is responsible for running
+    the tracer.
 
     Args:
-        routes: iterable of wavelength-resolved ``Route`` — each is
-            assumed to terminate on the pupil (e.g. via ``absorb(pupil.name)``).
-        projector: ``Projector`` — generates origins and sweeps the FOV.
+        trace_results_per_angle: nested list ``[angle_idx][route_idx]`` of
+            ``TraceResult``. Every ``TraceResult`` is expected to end on
+            the pupil (the last interaction is a ``PupilSeg``). Sums over
+            the inner route dimension give one heatmap per angle.
+        scan_angles: ``(num_y, num_x, 2)`` array of ``(angle_x, angle_y)``
+            in radians, matching the order of ``trace_results_per_angle``
+            when traversed row-major.
         pupil_element: ``RectangularPupil`` — pupil geometry for binning.
-        x_fov, y_fov: scan extents in radians.
-        num_x_angles, num_y_angles: scan grid.
-        color_idx: which per-color reflectance channel to use.
         pixel_size: bin size on the pupil plane in mm.
 
     Returns:
         Plotly Figure with one heatmap per scan angle and an angle slider.
     """
-    from apollo14.trace import trace_rays
-    from apollo14.projector import scan_directions
-
-    routes = list(routes)
-
     pupil_center = np.asarray(pupil_element.position)
     pupil_normal = np.asarray(pupil_element.normal)
     pupil_lx, pupil_ly = compute_local_axes(pupil_normal)
@@ -154,30 +152,25 @@ def plot_pupil_fill(routes, projector, pupil_element,
     bin_centers_x = (bin_edges[:-1] + bin_edges[1:]) / 2
     bin_centers_y = (bin_edges[:-1] + bin_edges[1:]) / 2
 
-    scan_dirs, scan_angles = scan_directions(
-        projector.direction, x_fov, y_fov, num_x_angles, num_y_angles,
-    )
+    scan_angles_np = np.asarray(scan_angles)
+    num_y_angles, num_x_angles = scan_angles_np.shape[:2]
 
     grids = []
     labels = []
-
+    idx = 0
     for iy in range(num_y_angles):
         for ix in range(num_x_angles):
-            d = scan_dirs[iy, ix]
-            ray_origins, _, _, _ = projector.generate_rays(direction=d)
-
             grid = np.zeros((n_bins, n_bins))
-            for route in routes:
-                tr = trace_rays(route, ray_origins, d, color_idx=color_idx)
+            for tr in trace_results_per_angle[idx]:
                 grid += bin_hits_to_grid_np(
                     tr, pupil_center, pupil_lx, pupil_ly,
                     bin_edges, bin_edges,
                 )
-
             grids.append(grid)
-            a_x = float(scan_angles[iy, ix, 0]) * 180 / np.pi
-            a_y = float(scan_angles[iy, ix, 1]) * 180 / np.pi
+            a_x = float(scan_angles_np[iy, ix, 0]) * 180 / np.pi
+            a_y = float(scan_angles_np[iy, ix, 1]) * 180 / np.pi
             labels.append(f"({a_x:.1f}, {a_y:.1f}) deg")
+            idx += 1
 
     vmax = max(g.max() for g in grids) if grids else 1.0
     if vmax == 0:
@@ -299,17 +292,29 @@ def _add_aperture(traces, aperture: RectangularAperture):
     lx, ly = compute_local_axes(aperture.normal)
     lx, ly = np.array(lx), np.array(ly)
     hw, hh = aperture.width / 2.0, aperture.height / 2.0
+    ihw, ihh = aperture.inner_width / 2.0, aperture.inner_height / 2.0
 
-    corners = np.array([
-        pos - hw * lx - hh * ly,
-        pos + hw * lx - hh * ly,
-        pos + hw * lx + hh * ly,
-        pos - hw * lx + hh * ly,
+    # 8 vertices — 4 outer corners then 4 inner corners, both CCW starting BL.
+    verts = np.array([
+        pos - hw * lx - hh * ly,   # 0: outer BL
+        pos + hw * lx - hh * ly,   # 1: outer BR
+        pos + hw * lx + hh * ly,   # 2: outer TR
+        pos - hw * lx + hh * ly,   # 3: outer TL
+        pos - ihw * lx - ihh * ly, # 4: inner BL
+        pos + ihw * lx - ihh * ly, # 5: inner BR
+        pos + ihw * lx + ihh * ly, # 6: inner TR
+        pos - ihw * lx + ihh * ly, # 7: inner TL
     ])
-    x, y, z = corners[:, 0].tolist(), corners[:, 1].tolist(), corners[:, 2].tolist()
+
+    # Frame = 4 quad strips (bottom, right, top, left), each 2 triangles.
+    i = [0, 0, 1, 1, 2, 2, 3, 3]
+    j = [1, 5, 2, 6, 3, 7, 0, 4]
+    k = [5, 4, 6, 5, 7, 6, 4, 7]
+
+    x, y, z = verts[:, 0].tolist(), verts[:, 1].tolist(), verts[:, 2].tolist()
     traces.append(go.Mesh3d(
         x=x, y=y, z=z,
-        i=[0, 0], j=[1, 2], k=[2, 3],
+        i=i, j=j, k=k,
         name=aperture.name,
         opacity=0.5,
         color='gray',
@@ -384,6 +389,51 @@ def _add_pupil(traces, pupil):
         line=dict(color='cyan', width=3),
         name=f"{pupil.name} normal",
         hoverinfo='name',
+    ))
+
+
+def _add_projector(traces, projector):
+    """Render the projector as a thin rectangular box.
+
+    Box extents: ``(beam_width + 1 mm) × (beam_height + 1 mm)`` in the beam
+    cross-section plane, ``1 mm`` thick along the emission direction.
+    Centered on ``projector.position`` with its front face pointing in
+    ``projector.direction``.
+    """
+    pos = np.array(projector.position)
+    d = np.array(projector.direction)
+    d = d / np.linalg.norm(d)
+    lx, ly = projector._compute_basis(projector.direction)
+    lx, ly = np.array(lx), np.array(ly)
+
+    hw = (projector.beam_width + 1.0 * mm) / 2.0
+    hh = (projector.beam_height + 1.0 * mm) / 2.0
+    ht = (.5 * mm) / 2.0  # half-thickness along emission axis
+
+    # 8 box corners. Back face (−d side) is where the emitter sits; front
+    # face (+d side) is where rays exit.
+    signs = [
+        (-1, -1, -1), ( 1, -1, -1), ( 1,  1, -1), (-1,  1, -1),
+        (-1, -1,  1), ( 1, -1,  1), ( 1,  1,  1), (-1,  1,  1),
+    ]
+    verts = np.array([
+        pos + sx * hw * lx + sy * hh * ly + sz * ht * d
+        for sx, sy, sz in signs
+    ])
+
+    # 12 triangles — 2 per face, 6 faces.
+    i = [0, 0, 1, 1, 2, 2, 4, 4, 0, 0, 3, 3]
+    j = [1, 2, 5, 6, 3, 7, 5, 6, 3, 4, 2, 6]
+    k = [2, 3, 6, 2, 7, 6, 6, 7, 4, 7, 6, 7]
+
+    x, y, z = verts[:, 0].tolist(), verts[:, 1].tolist(), verts[:, 2].tolist()
+    traces.append(go.Mesh3d(
+        x=x, y=y, z=z,
+        i=i, j=j, k=k,
+        name="projector",
+        opacity=0.7,
+        color='goldenrod',
+        hoverinfo='name+x+y+z',
     ))
 
 
