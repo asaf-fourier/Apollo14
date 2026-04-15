@@ -98,31 +98,25 @@ def _peak_wavelength(proj):
 
 
 # 30 nm window in 1 nm steps, centred on each channel's measured peak.
+# Kept as device-side (W,) arrays so the scan can be vmapped.
 SCAN_OFFSETS = jnp.arange(-15, 16) * nm  # 31 samples
-scan_wavelengths = {
-    c: [_peak_wavelength(p) + float(off) for off in SCAN_OFFSETS]
-    for c, p in projectors.items()
-}
 peak_wavelengths = {c: _peak_wavelength(p) for c, p in projectors.items()}
+scan_wavelengths = {
+    c: jnp.asarray([peak_wavelengths[c] + float(off) for off in SCAN_OFFSETS],
+                    dtype=jnp.float32)
+    for c in projectors
+}
 
 for c in "RGB":
-    lo = scan_wavelengths[c][0] / nm
-    hi = scan_wavelengths[c][-1] / nm
+    lo = float(scan_wavelengths[c][0]) / nm
+    hi = float(scan_wavelengths[c][-1]) / nm
     print(f"{c} peak {peak_wavelengths[c]/nm:.0f} nm — "
-          f"scan {lo:.0f}..{hi:.0f} nm ({len(scan_wavelengths[c])} samples)")
+          f"scan {lo:.0f}..{hi:.0f} nm ({scan_wavelengths[c].shape[0]} samples)")
 
-# Prepare one (main, branches) route set per (color, wavelength).
-main_routes = {
-    c: [prepare_route(main_route, wl) for wl in scan_wavelengths[c]]
-    for c in RGB_COLOR_IDX
-}
-branch_routes_rgb = {
-    c: [{name: prepare_route(r, wl) for name, r in branch_routes.items()}
-        for wl in scan_wavelengths[c]]
-    for c in RGB_COLOR_IDX
-}
-
-# Extra single-wavelength route set for the 3D visualisation (green peak).
+# Single-wavelength prepared routes for the 3D visualisation (green peak).
+# The hot-loop tracer works from raw (pre-prepare_route) routes so it can
+# vmap over wavelength; the viz path only needs one wavelength so we keep
+# it on the simpler prepared-route API.
 viz_main_route = prepare_route(main_route, peak_wavelengths["G"])
 viz_branch_routes = {
     name: prepare_route(r, peak_wavelengths["G"])
@@ -141,6 +135,11 @@ scan_dirs, scan_angles = scan_directions(
     DEFAULT_LIGHT_DIRECTION, x_fov, y_fov, num_x, num_y,
 )
 
+# Flatten to (A, 3) / (A, 2) so vmap only sees one batched axis.
+flat_dirs = scan_dirs.reshape(-1, 3)        # (A, 3)
+flat_angles = scan_angles.reshape(-1, 2)    # (A, 2), radians
+A = flat_dirs.shape[0]
+
 print(f"\nScan: {num_x}x{num_y} angles, FOV {x_fov/deg:.0f}x{y_fov/deg:.0f} deg")
 print(f"Projector: {projectors['R'].nx}x{projectors['R'].ny} rays, "
       f"{projectors['R'].beam_width/mm:.0f}x"
@@ -148,61 +147,108 @@ print(f"Projector: {projectors['R'].nx}x{projectors['R'].ny} rays, "
 
 
 # Blue channel has a linear angular falloff of ~2% per degree in both
-# x and y (applied as a scalar on ray intensity — the tracer is linear).
+# x and y. Precomputed on-device as a per-angle gain vector so it can
+# multiply ray intensity inside the vmapped trace without a host sync.
 BLUE_FALLOFF_PER_DEG = 0.02
+_ax_deg = flat_angles[:, 0] / deg
+_ay_deg = flat_angles[:, 1] / deg
+blue_gain_per_angle = jnp.clip(
+    (1.0 - BLUE_FALLOFF_PER_DEG * jnp.abs(_ax_deg))
+    * (1.0 - BLUE_FALLOFF_PER_DEG * jnp.abs(_ay_deg)),
+    0.0, 1.0,
+)  # (A,)
+gain_per_angle_by_color = {
+    "R": jnp.ones(A, dtype=jnp.float32),
+    "G": jnp.ones(A, dtype=jnp.float32),
+    "B": blue_gain_per_angle.astype(jnp.float32),
+}
+
+# ── Vmapped trace kernel: (wavelength × angle × ray) per branch ───────────
+#
+# One JIT-compiled function per (color, branch_route_shape) pair. Closes
+# over the color-specific projector, wavelength grid, and angular gain so
+# the compiled kernel has no Python dispatch overhead — 31×25 = 775
+# (wavelength, angle) combinations run as one XLA program per branch.
+
+def make_branch_tracer(projector, wavelengths, directions, gain_per_angle):
+    """Build a jitted function that sums pupil intensity per angle for one
+    branch route, marginalised over all scan wavelengths.
+
+    The returned function takes a raw (pre-``prepare_route``) route and
+    returns an ``(A,)`` per-angle total summed over the wavelength scan.
+    """
+    def per_angle(prepared, wavelength, direction, gain):
+        ray = projector.generate_rays(direction=direction, wavelength=wavelength)
+        ray = ray._replace(intensity=ray.intensity * gain)
+        tr = trace_rays(prepared, ray, wavelength=wavelength)
+        last_valid = tr.valids[..., -1]
+        return jnp.where(last_valid, tr.final_intensity, 0.0).sum()
+
+    def per_wavelength(raw_route, wavelength):
+        prepared = prepare_route(raw_route, wavelength)
+        return jax.vmap(per_angle, in_axes=(None, None, 0, 0))(
+            prepared, wavelength, directions, gain_per_angle)  # (A,)
+
+    def trace_branch(raw_route):
+        per_wl = jax.vmap(per_wavelength, in_axes=(None, 0))(
+            raw_route, wavelengths)  # (W, A)
+        return per_wl.sum(axis=0)  # (A,)
+
+    return jax.jit(trace_branch)
 
 
-def blue_angular_gain(ax_rad, ay_rad):
-    ax_deg = float(ax_rad) / deg
-    ay_deg = float(ay_rad) / deg
-    gain = (1.0 - BLUE_FALLOFF_PER_DEG * abs(ax_deg)) \
-         * (1.0 - BLUE_FALLOFF_PER_DEG * abs(ay_deg))
-    return max(gain, 0.0)
+branch_tracers = {
+    c: make_branch_tracer(
+        projectors[c], scan_wavelengths[c], flat_dirs,
+        gain_per_angle_by_color[c],
+    )
+    for c in "RGB"
+}
 
-# ── Trace main + branches per color, per wavelength, per angle ────────────
+print("\n── Tracing RGB across FOV "
+      "(6 branches × 31 wavelengths × 25 angles, vmapped) ──")
 
-print("\n── Tracing RGB across FOV (main + 6 branches, 31 wavelengths/color) ──")
 
-# Intensity reaching the pupil per (color, angle), summed over wavelengths
-# and branches.
-result = np.zeros((num_y, num_x, 3))
+def run_once():
+    """One full RGB sweep, returning per-color (A,) arrays, on-device."""
+    out = {c: jnp.zeros(A, dtype=jnp.float32) for c in "RGB"}
+    for c in "RGB":
+        for name, raw_branch in branch_routes.items():
+            out[c] = out[c] + branch_tracers[c](raw_branch)
+    return out
 
-# Visualization traces — green peak only, so the 3D view isn't overwhelming.
-viz_traces = []
 
-# Per-angle green-branch traces (peak wavelength) for the pupil-fill plot.
-pupil_traces_per_angle = []
+# Warm-up: first call pays JIT compilation (one compile per branch shape,
+# per color — ~18 compiles of the vmapped kernel).
+warm_t0 = time.perf_counter()
+warm = run_once()
+for v in warm.values():
+    v.block_until_ready()
+warm_elapsed = time.perf_counter() - warm_t0
+print(f"Warm-up (JIT compile + first run): {warm_elapsed:.2f} s")
 
+# Timed run: all kernels cached, this is the actual execution cost.
 trace_t0 = time.perf_counter()
+result_on_device = run_once()
+result_per_color = {c: np.asarray(v.block_until_ready())
+                     for c, v in result_on_device.items()}
+trace_elapsed = time.perf_counter() - trace_t0
+
+result = np.zeros((num_y, num_x, 3))
+for c, ci in RGB_COLOR_IDX.items():
+    result[:, :, ci] = result_per_color[c].reshape(num_y, num_x)
+
+print(f"\nTrace step elapsed: {trace_elapsed:.2f} s "
+      f"({1e3*trace_elapsed/A:.1f} ms/angle, {A} angles)")
+
+# ── Visualisation traces (green peak only, single wavelength path) ────────
+
+viz_traces = []
+pupil_traces_per_angle = []
 
 for iy in range(num_y):
     for ix in range(num_x):
         direction = scan_dirs[iy, ix]
-        ax_rad, ay_rad = scan_angles[iy, ix]
-
-        for c, ci in RGB_COLOR_IDX.items():
-            proj = projectors[c]
-            gain = blue_angular_gain(ax_rad, ay_rad) if c == "B" else 1.0
-
-            total = 0.0
-            for wi, wl in enumerate(scan_wavelengths[c]):
-                ray = proj.generate_rays(direction=direction, wavelength=wl)
-                if gain != 1.0:
-                    ray = ray._replace(intensity=ray.intensity * gain)
-
-                # Main path (doesn't reach the pupil — recorded for completeness).
-                _ = _trace_rays_jit(main_routes[c][wi], ray, wavelength=wl)
-
-                # Each reflected branch contributes to the pupil.
-                for name, broute in branch_routes_rgb[c][wi].items():
-                    tr = _trace_rays_jit(broute, ray, wavelength=wl)
-                    last_valid = tr.valids[..., -1]
-                    total += float(
-                        jnp.where(last_valid, tr.final_intensity, 0.0).sum()
-                    )
-            result[iy, ix, ci] = total
-
-        # Green-peak traces for visualisation + pupil fill (single wavelength).
         ray_g = projectors["G"].generate_rays(
             direction=direction, wavelength=peak_wavelengths["G"])
         green_branch_traces = []
@@ -216,12 +262,6 @@ for iy in range(num_y):
         tr_main = _trace_rays_jit(viz_main_route, ray_g,
                                   wavelength=peak_wavelengths["G"])
         viz_traces.append(tr_main)
-
-trace_elapsed = time.perf_counter() - trace_t0
-n_angles = num_x * num_y
-print(f"\nTrace step elapsed: {trace_elapsed:.2f} s "
-      f"({1e3*trace_elapsed/n_angles:.1f} ms/angle, "
-      f"{n_angles} angles)")
 
 # ── Summary ────────────────────────────────────────────────────────────────
 
