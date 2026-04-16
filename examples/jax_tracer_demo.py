@@ -90,8 +90,8 @@ projectors = {
     c: PlayNitrideLed.create(
         position=DEFAULT_LIGHT_POSITION,
         direction=DEFAULT_LIGHT_DIRECTION,
-        beam_width=4.0 * mm,
-        beam_height=1.2 * mm,
+        beam_width=10.0 * mm,
+        beam_height=2 * mm,
         nx=PROJECTOR_NX, ny=PROJECTOR_NY,
         color=c,
         falloff_x=FALLOFFS[c][0], falloff_y=FALLOFFS[c][1],
