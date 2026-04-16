@@ -53,9 +53,9 @@ class GlassFace:
 
     @property
     def half_extents(self) -> jnp.ndarray:
-        hw = float(jnp.max(jnp.abs(self._verts_x)))
-        hh = float(jnp.max(jnp.abs(self._verts_y)))
-        return jnp.array([hw, hh], dtype=jnp.float32)
+        hw = jnp.max(jnp.abs(self._verts_x))
+        hh = jnp.max(jnp.abs(self._verts_y))
+        return jnp.stack([hw, hh])
 
     def build_segment(self, current_material, mode):
         glass = self._block_material

@@ -107,6 +107,65 @@ class PartialMirror(PlanarElement):
         return seg, current_material
 
 
+@dataclass
+class GaussianMirror(PartialMirror):
+    """Partial mirror whose reflectance is a sum of per-color Gaussians.
+
+    Each color channel contributes one Gaussian bump centered at its
+    projector primary wavelength. The effective reflectance at any
+    wavelength is the sum of all three::
+
+        r(λ) = Σ_c amplitude[c] · exp( −(λ − center[c])² / (2·sigma[c]²) )
+
+    The ``amplitude`` and ``sigma`` arrays are the design variables for
+    optimization. The ``reflectance`` and ``wavelengths`` fields on the
+    parent ``PartialMirror`` are computed automatically by sampling the
+    Gaussians at ``probe_wavelengths``.
+
+    Args:
+        amplitude: ``(3,)`` per-color peak reflectance.
+        sigma: ``(3,)`` per-color Gaussian width (same units as
+            wavelengths — typically mm, since the project uses
+            ``apollo14.units.nm`` which converts to mm).
+        probe_wavelengths: ``(K,)`` wavelengths at which to sample the
+            curve. Also used as the Gaussian centers. Defaults to
+            ``DEFAULT_MIRROR_WAVELENGTHS`` (460/525/630 nm).
+    """
+    amplitude: jnp.ndarray = None        # (3,) per-color peak reflectance
+    sigma: jnp.ndarray = None            # (3,) per-color Gaussian width
+    probe_wavelengths: jnp.ndarray = None  # (K,) also used as Gaussian centers
+
+    def __post_init__(self):
+        if self.probe_wavelengths is None:
+            self.probe_wavelengths = DEFAULT_MIRROR_WAVELENGTHS
+        else:
+            self.probe_wavelengths = jnp.asarray(self.probe_wavelengths,
+                                                  dtype=jnp.float32)
+
+        if self.amplitude is None:
+            self.amplitude = jnp.full((3,), 0.05, dtype=jnp.float32)
+        else:
+            self.amplitude = jnp.asarray(self.amplitude, dtype=jnp.float32)
+
+        if self.sigma is None:
+            self.sigma = jnp.full((3,), 20.0 * nm, dtype=jnp.float32)
+        else:
+            self.sigma = jnp.asarray(self.sigma, dtype=jnp.float32)
+
+        self.wavelengths = self.probe_wavelengths
+        self.reflectance = self._build_reflectance_curve()
+        super().__post_init__()
+
+    def _build_reflectance_curve(self) -> jnp.ndarray:
+        """Evaluate sum-of-Gaussians at each probe wavelength."""
+        centers = self.probe_wavelengths                       # (K,)
+        wavelength_offset = (centers[None, :] - centers[:, None])  # (3, K)
+        exponent = -(wavelength_offset ** 2) / (
+            2.0 * self.sigma[:, None] ** 2 + 1e-18)
+        per_color = self.amplitude[:, None] * jnp.exp(exponent)    # (3, K)
+        return jnp.sum(per_color, axis=0)                          # (K,)
+
+
 def _interp_reflectance(wavelengths, reflectance, wavelength):
     """``jnp.interp`` with a consistent float32 output."""
     return jnp.interp(wavelength, wavelengths, reflectance)

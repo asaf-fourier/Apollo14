@@ -1,5 +1,5 @@
 from apollo14.combiner import build_default_system
-from apollo14.projector import Projector, scan_directions
+from apollo14.projector import Projector, FovGrid, scan_directions
 from apollo14.ray import Ray
 from apollo14.route import (
     ElementRef,

@@ -305,8 +305,9 @@ print("Saved: jax_tracer_demo_pupil.html")
 print("\n── Computing eyebox response for run report ──")
 
 from apollo14.elements.pupil import RectangularPupil
+from apollo14.projector import FovGrid
 from helios.eyebox import (
-    EyeboxConfig, eyebox_grid_points, compute_eyebox_response,
+    eyebox_grid_points, compute_eyebox_response,
 )
 from helios.merit import build_combiner_pupil_routes
 from helios.io import save_run, ScanConfig
@@ -322,17 +323,10 @@ wl_rgb = jnp.array(
     [peak_wavelengths["R"], peak_wavelengths["G"], peak_wavelengths["B"]])
 routes_rgb = build_combiner_pupil_routes(system, list(wl_rgb))
 
-eb_cfg = EyeboxConfig(n_fov_x=7, n_fov_y=7, n_beam_x=5, n_beam_y=5)
-response, _ = compute_eyebox_response(
-    routes_rgb,
-    projectors["G"].position, projectors["G"].direction,
-    projectors["G"].beam_width, projectors["G"].beam_height,
-    x_fov, y_fov, eb_points, config=eb_cfg,
+eb_fov_grid = FovGrid(projectors["G"].direction, x_fov, y_fov, num_x=7, num_y=7)
+response = compute_eyebox_response(
+    routes_rgb, projectors["G"], eb_fov_grid, eb_points,
 )
-
-_, eb_scan_angles = scan_directions(
-    projectors["G"].direction, x_fov, y_fov,
-    eb_cfg.n_fov_x, eb_cfg.n_fov_y)
 
 pupil_x_mm = jnp.linspace(-eb_radius, eb_radius, eb_nx)
 pupil_y_mm = jnp.linspace(-eb_radius, eb_radius, eb_ny)
@@ -340,7 +334,7 @@ pupil_y_mm = jnp.linspace(-eb_radius, eb_radius, eb_ny)
 scan_cfg = ScanConfig(
     base_direction=projectors["G"].direction,
     x_fov=float(x_fov), y_fov=float(y_fov),
-    num_x=eb_cfg.n_fov_x, num_y=eb_cfg.n_fov_y,
+    num_x=eb_fov_grid.num_x, num_y=eb_fov_grid.num_y,
 )
 
 run_dir = save_run(
@@ -348,7 +342,7 @@ run_dir = save_run(
     system, projectors["G"], scan_cfg,
     response=response,
     pupil_x_mm=pupil_x_mm, pupil_y_mm=pupil_y_mm,
-    scan_angles=eb_scan_angles,
+    scan_angles=eb_fov_grid.angles_grid,
     wavelengths_nm=wl_rgb / nm,
 )
 report_path = render_report(run_dir)

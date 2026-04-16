@@ -191,20 +191,78 @@ class PlayNitrideLed(Projector):
         )
 
 
+class FovGrid:
+    """FOV scan grid — iterable collection of directions with grid metadata.
+
+    Wraps :func:`scan_directions` output so callers can iterate over
+    flattened directions and later map results back to the 2-D FOV grid
+    via :attr:`angles` and :attr:`grid_shape`.
+
+    Usage::
+
+        grid = FovGrid(projector.direction, x_fov, y_fov, num_x, num_y)
+        for direction in grid:
+            ray = projector.generate_rays(direction=direction)
+            ...
+        # result array of shape (len(grid),) can be reshaped:
+        result_2d = result.reshape(grid.grid_shape)
+    """
+
+    def __init__(self, base_direction, x_fov, y_fov, num_x, num_y):
+        directions_grid, angles_grid = _build_scan_grid(
+            base_direction, x_fov, y_fov, num_x, num_y)
+        self.directions_grid = directions_grid    # (num_y, num_x, 3)
+        self.angles_grid = angles_grid            # (num_y, num_x, 2)
+        self.num_x = num_x
+        self.num_y = num_y
+        self._flat_directions = directions_grid.reshape(-1, 3)
+
+    @property
+    def grid_shape(self):
+        """(num_y, num_x) — shape for reshaping flat results back to 2-D."""
+        return (self.num_y, self.num_x)
+
+    @property
+    def flat_directions(self):
+        """(A, 3) flattened direction vectors."""
+        return self._flat_directions
+
+    @property
+    def flat_angles(self):
+        """(A, 2) flattened (angle_x, angle_y) in radians."""
+        return self.angles_grid.reshape(-1, 2)
+
+    def __len__(self):
+        return self._flat_directions.shape[0]
+
+    def __iter__(self):
+        for idx in range(len(self)):
+            yield self._flat_directions[idx]
+
+    def __getitem__(self, idx):
+        return self._flat_directions[idx]
+
+
 def scan_directions(base_direction, x_fov, y_fov, num_x, num_y):
     """Generate a grid of scan directions covering the given FOV.
 
     Returns:
         directions: (num_y, num_x, 3) array of normalized direction vectors
         angles: (num_y, num_x, 2) array of (angle_x, angle_y) in radians
+
+    .. note:: Prefer :class:`FovGrid` for new code — it wraps this
+       function and provides iteration + grid metadata.
     """
+    return _build_scan_grid(base_direction, x_fov, y_fov, num_x, num_y)
+
+
+def _build_scan_grid(base_direction, x_fov, y_fov, num_x, num_y):
     d = normalize(base_direction)
 
-    # Build rotation basis
     ref = jnp.where(jnp.abs(d[2]) < 0.9, jnp.array([0.0, 0.0, 1.0]),
                     jnp.array([1.0, 0.0, 0.0]))
-    axis_x = normalize(jnp.cross(d, ref))       # rotation axis for x-scan
-    axis_y = normalize(jnp.cross(axis_x, d))     # rotation axis for y-scan
+    axis_x = normalize(jnp.cross(d, ref))
+    axis_y = normalize(jnp.cross(axis_x, d))
 
     ax = jnp.linspace(-x_fov / 2, x_fov / 2, num_x) if num_x > 1 else jnp.array([0.0])
     ay = jnp.linspace(-y_fov / 2, y_fov / 2, num_y) if num_y > 1 else jnp.array([0.0])
@@ -215,7 +273,6 @@ def scan_directions(base_direction, x_fov, y_fov, num_x, num_y):
         row_dirs = []
         row_angles = []
         for ix in range(len(ax)):
-            # Rodrigues rotation: first around axis_y (vertical scan), then axis_x (horizontal)
             rotated = _rodrigues(d, axis_y, ay[iy])
             rotated = _rodrigues(rotated, axis_x, ax[ix])
             row_dirs.append(normalize(rotated))
