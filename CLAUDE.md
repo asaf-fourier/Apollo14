@@ -67,6 +67,21 @@ Helios is the optimization layer. It imports from `apollo14` but **`apollo14` mu
 - **Clean API** — the system definition and tracer should be usable as a library by the optimization project.
 - **Plotly for visualization** — interactive 3D renders of the system with slider to step through scan angles.
 
+## Naming conventions
+
+Use **descriptive, self-explanatory names** for all variables. Avoid single-letter or abbreviated names — code should read clearly without comments explaining what a variable holds.
+
+- `input_flux` not `I_in`, `mean_brightness` not `I_bar`, `brightness_threshold` not `I_thresh`
+- `above_threshold` not `above`, `cell_mask` not `mask`, `num_target_cells` not `n_cells`
+- `loss_coverage` not `L_cov`, `loss_shape` not `L_shape`
+- `wavelength_offset` not `delta`, `exponent` not `expo`
+- `moment` / `variance` / `step_count` not `m` / `v` / `t` (Adam state)
+- `corrected_moment` not `m_hat`, `learning_rate` not `lr`
+- `mirror_idx` not `i`, `mirror_amps` not `a`, `spacing` not `s` (loop variables)
+- `clipped_spacings` not `sp`, `total_spacing` not `total`
+
+Exceptions: standard mathematical notation in docstrings and comments is fine (e.g. `Ī(s)`, `σ`, `β` in formulas). The rule applies to Python identifiers, not documentation.
+
 ## Target System (Talos)
 
 Reference implementation: Apollo13's `system/talos/talos.py`. Key parameters:
