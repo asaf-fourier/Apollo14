@@ -5,6 +5,7 @@ JAX tracer, producing a per-cell, per-angle, per-wavelength intensity
 tensor. Fully differentiable — gradients flow through intensity values.
 """
 
+import jax
 import jax.numpy as jnp
 
 from apollo14.geometry import planar_grid_points
@@ -23,6 +24,22 @@ def eyebox_grid_points(center, normal, radius, nx, ny):
 
 # ── Response computation ────────────────────────────────────────────────────
 
+def _trace_branch_over_fov(route, projector, eyebox_points, wavelength,
+                           directions):
+    """Trace one branch route across all FOV directions via vmap.
+
+    Returns ``(S, A)`` binned intensity at each eyebox sample for each
+    FOV direction.
+    """
+    def per_direction(direction):
+        ray = projector.generate_rays(direction=direction,
+                                      wavelength=wavelength)
+        traced = trace_rays(route, ray, wavelength=wavelength)
+        return bin_hits_to_nearest(traced, eyebox_points, stop_grad=True)
+
+    return jax.vmap(per_direction)(directions)  # (A, S) → transpose below
+
+
 def compute_eyebox_response(routes_per_wavelength, projector,
                             fov_grid, eyebox_points,
                             wavelengths=None):
@@ -33,6 +50,9 @@ def compute_eyebox_response(routes_per_wavelength, projector,
     binning hits to the nearest eyebox grid point. Gradients flow
     through intensity values; spatial assignment is fixed
     (``stop_gradient`` on argmin).
+
+    FOV directions are vectorized with ``jax.vmap`` for fast compilation
+    and execution — one compiled kernel per (wavelength, branch) pair.
 
     Args:
         routes_per_wavelength: ``(n_wavelengths, n_branches)`` list of
@@ -59,22 +79,17 @@ def compute_eyebox_response(routes_per_wavelength, projector,
             f"wavelengths ({len(wavelengths)}) must match "
             f"routes_per_wavelength ({len(routes_per_wavelength)}) in length")
 
+    directions = fov_grid.flat_directions  # (A, 3)
+
     wavelength_responses = []
     for wl_idx, branch_routes in enumerate(routes_per_wavelength):
         trace_wavelength = wavelengths[wl_idx]
-        angle_responses = []
-        for direction in fov_grid:
-            ray = projector.generate_rays(direction=direction,
-                                          wavelength=trace_wavelength)
-            binned = jnp.zeros(eyebox_points.shape[0])
-            for route in branch_routes:
-                traced = trace_rays(route, ray, wavelength=trace_wavelength)
-                binned = binned + bin_hits_to_nearest(
-                    traced, eyebox_points, stop_grad=True)
-            angle_responses.append(binned)
-
-        per_wavelength = jnp.stack(angle_responses, axis=1)  # (S, A)
-        wavelength_responses.append(per_wavelength)
+        binned = jnp.zeros((directions.shape[0], eyebox_points.shape[0]))
+        for route in branch_routes:
+            binned = binned + _trace_branch_over_fov(
+                route, projector, eyebox_points, trace_wavelength,
+                directions)  # (A, S)
+        wavelength_responses.append(binned.T)  # (S, A)
 
     response = jnp.stack(wavelength_responses, axis=-1)  # (S, A, n_wl)
     return response
