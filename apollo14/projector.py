@@ -187,7 +187,7 @@ class PlayNitrideLed(Projector):
             beam_height=beam_height,
             nx=nx, ny=ny,
             falloff_x=falloff_x, falloff_y=falloff_y,
-            spectrum=(wls, rad),
+            spectrum=(wls, rad / rad.max()),
         )
 
 
