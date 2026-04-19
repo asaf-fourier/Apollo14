@@ -52,7 +52,7 @@ def build_combiner_pupil_routes(system: OpticalSystem,
     main_path.extend(f"mirror_{i}" for i in range(num_mirrors))
     main_path.append((chassis_name, "front"))
 
-    tail = [(chassis_name, "front"), absorb(pupil_name)]
+    tail = [(chassis_name, "top"), absorb(pupil_name)]
     branch_routes = [
         build_route(system, branch_path(main_path, at=f"mirror_{i}", tail=tail))
         for i in range(num_mirrors)

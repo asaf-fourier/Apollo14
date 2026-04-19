@@ -20,7 +20,7 @@ Run::
 import jax
 import jax.numpy as jnp
 
-from apollo14.units import mm, deg
+from apollo14.units import mm, nm, deg
 from apollo14.combiner import (
     DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
 )
@@ -37,6 +37,9 @@ from helios.eyebox import (
 from helios.pupil_merit import (
     PupilMeritConfig, pupil_merit, merit_breakdown,
 )
+from helios.adam import AdamConfig, adam_init, adam_step, lr_schedule
+from helios.io import save_optimization_report, save_run, ScanConfig
+from helios.reports.run_report import render_report
 
 
 # ── Eyebox target region (pre-defined, fixed) ───────────────────────────────
@@ -44,8 +47,8 @@ from helios.pupil_merit import (
 EYEBOX_RADIUS = 5.0 * mm         # 10×10 mm centered eyebox
 EYEBOX_NX, EYEBOX_NY = 7, 7      # 49 cells, ~1.4 mm each
 
-X_FOV = 10.0 * deg
-Y_FOV = 10.0 * deg
+X_FOV = 7.0 * deg
+Y_FOV = 7.0 * deg
 
 # ── RGB projectors (PlayNitride micro-LEDs, one per color) ─────────────────
 
@@ -90,11 +93,13 @@ bounds = ParamBounds()
 
 
 # ── Reference input flux ────────────────────────────────────────────────────
-# One FOV direction delivers one full beam — since every beam ray has
-# intensity 1 in the tracer's accounting, input_flux equals the number of
-# rays per beam. This keeps ``threshold_relative`` invariant to beam density.
+# True on-axis flux: sum of actual ray intensities across all three channels.
 
-INPUT_FLUX = float(PROJECTOR_NX * PROJECTOR_NY)
+INPUT_FLUX = sum(
+    float(jnp.sum(proj.generate_rays(
+        direction=DEFAULT_LIGHT_DIRECTION, wavelength=wl).intensity))
+    for proj, wl in zip(PROJECTORS, DEFAULT_WAVELENGTHS)
+)
 
 
 # ── Build the pupil cell grid and mask for the target region ────────────────
@@ -146,46 +151,14 @@ value_and_grad_fn = jax.jit(jax.value_and_grad(loss_fn))
 
 # ── Adam optimizer ──────────────────────────────────────────────────────────
 
-LEARNING_RATE = 5e-4
-ADAM_BETA1, ADAM_BETA2, ADAM_EPS = 0.9, 0.999, 1e-8
-NUM_STEPS = 200
-
-
-def adam_init(params):
-    zeros = jax.tree.map(jnp.zeros_like, params)
-    return zeros, zeros, jnp.array(0.0)
-
-
-def adam_step(params, state):
-    moment, variance, step_count = state
-    loss, grad = value_and_grad_fn(params)
-    step_count = step_count + 1
-    moment = jax.tree.map(
-        lambda mom, grd: ADAM_BETA1 * mom + (1 - ADAM_BETA1) * grd,
-        moment, grad,
-    )
-    variance = jax.tree.map(
-        lambda var, grd: ADAM_BETA2 * var + (1 - ADAM_BETA2) * grd ** 2,
-        variance, grad,
-    )
-    corrected_moment = jax.tree.map(
-        lambda mom: mom / (1 - ADAM_BETA1 ** step_count), moment,
-    )
-    corrected_variance = jax.tree.map(
-        lambda var: var / (1 - ADAM_BETA2 ** step_count), variance,
-    )
-    new_params = jax.tree.map(
-        lambda param, mom, var: param - LEARNING_RATE * mom / (jnp.sqrt(var) + ADAM_EPS),
-        params, corrected_moment, corrected_variance,
-    )
-    new_params = bounds.clip(new_params)
-    return new_params, (moment, variance, step_count), loss
+adam_cfg = AdamConfig(peak_lr=5e-4, warmup_steps=20, num_steps=400)
 
 
 # ── Run ─────────────────────────────────────────────────────────────────────
 
 def main():
-    params = CombinerParams.initial()
+    initial_params = CombinerParams.initial()
+    params = initial_params
     state = adam_init(params)
 
     print("── Pupil optimization (spacings + Gaussian reflectance) ──")
@@ -196,27 +169,31 @@ def main():
           f"{FOV_GRID.num_x}×{FOV_GRID.num_y} samples")
     print(f"I_in:      {INPUT_FLUX:.1f}  (threshold_relative={merit_cfg.threshold_relative})")
 
-    init = breakdown_fn(params)
-    print(f"\nInitial merit: {float(init['total']):.5f}")
-    print(f"  shape={float(init['shape']):.5f}  "
-          f"coverage={float(init['coverage']):.5f}  "
-          f"warmup={float(init['warmup']):.5f}  "
-          f"cap={float(init['cap']):.5f}")
-    print(f"  active_fraction={float(init['active_fraction']):.3f}  "
-          f"min_rel={float(init['min_brightness_rel']):.4f}")
+    initial_breakdown = breakdown_fn(params)
+    print(f"\nInitial merit: {float(initial_breakdown['total']):.5f}")
+    print(f"  shape={float(initial_breakdown['shape']):.5f}  "
+          f"coverage={float(initial_breakdown['coverage']):.5f}  "
+          f"warmup={float(initial_breakdown['warmup']):.5f}  "
+          f"cap={float(initial_breakdown['cap']):.5f}")
+    print(f"  active_fraction={float(initial_breakdown['active_fraction']):.3f}  "
+          f"min_rel={float(initial_breakdown['min_brightness_rel']):.4f}")
 
-    for step in range(NUM_STEPS):
-        params, state, loss = adam_step(params, state)
+    loss_history = []
+    for step in range(adam_cfg.num_steps):
+        loss, grad = value_and_grad_fn(params)
+        params, state = adam_step(params, grad, state, adam_cfg)
+        params = bounds.clip(params)
+        loss_history.append(float(loss))
         print(f"step {step+1:4d}  loss={float(loss):.5f}")
 
-    final = breakdown_fn(params)
-    print(f"\nFinal merit:   {float(final['total']):.5f}")
-    print(f"  shape={float(final['shape']):.5f}  "
-          f"coverage={float(final['coverage']):.5f}  "
-          f"warmup={float(final['warmup']):.5f}  "
-          f"cap={float(final['cap']):.5f}")
-    print(f"  active_fraction={float(final['active_fraction']):.3f}  "
-          f"min_rel={float(final['min_brightness_rel']):.4f}")
+    final_breakdown = breakdown_fn(params)
+    print(f"\nFinal merit:   {float(final_breakdown['total']):.5f}")
+    print(f"  shape={float(final_breakdown['shape']):.5f}  "
+          f"coverage={float(final_breakdown['coverage']):.5f}  "
+          f"warmup={float(final_breakdown['warmup']):.5f}  "
+          f"cap={float(final_breakdown['cap']):.5f}")
+    print(f"  active_fraction={float(final_breakdown['active_fraction']):.3f}  "
+          f"min_rel={float(final_breakdown['min_brightness_rel']):.4f}")
 
     print("\nFinal spacings (mm):",
           [f"{float(spacing)/mm:.3f}" for spacing in params.spacings])
@@ -230,6 +207,57 @@ def main():
         mirror_width = params.widths[mirror_idx]
         print(f"  m{mirror_idx}: {float(mirror_width[0])*1e6:.1f}  "
               f"{float(mirror_width[1])*1e6:.1f}  {float(mirror_width[2])*1e6:.1f}")
+
+    final_system = build_parametrized_system(params)
+    report_path = save_optimization_report(
+        "examples/reports/optimize_pupil",
+        system=final_system,
+        projectors=PROJECTORS,
+        fov_grid=FOV_GRID,
+        merit_config=merit_cfg,
+        optimizer_config={
+            "algorithm": "adam",
+            "peak_learning_rate": adam_cfg.peak_lr,
+            "warmup_steps": adam_cfg.warmup_steps,
+            "schedule": "warmup_cosine_decay",
+            "beta1": adam_cfg.beta1,
+            "beta2": adam_cfg.beta2,
+            "epsilon": adam_cfg.epsilon,
+            "num_steps": adam_cfg.num_steps,
+        },
+        param_bounds=bounds,
+        initial_params=initial_params,
+        final_params=params,
+        initial_breakdown={k: float(v) for k, v in initial_breakdown.items()},
+        final_breakdown={k: float(v) for k, v in final_breakdown.items()},
+        loss_history=loss_history,
+        eyebox_config={
+            "radius": EYEBOX_RADIUS,
+            "nx": EYEBOX_NX,
+            "ny": EYEBOX_NY,
+        },
+    )
+    print(f"\nSaved optimization report: {report_path}")
+
+    response = _compute_rgb_response(params)
+    pupil_x_mm = jnp.linspace(-EYEBOX_RADIUS, EYEBOX_RADIUS, EYEBOX_NX)
+    pupil_y_mm = jnp.linspace(-EYEBOX_RADIUS, EYEBOX_RADIUS, EYEBOX_NY)
+    scan_cfg = ScanConfig(
+        base_direction=DEFAULT_LIGHT_DIRECTION,
+        x_fov=float(X_FOV), y_fov=float(Y_FOV),
+        num_x=FOV_GRID.num_x, num_y=FOV_GRID.num_y,
+    )
+    run_dir = save_run(
+        "examples/reports/optimize_pupil",
+        final_system, PROJECTORS[0], scan_cfg,
+        response=response,
+        pupil_x_mm=pupil_x_mm,
+        pupil_y_mm=pupil_y_mm,
+        scan_angles=FOV_GRID.angles_grid,
+        wavelengths_nm=DEFAULT_WAVELENGTHS / nm,
+    )
+    html_path = render_report(run_dir)
+    print(f"Saved run report: {html_path}")
 
 
 if __name__ == "__main__":

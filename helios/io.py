@@ -21,7 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 
 import apollo14
-from apollo14.projector import Projector
+from apollo14.projector import Projector, FovGrid
 from apollo14.system import OpticalSystem
 
 
@@ -89,7 +89,7 @@ def _serialize_element(e) -> dict:
     cls = type(e).__name__
     base = {"type": cls, "name": getattr(e, "name", None)}
 
-    if cls == "PartialMirror":
+    if cls in ("PartialMirror", "GaussianMirror"):
         base.update({
             "position": _to_list(e.position),
             "normal": _to_list(e.normal),
@@ -98,6 +98,11 @@ def _serialize_element(e) -> dict:
             "wavelengths": _to_list(e.wavelengths),
             "reflectance": _to_list(e.reflectance),
         })
+        if cls == "GaussianMirror":
+            base.update({
+                "amplitude": _to_list(e.amplitude),
+                "sigma": _to_list(e.sigma),
+            })
     elif cls == "RectangularAperture":
         base.update({
             "position": _to_list(e.position),
@@ -205,3 +210,99 @@ def save_run(
         np.savez(run_dir / "response.npz", **arrays)
 
     return run_dir
+
+
+def _serialize_fov_grid(fov_grid: FovGrid) -> dict:
+    return {
+        "x_fov": _round_sig(float(fov_grid.angles_grid[:, :, 0].max()
+                                  - fov_grid.angles_grid[:, :, 0].min())),
+        "y_fov": _round_sig(float(fov_grid.angles_grid[:, :, 1].max()
+                                  - fov_grid.angles_grid[:, :, 1].min())),
+        "num_x": int(fov_grid.num_x),
+        "num_y": int(fov_grid.num_y),
+    }
+
+
+def _serialize_combiner_params(params) -> dict:
+    return {
+        "spacings": _to_list(params.spacings),
+        "amplitudes": _to_list(params.amplitudes),
+        "widths": _to_list(params.widths),
+    }
+
+
+def _serialize_merit_config(config) -> dict:
+    return {
+        "threshold_relative": _round_sig(float(config.threshold_relative)),
+        "cap_relative": (_round_sig(float(config.cap_relative))
+                         if config.cap_relative is not None else None),
+        "sigmoid_steepness": _round_sig(float(config.sigmoid_steepness)),
+        "soft_min_temperature": _round_sig(float(config.soft_min_temperature)),
+        "shape_floor_epsilon": float(config.shape_floor_epsilon),
+        "weight_shape": _round_sig(float(config.weight_shape)),
+        "weight_coverage": _round_sig(float(config.weight_coverage)),
+        "weight_warmup": _round_sig(float(config.weight_warmup)),
+        "weight_cap": _round_sig(float(config.weight_cap)),
+    }
+
+
+def _serialize_merit_breakdown(breakdown: dict) -> dict:
+    return {k: _round_sig(float(v)) for k, v in breakdown.items()}
+
+
+def save_optimization_report(
+    run_dir: Path | str,
+    *,
+    system: OpticalSystem,
+    projectors: list[Projector],
+    fov_grid: FovGrid,
+    merit_config,
+    optimizer_config: dict,
+    param_bounds,
+    initial_params,
+    final_params,
+    initial_breakdown: dict,
+    final_breakdown: dict,
+    loss_history: list[float],
+    eyebox_config: dict,
+) -> Path:
+    """Write an optimization report to ``run_dir/optimization_report.json``.
+
+    Reuses existing serializers for the system and projectors.  Captures
+    everything needed to reproduce or compare an optimization run.
+    """
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    report = {
+        "git_sha": _git_sha(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "system": _serialize_system(system),
+        "projectors": [_serialize_projector(p) for p in projectors],
+        "fov_grid": _serialize_fov_grid(fov_grid),
+        "eyebox": {
+            "radius": _round_sig(float(eyebox_config["radius"])),
+            "nx": int(eyebox_config["nx"]),
+            "ny": int(eyebox_config["ny"]),
+        },
+        "merit_config": _serialize_merit_config(merit_config),
+        "optimizer": optimizer_config,
+        "param_bounds": {
+            "spacing_min_mm": _round_sig(float(param_bounds.spacing_min_mm)),
+            "spacing_max_mm": _round_sig(float(param_bounds.spacing_max_mm)),
+            "amplitude_min": _round_sig(float(param_bounds.amplitude_min)),
+            "amplitude_max": _round_sig(float(param_bounds.amplitude_max)),
+            "width_min_nm": _round_sig(float(param_bounds.width_min_nm)),
+            "width_max_nm": _round_sig(float(param_bounds.width_max_nm)),
+            "chassis_usable_mm": _round_sig(float(param_bounds.chassis_usable_mm)),
+        },
+        "initial_params": _serialize_combiner_params(initial_params),
+        "final_params": _serialize_combiner_params(final_params),
+        "initial_merit": _serialize_merit_breakdown(initial_breakdown),
+        "final_merit": _serialize_merit_breakdown(final_breakdown),
+        "loss_history": [_round_sig(v) for v in loss_history],
+    }
+
+    path = run_dir / "optimization_report.json"
+    path.write_text(json.dumps(report, indent=2))
+    return path
