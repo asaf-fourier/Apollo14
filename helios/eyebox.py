@@ -10,7 +10,7 @@ import jax.numpy as jnp
 
 from apollo14.geometry import planar_grid_points
 from apollo14.trace import trace_rays
-from apollo14.binning import bin_hits_to_nearest
+from apollo14.binning import bin_hits_to_nearest, bin_hits_soft
 
 from helios.merit import DEFAULT_WAVELENGTHS
 
@@ -25,34 +25,32 @@ def eyebox_grid_points(center, normal, radius, nx, ny):
 # ── Response computation ────────────────────────────────────────────────────
 
 def _trace_branch_over_fov(route, projector, eyebox_points, wavelength,
-                           directions):
+                           directions, sigma=None):
     """Trace one branch route across all FOV directions via vmap.
 
-    Returns ``(S, A)`` binned intensity at each eyebox sample for each
+    Returns ``(A, S)`` binned intensity at each eyebox sample for each
     FOV direction.
     """
     def per_direction(direction):
         ray = projector.generate_rays(direction=direction,
                                       wavelength=wavelength)
         traced = trace_rays(route, ray, wavelength=wavelength)
+        if sigma is not None:
+            return bin_hits_soft(traced, eyebox_points, sigma)
         return bin_hits_to_nearest(traced, eyebox_points, stop_grad=True)
 
-    return jax.vmap(per_direction)(directions)  # (A, S) → transpose below
+    return jax.vmap(per_direction)(directions)  # (A, S)
 
 
 def compute_eyebox_response(routes_per_wavelength, projector,
                             fov_grid, eyebox_points,
-                            wavelengths=None):
+                            wavelengths=None, sigma=None):
     """Compute intensity at each eyebox sample for each FOV angle and wavelength.
 
     For each FOV direction in ``fov_grid``, traces a dense beam of rays
     from the projector through every pupil-terminated branch route,
-    binning hits to the nearest eyebox grid point. Gradients flow
-    through intensity values; spatial assignment is fixed
-    (``stop_gradient`` on argmin).
-
-    FOV directions are vectorized with ``jax.vmap`` for fast compilation
-    and execution — one compiled kernel per (wavelength, branch) pair.
+    binning hits to eyebox grid points. FOV directions are vectorized
+    with ``jax.vmap`` — one compiled kernel per (wavelength, branch).
 
     Args:
         routes_per_wavelength: ``(n_wavelengths, n_branches)`` list of
@@ -67,6 +65,11 @@ def compute_eyebox_response(routes_per_wavelength, projector,
         eyebox_points: (S, 3) sample points on the eyebox
         wavelengths: ``(n_wavelengths,)`` trace wavelengths. Defaults to
             :data:`DEFAULT_WAVELENGTHS`.
+        sigma: Gaussian kernel width for soft binning. When ``None``
+            (default), uses hard nearest-neighbor binning with
+            ``stop_gradient`` on spatial assignment. When set, gradients
+            flow through ray positions, enabling optimization of mirror
+            spacings.
 
     Returns:
         response: (S, A, n_wavelengths) intensity per sample, per angle,
@@ -88,7 +91,7 @@ def compute_eyebox_response(routes_per_wavelength, projector,
         for route in branch_routes:
             binned = binned + _trace_branch_over_fov(
                 route, projector, eyebox_points, trace_wavelength,
-                directions)  # (A, S)
+                directions, sigma=sigma)  # (A, S)
         wavelength_responses.append(binned.T)  # (S, A)
 
     response = jnp.stack(wavelength_responses, axis=-1)  # (S, A, n_wl)

@@ -51,6 +51,33 @@ def bin_hits_to_nearest(trace_result: TraceResult, grid_points, stop_grad=True):
     return jnp.sum(weighted, axis=0)                        # (S,)
 
 
+def bin_hits_soft(trace_result: TraceResult, grid_points, sigma):
+    """Soft Gaussian-kernel binning — fully differentiable w.r.t. ray positions.
+
+    Each ray distributes its intensity to all grid points with weights
+    proportional to ``exp(-dist² / (2·sigma²))``, normalized so the
+    weights sum to 1 per ray. Gradients flow through both intensity
+    and spatial position, enabling optimization of mirror spacings.
+
+    Args:
+        trace_result: TraceResult with leading batch dim (R, ...).
+        grid_points: (S, 3) target grid positions.
+        sigma: Gaussian kernel width. Should be ~0.5× the grid spacing
+            for smooth gradients without excessive blurring.
+
+    Returns:
+        binned: (S,) total intensity at each grid point.
+    """
+    pts_flat, ints_flat, valid_flat = _ray_final(trace_result)
+
+    delta = pts_flat[:, None, :] - grid_points[None, :, :]   # (R, S, 3)
+    dist_sq = jnp.sum(delta ** 2, axis=-1)                    # (R, S)
+    weights = jax.nn.softmax(-dist_sq / (2.0 * sigma ** 2), axis=-1)  # (R, S)
+    weighted = jnp.where(valid_flat[:, None],
+                         ints_flat[:, None] * weights, 0.0)
+    return jnp.sum(weighted, axis=0)                           # (S,)
+
+
 class PupilGrid(NamedTuple):
     """Precomputed pupil-plane binning grid.
 

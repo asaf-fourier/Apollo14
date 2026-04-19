@@ -16,18 +16,18 @@ from apollo14.system import OpticalSystem
 from apollo14.units import nm
 
 
-# ── Typical microLED peak wavelengths ─────────────────────────────────────────
+# ── PlayNitride microLED peak wavelengths ─────────────────────────────────────
 
-LED_RED = 630.0 * nm
-LED_GREEN = 525.0 * nm
-LED_BLUE = 460.0 * nm
+LED_RED = 627.0 * nm
+LED_GREEN = 545.0 * nm
+LED_BLUE = 446.0 * nm
 
 DEFAULT_WAVELENGTHS = jnp.array([LED_RED, LED_GREEN, LED_BLUE])
 
 # D65 relative power at those wavelengths (from CIE D65 standard illuminant).
 # These are the ratios the projector must produce for white appearance.
 # Normalized so they sum to 1.
-_D65_RAW = jnp.array([78.0, 107.0, 82.0])  # approximate D65 at 630/525/460 nm
+_D65_RAW = jnp.array([81.8, 101.0, 104.0])  # D65 at 627/545/446 nm
 D65_WEIGHTS = _D65_RAW / _D65_RAW.sum()
 
 
