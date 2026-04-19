@@ -169,3 +169,59 @@ def test_scan_center_matches_base():
     dirs, _ = scan_directions(base_dir, x_fov=0.2, y_fov=0.2, num_x=3, num_y=3)
     center_dir = dirs[1, 1]  # middle of 3x3 grid
     assert jnp.allclose(center_dir, base_dir, atol=1e-5)
+
+
+# ── Spectrum normalization ────────────────────────────────────────────────
+
+
+def test_normalize_spectrum_peak_is_one():
+    wls = jnp.array([400.0, 500.0, 600.0]) * nm
+    rad = jnp.array([2.0, 10.0, 3.0])
+    normalized_rad = rad / rad.max()
+    proj = Projector.uniform(
+        position=jnp.array([0.0, 10.0, 0.0]),
+        direction=jnp.array([0.0, -1.0, 0.0]),
+        beam_width=2.0, beam_height=2.0, nx=3, ny=3,
+        spectrum=(wls, normalized_rad),
+    )
+    ray = proj.generate_rays(wavelength=500.0 * nm)
+    assert jnp.allclose(ray.intensity, 1.0)
+
+
+def test_normalize_spectrum_preserves_shape():
+    wls = jnp.array([400.0, 500.0, 600.0]) * nm
+    rad = jnp.array([2.0, 10.0, 3.0])
+    normalized_rad = rad / rad.max()
+    proj = Projector.uniform(
+        position=jnp.array([0.0, 10.0, 0.0]),
+        direction=jnp.array([0.0, -1.0, 0.0]),
+        beam_width=2.0, beam_height=2.0, nx=2, ny=2,
+        spectrum=(wls, normalized_rad),
+    )
+    ray_peak = proj.generate_rays(wavelength=500.0 * nm)
+    ray_off = proj.generate_rays(wavelength=400.0 * nm)
+    ratio = float(ray_off.intensity[0] / ray_peak.intensity[0])
+    assert jnp.isclose(ratio, 2.0 / 10.0, atol=1e-5)
+
+
+def test_normalized_channels_equal_peak_intensity():
+    """Three projectors with different raw spectra, each peak-normalized,
+    should produce the same intensity at their respective peak wavelengths."""
+    spectra = [
+        (jnp.array([600.0, 630.0, 660.0]) * nm, jnp.array([0.5, 8.0, 0.3])),
+        (jnp.array([500.0, 525.0, 550.0]) * nm, jnp.array([0.2, 1.5, 0.1])),
+        (jnp.array([440.0, 460.0, 480.0]) * nm, jnp.array([0.1, 2.0, 0.4])),
+    ]
+    peak_intensities = []
+    for wls, rad in spectra:
+        normalized = rad / rad.max()
+        peak_wl = wls[jnp.argmax(rad)]
+        proj = Projector.uniform(
+            position=jnp.array([0.0, 10.0, 0.0]),
+            direction=jnp.array([0.0, -1.0, 0.0]),
+            beam_width=2.0, beam_height=2.0, nx=2, ny=2,
+            spectrum=(wls, normalized),
+        )
+        ray = proj.generate_rays(wavelength=peak_wl)
+        peak_intensities.append(float(ray.intensity[0]))
+    assert jnp.allclose(jnp.array(peak_intensities), 1.0)
