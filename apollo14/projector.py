@@ -87,6 +87,26 @@ class Projector:
             spectrum=(wls, rad),
         )
 
+    def spectral_band(self, threshold: float = 0.05) -> Tuple[float, float]:
+        """Wavelength range where normalized spectral intensity >= ``threshold``.
+
+        Returns ``(wl_min, wl_max)`` in internal length units. The spectrum
+        is normalized to its peak before thresholding, so ``threshold=0.05``
+        finds the band where intensity is at least 5% of peak.
+
+        Raises ``ValueError`` if no spectrum is set.
+        """
+        if self.spectrum is None:
+            raise ValueError("No spectrum set on this projector")
+        wavelengths, radiance = self.spectrum
+        normalized = radiance / radiance.max()
+        above = normalized >= threshold
+        indices = jnp.where(above, jnp.arange(len(wavelengths)), len(wavelengths))
+        first = int(jnp.min(indices))
+        indices_rev = jnp.where(above, jnp.arange(len(wavelengths)), -1)
+        last = int(jnp.max(indices_rev))
+        return float(wavelengths[first]), float(wavelengths[last])
+
     def _compute_basis(self, direction=None):
         """Compute the beam cross-section basis vectors for a given direction."""
         d = normalize(direction if direction is not None else self.direction)
@@ -188,6 +208,30 @@ class PlayNitrideLed(Projector):
             nx=nx, ny=ny,
             falloff_x=falloff_x, falloff_y=falloff_y,
             spectrum=(wls, rad / rad.max()),
+        )
+
+    @classmethod
+    def create_broadband(cls, position, direction, beam_width, beam_height,
+                         nx: int, ny: int,
+                         falloff_x: float = 0.0, falloff_y: float = 0.0):
+        """Combined R+G+B spectrum, peak-normalized.
+
+        Sums the three LED channels and normalizes to a peak of 1.0,
+        giving a single projector whose spectral shape represents the
+        full emission of the micro-LED array.
+        """
+        wls_r, rad_r = load_spectrum_csv(_PLAYNITRIDE_CSV, column="R")
+        _,     rad_g = load_spectrum_csv(_PLAYNITRIDE_CSV, column="G")
+        _,     rad_b = load_spectrum_csv(_PLAYNITRIDE_CSV, column="B")
+        combined = rad_r / rad_r.max() + rad_g / rad_g.max() + rad_b / rad_b.max()
+        return cls(
+            position=position,
+            direction=normalize(direction),
+            beam_width=beam_width,
+            beam_height=beam_height,
+            nx=nx, ny=ny,
+            falloff_x=falloff_x, falloff_y=falloff_y,
+            spectrum=(wls_r, combined),
         )
 
 

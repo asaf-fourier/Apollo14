@@ -30,7 +30,7 @@ from apollo14.projector import PlayNitrideLed, FovGrid
 from helios.combiner_params import (
     CombinerParams, ParamBounds, build_parametrized_system, NUM_MIRRORS,
 )
-from helios.merit import build_combiner_pupil_routes, DEFAULT_WAVELENGTHS
+from helios.merit import build_combiner_pupil_routes, d65_weights_at
 from helios.eyebox import (
     compute_eyebox_response, eyebox_grid_points,
 )
@@ -50,37 +50,37 @@ EYEBOX_NX, EYEBOX_NY = 7, 7      # 49 cells, ~1.4 mm each
 X_FOV = 7.0 * deg
 Y_FOV = 7.0 * deg
 
-# ── RGB projectors (PlayNitride micro-LEDs, one per color) ─────────────────
+# ── Broadband projector (PlayNitride micro-LED, combined R+G+B) ───────────
 
-PROJECTOR_NX, PROJECTOR_NY = 7, 7
-BLUE_FALLOFF = 0.02 / (6.0 * deg)
+PROJECTOR_NX, PROJECTOR_NY = 14, 14
 
-PROJECTORS = [
-    PlayNitrideLed.create(
-        position=DEFAULT_LIGHT_POSITION, direction=DEFAULT_LIGHT_DIRECTION,
-        beam_width=10.0 * mm, beam_height=2.0 * mm,
-        nx=PROJECTOR_NX, ny=PROJECTOR_NY, color="R",
-    ),
-    PlayNitrideLed.create(
-        position=DEFAULT_LIGHT_POSITION, direction=DEFAULT_LIGHT_DIRECTION,
-        beam_width=10.0 * mm, beam_height=2.0 * mm,
-        nx=PROJECTOR_NX, ny=PROJECTOR_NY, color="G",
-    ),
-    PlayNitrideLed.create(
-        position=DEFAULT_LIGHT_POSITION, direction=DEFAULT_LIGHT_DIRECTION,
-        beam_width=10.0 * mm, beam_height=2.0 * mm,
-        nx=PROJECTOR_NX, ny=PROJECTOR_NY, color="B",
-        falloff_x=BLUE_FALLOFF, falloff_y=BLUE_FALLOFF,
-    ),
-]
+PROJECTOR = PlayNitrideLed.create_broadband(
+    position=DEFAULT_LIGHT_POSITION, direction=DEFAULT_LIGHT_DIRECTION,
+    beam_width=10.0 * mm, beam_height=2.0 * mm,
+    nx=PROJECTOR_NX, ny=PROJECTOR_NY,
+)
+
+# ── Wavelength sampling (spectral band above 5% of peak) ─────────────────
+
+SPECTRAL_THRESHOLD = 0.05
+SPECTRAL_SAMPLES = 10
+
+# _wl_min, _wl_max = PROJECTOR.spectral_band(threshold=SPECTRAL_THRESHOLD)
+_wl_min, _wl_max = 400*nm, 700*nm
+TRACE_WAVELENGTHS = jnp.linspace(_wl_min, _wl_max, SPECTRAL_SAMPLES)
+
+# ── Continuous D65 weights at the traced wavelengths ──────────────────────
+
+D65_TRACE_WEIGHTS = d65_weights_at(TRACE_WAVELENGTHS)
 
 # ── Merit & tracer configuration ────────────────────────────────────────────
 
-FOV_GRID = FovGrid(DEFAULT_LIGHT_DIRECTION, X_FOV, Y_FOV, num_x=7, num_y=7)
+FOV_GRID = FovGrid(DEFAULT_LIGHT_DIRECTION, X_FOV, Y_FOV, num_x=14, num_y=14)
 
 merit_cfg_phase1 = PupilMeritConfig(
     threshold_relative=0.004,
     cap_relative=0.02,
+    d65_weights=D65_TRACE_WEIGHTS,
     weight_shape=0.2,
     weight_coverage=5.0,
     weight_warmup=1.0,
@@ -92,6 +92,7 @@ merit_cfg_phase1 = PupilMeritConfig(
 merit_cfg_phase2 = PupilMeritConfig(
     threshold_relative=0.004,
     cap_relative=0.02,
+    d65_weights=D65_TRACE_WEIGHTS,
     weight_shape=1.0,
     weight_coverage=3.0,
     weight_warmup=0.5,
@@ -104,11 +105,13 @@ bounds = ParamBounds()
 
 
 # ── Reference input flux ────────────────────────────────────────────────────
-# Per-channel on-axis flux.  With peak-normalized spectra each channel
-# delivers N_rays at its peak wavelength.  Thresholds are relative to
-# what one color channel can deliver, not the total across R+G+B.
+# Total flux per direction = N_rays × sum of spectral weights across all
+# traced wavelengths.
 
-INPUT_FLUX = float(PROJECTOR_NX * PROJECTOR_NY)
+NUM_RAYS = PROJECTOR_NX * PROJECTOR_NY
+_spec_wls, _spec_rad = PROJECTOR.spectrum
+_spectral_weights = jnp.interp(TRACE_WAVELENGTHS, _spec_wls, _spec_rad)
+INPUT_FLUX = float(NUM_RAYS * _spectral_weights.sum())
 
 # ── Build the pupil cell grid and mask for the target region ────────────────
 # We build the grid from the pupil element in the reference system. The
@@ -127,36 +130,36 @@ BINNING_SIGMA = 0.8 * mm   # ~half grid spacing for smooth spatial gradients
 # ── Loss function ───────────────────────────────────────────────────────────
 
 
-def _compute_rgb_response(params: CombinerParams):
-    """Trace each wavelength with its own projector and stack responses."""
+def _compute_spectral_response(params: CombinerParams):
+    """Trace the broadband projector at each wavelength sample."""
     system = build_parametrized_system(params)
     routes_per_wavelength = build_combiner_pupil_routes(
-        system, DEFAULT_WAVELENGTHS, num_mirrors=NUM_MIRRORS,
+        system, TRACE_WAVELENGTHS, num_mirrors=NUM_MIRRORS,
     )
-    channel_responses = []
-    for wl_idx, projector in enumerate(PROJECTORS):
+    wavelength_responses = []
+    for wl_idx in range(SPECTRAL_SAMPLES):
         single_response = compute_eyebox_response(
-            [routes_per_wavelength[wl_idx]], projector,
+            [routes_per_wavelength[wl_idx]], PROJECTOR,
             FOV_GRID, EYEBOX_POINTS,
-            wavelengths=[DEFAULT_WAVELENGTHS[wl_idx]],
+            wavelengths=[TRACE_WAVELENGTHS[wl_idx]],
             sigma=BINNING_SIGMA,
         )  # (S, A, 1)
-        channel_responses.append(single_response[..., 0])  # (S, A)
-    return jnp.stack(channel_responses, axis=-1)  # (S, A, 3)
+        wavelength_responses.append(single_response[..., 0])  # (S, A)
+    return jnp.stack(wavelength_responses, axis=-1)  # (S, A, N)
 
 
 def loss_fn_phase1(params: CombinerParams) -> jnp.ndarray:
-    response = _compute_rgb_response(params)
+    response = _compute_spectral_response(params)
     return pupil_merit(response, INPUT_FLUX, merit_cfg_phase1, cell_mask=CELL_MASK)
 
 
 def loss_fn_phase2(params: CombinerParams) -> jnp.ndarray:
-    response = _compute_rgb_response(params)
+    response = _compute_spectral_response(params)
     return pupil_merit(response, INPUT_FLUX, merit_cfg_phase2, cell_mask=CELL_MASK)
 
 
 def breakdown_fn(params: CombinerParams, merit_cfg: PupilMeritConfig) -> dict:
-    response = _compute_rgb_response(params)
+    response = _compute_spectral_response(params)
     return merit_breakdown(response, INPUT_FLUX, merit_cfg, cell_mask=CELL_MASK)
 
 
@@ -196,6 +199,8 @@ def main():
           f"{EYEBOX_NX}×{EYEBOX_NY} cells")
     print(f"FOV:       ±{X_FOV/deg:.1f}° × ±{Y_FOV/deg:.1f}°, "
           f"{FOV_GRID.num_x}×{FOV_GRID.num_y} samples")
+    print(f"Spectrum:  {SPECTRAL_SAMPLES} samples/channel, "
+          f">{SPECTRAL_THRESHOLD:.0%} of peak")
     print(f"I_in:      {INPUT_FLUX:.1f}  "
           f"(threshold_relative={merit_cfg_phase1.threshold_relative})")
 
@@ -240,11 +245,26 @@ def main():
         print(f"  m{mirror_idx}: {float(mirror_width[0])*1e6:.1f}  "
               f"{float(mirror_width[1])*1e6:.1f}  {float(mirror_width[2])*1e6:.1f}")
 
+    response = _compute_spectral_response(params)
+    mean_over_fov = response.mean(axis=1)          # (S, 3)
+    total_brightness = mean_over_fov.sum(axis=-1)  # (S,)
+    relative_brightness = total_brightness / INPUT_FLUX
+
+    threshold = merit_cfg_phase1.threshold_relative
+    grid = relative_brightness.reshape(EYEBOX_NY, EYEBOX_NX)
+    print(f"\nEyebox brightness map (relative to input flux, threshold={threshold}):")
+    for row in grid:
+        print("  " + "  ".join(f"{float(v):.4f}" for v in row))
+    active_cells = int((relative_brightness >= threshold).sum())
+    print(f"Active cells: {active_cells}/{relative_brightness.shape[0]}  "
+          f"min={float(relative_brightness.min()):.5f}  "
+          f"max={float(relative_brightness.max()):.5f}")
+
     final_system = build_parametrized_system(params)
     report_path = save_optimization_report(
         "examples/reports/optimize_pupil",
         system=final_system,
-        projectors=PROJECTORS,
+        projectors=[PROJECTOR],
         fov_grid=FOV_GRID,
         merit_config=merit_cfg_phase2,
         optimizer_config={
@@ -278,7 +298,6 @@ def main():
     )
     print(f"\nSaved optimization report: {report_path}")
 
-    response = _compute_rgb_response(params)
     pupil_x_mm = jnp.linspace(-EYEBOX_RADIUS, EYEBOX_RADIUS, EYEBOX_NX)
     pupil_y_mm = jnp.linspace(-EYEBOX_RADIUS, EYEBOX_RADIUS, EYEBOX_NY)
     scan_cfg = ScanConfig(
@@ -288,12 +307,12 @@ def main():
     )
     run_dir = save_run(
         "examples/reports/optimize_pupil",
-        final_system, PROJECTORS[0], scan_cfg,
+        final_system, PROJECTOR, scan_cfg,
         response=response,
         pupil_x_mm=pupil_x_mm,
         pupil_y_mm=pupil_y_mm,
         scan_angles=FOV_GRID.angles_grid,
-        wavelengths_nm=DEFAULT_WAVELENGTHS / nm,
+        wavelengths_nm=TRACE_WAVELENGTHS / nm,
     )
     html_path = render_report(run_dir)
     print(f"Saved run report: {html_path}")

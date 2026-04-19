@@ -151,7 +151,7 @@ class ParamBounds:
     spacing_max_mm: float = 3.0
     amplitude_min: float = 0.005
     amplitude_max: float = 0.40
-    width_min_nm: float = 3.0
+    width_min_nm: float = 10.0
     width_max_nm: float = 150.0
     chassis_usable_mm: float = 18.0  # margin below 20 mm
 

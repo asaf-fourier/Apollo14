@@ -212,7 +212,8 @@ def pupil_merit(
     if config is None:
         config = PupilMeritConfig()
 
-    d65_weights = config.d65_weights.reshape(1, 1, 3)              # (1,1,3)
+    num_channels = response.shape[-1]
+    d65_weights = config.d65_weights.reshape(1, 1, num_channels)  # (1,1,C)
 
     # Per-cell totals and brightness
     brightness_per_angle = jnp.sum(response, axis=-1)             # (S, A)
@@ -299,7 +300,8 @@ def merit_breakdown(
     if config is None:
         config = PupilMeritConfig()
 
-    d65_weights = config.d65_weights.reshape(1, 1, 3)
+    num_channels = response.shape[-1]
+    d65_weights = config.d65_weights.reshape(1, 1, num_channels)
     brightness_per_angle = jnp.sum(response, axis=-1)
     mean_brightness = jnp.mean(brightness_per_angle, axis=-1)
 
