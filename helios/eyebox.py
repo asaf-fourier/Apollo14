@@ -24,8 +24,8 @@ def eyebox_grid_points(center, normal, radius, nx, ny):
 
 # ── Response computation ────────────────────────────────────────────────────
 
-def _trace_branch_over_fov(route, projector, eyebox_points, wavelength,
-                           directions, sigma=None):
+def trace_branch_over_fov(route, projector, eyebox_points, wavelength,
+                          directions, sigma=None):
     """Trace one branch route across all FOV directions via vmap.
 
     Returns ``(A, S)`` binned intensity at each eyebox sample for each
@@ -89,7 +89,7 @@ def compute_eyebox_response(routes_per_wavelength, projector,
         trace_wavelength = wavelengths[wl_idx]
         binned = jnp.zeros((directions.shape[0], eyebox_points.shape[0]))
         for route in branch_routes:
-            binned = binned + _trace_branch_over_fov(
+            binned = binned + trace_branch_over_fov(
                 route, projector, eyebox_points, trace_wavelength,
                 directions, sigma=sigma)  # (A, S)
         wavelength_responses.append(binned.T)  # (S, A)

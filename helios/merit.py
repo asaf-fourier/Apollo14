@@ -69,6 +69,31 @@ def d65_weights_at(wavelengths: jnp.ndarray) -> jnp.ndarray:
 
 # ── Route construction helper ────────────────────────────────────────────────
 
+def build_combiner_branch_routes(system: OpticalSystem,
+                                 num_mirrors: int = 6,
+                                 pupil_name: str = "pupil",
+                                 chassis_name: str = "chassis",
+                                 ) -> list[Route]:
+    """Build unprepared branch routes that terminate on the pupil.
+
+    Returns ``num_mirrors`` routes (one per mirror branch) with
+    ``MaterialData`` still in ``FaceSeg`` fields — call
+    ``prepare_route(r, wavelength)`` before tracing.
+    """
+    main_path: list = [
+        "aperture",
+        (chassis_name, "back"),
+    ]
+    main_path.extend(f"mirror_{i}" for i in range(num_mirrors))
+    main_path.append((chassis_name, "front"))
+
+    tail = [(chassis_name, "top"), absorb(pupil_name)]
+    return [
+        build_route(system, branch_path(main_path, at=f"mirror_{i}", tail=tail))
+        for i in range(num_mirrors)
+    ]
+
+
 def build_combiner_pupil_routes(system: OpticalSystem,
                                 wavelengths: Sequence[float],
                                 num_mirrors: int = 6,
@@ -81,18 +106,8 @@ def build_combiner_pupil_routes(system: OpticalSystem,
     pupil), wavelength-resolved once per color. The returned list is shaped
     ``(n_wavelengths, num_mirrors)``.
     """
-    main_path: list = [
-        "aperture",
-        (chassis_name, "back"),
-    ]
-    main_path.extend(f"mirror_{i}" for i in range(num_mirrors))
-    main_path.append((chassis_name, "front"))
-
-    tail = [(chassis_name, "top"), absorb(pupil_name)]
-    branch_routes = [
-        build_route(system, branch_path(main_path, at=f"mirror_{i}", tail=tail))
-        for i in range(num_mirrors)
-    ]
+    branch_routes = build_combiner_branch_routes(
+        system, num_mirrors, pupil_name, chassis_name)
 
     return [
         [prepare_route(r, wl) for r in branch_routes]

@@ -4,15 +4,14 @@ Reads ``manifest.json`` + ``response.npz`` from a run directory and writes
 a single self-contained ``report.html`` containing:
 
   1. Header (run_id, git sha, timestamp)
-  2. Per-color pupil heatmaps (R/G/B averaged over FOV)
-  3. White-balance error map (distance from D65 per pupil cell)
+  2. Pupil total-intensity heatmap (summed over wavelengths, FOV-averaged)
+  3. White-balance error map (spectral distance from D65 per pupil cell)
   4. Global FOV maps (pupil-averaged + worst-cell)
   5. Per-cell FOV heatmap with an eyebox-cell slider
 
-The response is ``(S, A, 3)`` — samples × angles × colors — where ``S``
+The response is ``(S, A, C)`` — samples × angles × channels — where ``S``
 reshapes to the pupil grid ``(ny, nx)`` and ``A`` reshapes to the FOV
-grid ``(n_fov_y, n_fov_x)``. All figures are built from primitives that
-take only a 2D array + axes, so they stay reusable outside this report.
+grid ``(n_fov_y, n_fov_x)``. ``C`` may be 3 (R/G/B) or N (spectral).
 """
 
 from __future__ import annotations
@@ -23,7 +22,8 @@ from pathlib import Path
 import numpy as np
 import plotly.graph_objects as go
 
-from helios.merit import D65_WEIGHTS
+from helios.merit import D65_WEIGHTS, d65_weights_at
+from apollo14.units import nm
 
 
 # ── Primitives (fully generic) ──────────────────────────────────────────────
@@ -36,11 +36,7 @@ def fov_heatmap_figure(
     zmin: float | None = None,
     zmax: float | None = None,
 ) -> go.Figure:
-    """Heatmap on a FOV angular grid.
-
-    ``intensity`` shape ``(len(ay_deg), len(ax_deg))``. No knowledge of
-    projectors or pupils — just "value per direction."
-    """
+    """Heatmap on a FOV angular grid."""
     fig = go.Figure(go.Heatmap(
         z=intensity,
         x=ax_deg,
@@ -93,7 +89,7 @@ def pupil_heatmap_figure(
 # ── Composers ────────────────────────────────────────────────────────────────
 
 def _reshape_pupil(response: np.ndarray, ny: int, nx: int) -> np.ndarray:
-    """(S, A, 3) → (ny, nx, A, 3)."""
+    """(S, A, C) → (ny, nx, A, C)."""
     S, A, C = response.shape
     if S != ny * nx:
         raise ValueError(f"S={S} does not match pupil grid {ny}x{nx}")
@@ -101,58 +97,55 @@ def _reshape_pupil(response: np.ndarray, ny: int, nx: int) -> np.ndarray:
 
 
 def _reshape_fov(response: np.ndarray, n_fov_y: int, n_fov_x: int) -> np.ndarray:
-    """(S, A, 3) → (S, n_fov_y, n_fov_x, 3)."""
+    """(S, A, C) → (S, n_fov_y, n_fov_x, C)."""
     S, A, C = response.shape
     if A != n_fov_y * n_fov_x:
         raise ValueError(f"A={A} does not match FOV grid {n_fov_y}x{n_fov_x}")
     return response.reshape(S, n_fov_y, n_fov_x, C)
 
 
-def pupil_rgb_figures(
+def _get_d65(wavelengths_nm: np.ndarray | None) -> np.ndarray:
+    """Return normalized D65 weights matching the response channels."""
+    if wavelengths_nm is not None and len(wavelengths_nm) != 3:
+        import jax.numpy as jnp
+        wls = jnp.asarray(wavelengths_nm) * nm
+        d65 = np.asarray(d65_weights_at(wls))
+    else:
+        d65 = np.asarray(D65_WEIGHTS)
+    return d65 / d65.sum()
+
+
+def pupil_total_figure(
     response: np.ndarray,
     pupil_x_mm: np.ndarray,
     pupil_y_mm: np.ndarray,
-) -> list[go.Figure]:
-    """Three pupil heatmaps — one per color — averaged over FOV angles."""
+) -> go.Figure:
+    """Pupil heatmap — total intensity summed over all channels, FOV-averaged."""
     ny, nx = len(pupil_y_mm), len(pupil_x_mm)
-    grid = _reshape_pupil(response, ny, nx)       # (ny, nx, A, 3)
-    avg = grid.mean(axis=2)                       # (ny, nx, 3)
+    grid = _reshape_pupil(response, ny, nx)       # (ny, nx, A, C)
+    avg = grid.mean(axis=2).sum(axis=-1)          # (ny, nx)
 
-    colorbar_title = "avg intensity"
-    figs = []
-    for ci, (name, scale) in enumerate([
-        ("R", "Reds"), ("G", "Greens"), ("B", "Blues"),
-    ]):
-        figs.append(pupil_heatmap_figure(
-            pupil_x_mm, pupil_y_mm, avg[:, :, ci],
-            title=f"Pupil — {name} (FOV-averaged)",
-            colorscale=scale,
-            colorbar_title=colorbar_title,
-        ))
-    return figs
+    return pupil_heatmap_figure(
+        pupil_x_mm, pupil_y_mm, avg,
+        title="Pupil — total intensity (FOV-averaged)",
+        colorbar_title="avg intensity",
+    )
 
 
 def white_balance_figure(
     response: np.ndarray,
     pupil_x_mm: np.ndarray,
     pupil_y_mm: np.ndarray,
-    d65_weights: np.ndarray | None = None,
+    wavelengths_nm: np.ndarray | None = None,
 ) -> go.Figure:
-    """Per-cell distance from D65 ratio (FOV-averaged, color-normalized).
-
-    For each pupil cell, compute the FOV-averaged per-color intensity,
-    normalize to a unit-sum distribution, and measure L2 distance to the
-    D65 target distribution. 0 = perfect white balance.
-    """
-    if d65_weights is None:
-        d65_weights = np.asarray(D65_WEIGHTS)
-    d65 = d65_weights / d65_weights.sum()
+    """Per-cell distance from D65 spectral distribution (FOV-averaged)."""
+    d65 = _get_d65(wavelengths_nm)
 
     ny, nx = len(pupil_y_mm), len(pupil_x_mm)
-    grid = _reshape_pupil(response, ny, nx)       # (ny, nx, A, 3)
-    avg = grid.mean(axis=2)                       # (ny, nx, 3)
+    grid = _reshape_pupil(response, ny, nx)       # (ny, nx, A, C)
+    avg = grid.mean(axis=2)                       # (ny, nx, C)
     total = avg.sum(axis=-1, keepdims=True) + 1e-12
-    ratios = avg / total                          # (ny, nx, 3)
+    ratios = avg / total                          # (ny, nx, C)
     err = np.linalg.norm(ratios - d65[None, None, :], axis=-1)  # (ny, nx)
 
     return pupil_heatmap_figure(
@@ -166,31 +159,28 @@ def white_balance_figure(
 def fov_global_figures(
     response: np.ndarray,
     scan_angles: np.ndarray,
+    wavelengths_nm: np.ndarray | None = None,
 ) -> list[go.Figure]:
-    """Two global FOV maps: pupil-averaged and worst-cell.
+    """Two global FOV maps: pupil-averaged and worst-cell."""
+    d65 = _get_d65(wavelengths_nm)
 
-    - Averaged: mean intensity across pupil samples and colors, per angle.
-    - Worst: worst pupil cell per angle (D65-normalized, worst color).
-    """
     n_fov_y, n_fov_x = scan_angles.shape[:2]
     ax_deg = np.degrees(scan_angles[0, :, 0])
     ay_deg = np.degrees(scan_angles[:, 0, 1])
 
-    reshaped = _reshape_fov(response, n_fov_y, n_fov_x)   # (S, ny_f, nx_f, 3)
+    reshaped = _reshape_fov(response, n_fov_y, n_fov_x)   # (S, ny_f, nx_f, C)
 
     avg = reshaped.sum(axis=-1).mean(axis=0)              # (ny_f, nx_f)
 
-    d65 = np.asarray(D65_WEIGHTS)
-    d65 = d65 / d65.sum()
     normed = reshaped / (d65[None, None, None, :] + 1e-12)
-    worst_color = normed.min(axis=-1)                     # (S, ny_f, nx_f)
-    worst_cell = worst_color.min(axis=0)                  # (ny_f, nx_f)
+    worst_channel = normed.min(axis=-1)                    # (S, ny_f, nx_f)
+    worst_cell = worst_channel.min(axis=0)                 # (ny_f, nx_f)
 
     return [
         fov_heatmap_figure(ax_deg, ay_deg, avg,
-                           title="FOV — pupil-averaged (sum of colors)"),
+                           title="FOV — pupil-averaged (sum of channels)"),
         fov_heatmap_figure(ax_deg, ay_deg, worst_cell,
-                           title="FOV — worst pupil cell (D65-normalized min color)"),
+                           title="FOV — worst pupil cell (D65-normalized min channel)"),
     ]
 
 
@@ -200,19 +190,14 @@ def per_cell_fov_figure(
     pupil_x_mm: np.ndarray,
     pupil_y_mm: np.ndarray,
 ) -> go.Figure:
-    """Per-cell FOV heatmap with a slider stepping through pupil cells.
-
-    Each slider frame shows one pupil cell's FOV intensity map (summed
-    over colors). Shared colorbar across cells so brightness is
-    comparable between cells.
-    """
+    """Per-cell FOV heatmap with a slider stepping through pupil cells."""
     n_fov_y, n_fov_x = scan_angles.shape[:2]
     ax_deg = np.degrees(scan_angles[0, :, 0])
     ay_deg = np.degrees(scan_angles[:, 0, 1])
     ny, nx = len(pupil_y_mm), len(pupil_x_mm)
 
-    pupil_grid = _reshape_pupil(response, ny, nx)         # (ny, nx, A, 3)
-    fov_grid = pupil_grid.reshape(ny, nx, n_fov_y, n_fov_x, 3)
+    pupil_grid = _reshape_pupil(response, ny, nx)         # (ny, nx, A, C)
+    fov_grid = pupil_grid.reshape(ny, nx, n_fov_y, n_fov_x, -1)
     per_cell = fov_grid.sum(axis=-1)                      # (ny, nx, ny_f, nx_f)
 
     zmax = float(per_cell.max())
@@ -268,15 +253,18 @@ def render_report(run_dir: Path | str) -> Path:
     pupil_x_mm = data["pupil_x_mm"]
     pupil_y_mm = data["pupil_y_mm"]
     scan_angles = data["scan_angles"]
+    wavelengths_nm = data.get("wavelengths_nm", None)
 
     figs: list[tuple[str, go.Figure]] = []
-    figs += [(f"pupil_{c}", f) for c, f in zip(
-        "rgb", pupil_rgb_figures(response, pupil_x_mm, pupil_y_mm))]
+    figs.append(("pupil_total",
+                 pupil_total_figure(response, pupil_x_mm, pupil_y_mm)))
     figs.append(("white_balance",
-                 white_balance_figure(response, pupil_x_mm, pupil_y_mm)))
+                 white_balance_figure(response, pupil_x_mm, pupil_y_mm,
+                                     wavelengths_nm=wavelengths_nm)))
     figs += [(n, f) for n, f in zip(
         ["fov_avg", "fov_worst"],
-        fov_global_figures(response, scan_angles))]
+        fov_global_figures(response, scan_angles,
+                           wavelengths_nm=wavelengths_nm))]
     figs.append(("per_cell_fov",
                  per_cell_fov_figure(response, scan_angles,
                                      pupil_x_mm, pupil_y_mm)))

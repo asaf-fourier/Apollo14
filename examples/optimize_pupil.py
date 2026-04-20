@@ -30,9 +30,10 @@ from apollo14.projector import PlayNitrideLed, FovGrid
 from helios.combiner_params import (
     CombinerParams, ParamBounds, build_parametrized_system, NUM_MIRRORS,
 )
-from helios.merit import build_combiner_pupil_routes, d65_weights_at
+from apollo14.trace import prepare_route
+from helios.merit import build_combiner_branch_routes, d65_weights_at
 from helios.eyebox import (
-    compute_eyebox_response, eyebox_grid_points,
+    trace_branch_over_fov, eyebox_grid_points,
 )
 from helios.pupil_merit import (
     PupilMeritConfig, pupil_merit, merit_breakdown,
@@ -63,7 +64,7 @@ PROJECTOR = PlayNitrideLed.create_broadband(
 # ── Wavelength sampling (spectral band above 5% of peak) ─────────────────
 
 SPECTRAL_THRESHOLD = 0.05
-SPECTRAL_SAMPLES = 10
+SPECTRAL_SAMPLES = 2
 
 # _wl_min, _wl_max = PROJECTOR.spectral_band(threshold=SPECTRAL_THRESHOLD)
 _wl_min, _wl_max = 400*nm, 700*nm
@@ -131,21 +132,24 @@ BINNING_SIGMA = 0.8 * mm   # ~half grid spacing for smooth spatial gradients
 
 
 def _compute_spectral_response(params: CombinerParams):
-    """Trace the broadband projector at each wavelength sample."""
+    """Trace the broadband projector at each wavelength, vmapped over wavelengths."""
     system = build_parametrized_system(params)
-    routes_per_wavelength = build_combiner_pupil_routes(
-        system, TRACE_WAVELENGTHS, num_mirrors=NUM_MIRRORS,
+    branch_routes = build_combiner_branch_routes(
+        system, num_mirrors=NUM_MIRRORS,
     )
-    wavelength_responses = []
-    for wl_idx in range(SPECTRAL_SAMPLES):
-        single_response = compute_eyebox_response(
-            [routes_per_wavelength[wl_idx]], PROJECTOR,
-            FOV_GRID, EYEBOX_POINTS,
-            wavelengths=[TRACE_WAVELENGTHS[wl_idx]],
-            sigma=BINNING_SIGMA,
-        )  # (S, A, 1)
-        wavelength_responses.append(single_response[..., 0])  # (S, A)
-    return jnp.stack(wavelength_responses, axis=-1)  # (S, A, N)
+    directions = FOV_GRID.flat_directions  # (A, 3)
+
+    def trace_one_wavelength(wavelength):
+        binned = jnp.zeros((directions.shape[0], EYEBOX_POINTS.shape[0]))
+        for route in branch_routes:
+            prepared = prepare_route(route, wavelength)
+            binned = binned + trace_branch_over_fov(
+                prepared, PROJECTOR, EYEBOX_POINTS, wavelength,
+                directions, sigma=BINNING_SIGMA)  # (A, S)
+        return binned.T  # (S, A)
+
+    all_responses = jax.vmap(trace_one_wavelength)(TRACE_WAVELENGTHS)  # (N, S, A)
+    return jnp.transpose(all_responses, (1, 2, 0))  # (S, A, N)
 
 
 def loss_fn_phase1(params: CombinerParams) -> jnp.ndarray:
