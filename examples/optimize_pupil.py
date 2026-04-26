@@ -82,13 +82,25 @@ D65_TRACE_WEIGHTS = d65_weights_at(TRACE_WAVELENGTHS)
 
 LUMINANCE_TRACE_WEIGHTS = photopic_luminance_weights(TRACE_WAVELENGTHS)
 
+# ── Per-cell brightness targets ─────────────────────────────────────────────
+# Fractions of input flux each of the 49 eyebox cells should receive.
+# With NUM_EYEBOX_CELLS=49: threshold 0.002 ≈ 9.8% of input flux reaching
+# the eyebox uniformly, cap 0.003 ≈ 14.7% — a ~50% headroom band lets the
+# optimizer find a uniform-ish solution without being whipsawed by an
+# equality-only constraint.
+
+NUM_EYEBOX_CELLS = EYEBOX_NX * EYEBOX_NY    # 49
+PER_CELL_THRESHOLD = 0.002
+PER_CELL_CAP = 0.003
+
+
 # ── Merit & tracer configuration ────────────────────────────────────────────
 
 FOV_GRID = FovGrid(DEFAULT_LIGHT_DIRECTION, X_FOV, Y_FOV, num_x=14, num_y=14)
 
 merit_cfg_phase1 = PupilMeritConfig(
-    threshold_relative=0.004,
-    cap_relative=0.02,
+    threshold_relative=PER_CELL_THRESHOLD,
+    cap_relative=PER_CELL_CAP,
     d65_weights=D65_TRACE_WEIGHTS,
     luminance_weights=LUMINANCE_TRACE_WEIGHTS,
     weight_shape=0.2,
@@ -100,8 +112,8 @@ merit_cfg_phase1 = PupilMeritConfig(
 )
 
 merit_cfg_phase2 = PupilMeritConfig(
-    threshold_relative=0.004,
-    cap_relative=0.02,
+    threshold_relative=PER_CELL_THRESHOLD,
+    cap_relative=PER_CELL_CAP,
     d65_weights=D65_TRACE_WEIGHTS,
     luminance_weights=LUMINANCE_TRACE_WEIGHTS,
     weight_shape=1.0,
