@@ -14,11 +14,36 @@ dependencies = [
 dev = [
     "pytest",
     "pytest-xdist",
+    "ruff",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v"
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+# E/W: pycodestyle, F: pyflakes, I: isort, B: bugbear, UP: pyupgrade,
+# N: pep8-naming, SIM: simplify, RUF: ruff-specific.
+select = ["E", "W", "F", "I", "B", "UP", "N", "SIM", "RUF"]
+ignore = [
+    "E501",   # line too long — line-length already set generously
+    "E741",   # ambiguous variable name (l, I, O) — physics uses i for iterator
+    "N803",   # argument should be lowercase — math notation (n1, n2) is clearer
+    "N806",   # variable should be lowercase — same reason
+    "B008",   # function call in default arg — used for jnp.array defaults
+    "SIM108", # use ternary — explicit if/else often clearer for physics
+    "RUF001", # ambiguous unicode in strings — math symbols (×, σ, β) are intentional
+    "RUF002", # ambiguous unicode in docstrings — same reason
+    "RUF003", # ambiguous unicode in comments — same reason
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]  # re-exports are the point
+"tests/*" = ["F401"]      # NamedTuple imports for isinstance fixtures
 
 [tool.hatch.build.targets.wheel]
 packages = ["apollo14", "helios"]
