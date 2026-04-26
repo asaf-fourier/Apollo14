@@ -35,6 +35,7 @@ from helios.merit import build_combiner_branch_routes, d65_weights_at
 from helios.eyebox import (
     trace_branch_over_fov, eyebox_grid_points,
 )
+from helios.photometry import luminance_weights as photopic_luminance_weights
 from helios.pupil_merit import (
     PupilMeritConfig, pupil_merit, merit_breakdown,
 )
@@ -64,15 +65,22 @@ PROJECTOR = PlayNitrideLed.create_broadband(
 # ── Wavelength sampling (spectral band above 5% of peak) ─────────────────
 
 SPECTRAL_THRESHOLD = 0.05
-SPECTRAL_SAMPLES = 2
+SPECTRAL_SAMPLES = 100
 
-# _wl_min, _wl_max = PROJECTOR.spectral_band(threshold=SPECTRAL_THRESHOLD)
-_wl_min, _wl_max = 400*nm, 700*nm
+_wl_min, _wl_max = PROJECTOR.spectral_band(threshold=SPECTRAL_THRESHOLD)
+# _wl_min, _wl_max = 400*nm, 700*nm
 TRACE_WAVELENGTHS = jnp.linspace(_wl_min, _wl_max, SPECTRAL_SAMPLES)
 
 # ── Continuous D65 weights at the traced wavelengths ──────────────────────
 
 D65_TRACE_WEIGHTS = d65_weights_at(TRACE_WAVELENGTHS)
+
+# ── Photopic V(λ)·Δλ·K_m weights at the traced wavelengths ─────────────────
+# Photometric "brightness" — blue at 446 nm counts ~3% of green at 545 nm
+# per watt. The merit's coverage / warm-up / cap thresholds become
+# perceptually meaningful instead of radiometric.
+
+LUMINANCE_TRACE_WEIGHTS = photopic_luminance_weights(TRACE_WAVELENGTHS)
 
 # ── Merit & tracer configuration ────────────────────────────────────────────
 
@@ -82,6 +90,7 @@ merit_cfg_phase1 = PupilMeritConfig(
     threshold_relative=0.004,
     cap_relative=0.02,
     d65_weights=D65_TRACE_WEIGHTS,
+    luminance_weights=LUMINANCE_TRACE_WEIGHTS,
     weight_shape=0.2,
     weight_coverage=5.0,
     weight_warmup=1.0,
@@ -94,6 +103,7 @@ merit_cfg_phase2 = PupilMeritConfig(
     threshold_relative=0.004,
     cap_relative=0.02,
     d65_weights=D65_TRACE_WEIGHTS,
+    luminance_weights=LUMINANCE_TRACE_WEIGHTS,
     weight_shape=1.0,
     weight_coverage=3.0,
     weight_warmup=0.5,
@@ -105,14 +115,15 @@ merit_cfg_phase2 = PupilMeritConfig(
 bounds = ParamBounds()
 
 
-# ── Reference input flux ────────────────────────────────────────────────────
-# Total flux per direction = N_rays × sum of spectral weights across all
-# traced wavelengths.
+# ── Reference input flux (photometric, matches luminance_weights) ──────────
+# One direction's emitted *luminous* flux summed across traced wavelengths:
+# N_rays × Σ_λ spectrum(λ) × V(λ) × Δλ × K_m. Threshold/cap percentages
+# are now fractions of perceived input brightness, not radiometric flux.
 
 NUM_RAYS = PROJECTOR_NX * PROJECTOR_NY
 _spec_wls, _spec_rad = PROJECTOR.spectrum
 _spectral_weights = jnp.interp(TRACE_WAVELENGTHS, _spec_wls, _spec_rad)
-INPUT_FLUX = float(NUM_RAYS * _spectral_weights.sum())
+INPUT_FLUX = float(NUM_RAYS * jnp.sum(_spectral_weights * LUMINANCE_TRACE_WEIGHTS))
 
 # ── Build the pupil cell grid and mask for the target region ────────────────
 # We build the grid from the pupil element in the reference system. The

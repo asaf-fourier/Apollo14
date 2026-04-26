@@ -131,6 +131,21 @@ class PupilMeritConfig:
     All thresholds are **relative to the reference input flux** ``I_in``
     so the merit is invariant to the number of rays traced.
 
+    Brightness can be either radiometric (default — sum of per-wavelength
+    response values) or **photometric** (V(λ)-weighted sum, proportional
+    to luminance). Set ``luminance_weights`` to switch:
+
+    - ``None`` → radiometric: every wavelength contributes equally per
+      watt. ``input_flux`` should be ``N_rays × Σ_λ spectrum(λ)``.
+    - ``photopic_v(trace_wavelengths) × Δλ × K_m`` (or any other per-λ
+      weighting) → photometric: blue counts ~3% of green per watt, etc.
+      ``input_flux`` should be ``N_rays × Σ_λ spectrum(λ) × weights[λ]``.
+
+    The shape term is **always** computed in radiance space — its template
+    ``D65 × cell_radiance_scale`` must share units with ``response``,
+    which is radiance. Only the threshold-driven terms (coverage, warm-up,
+    cap) consume the photometric scale.
+
     Attributes:
         threshold_relative: Minimum acceptable cell brightness as a
             fraction of ``input_flux``. A cell is "in the eyebox" when
@@ -140,8 +155,13 @@ class PupilMeritConfig:
         cap_relative: Optional upper bound as a fraction of
             ``input_flux``. Set to ``None`` or a very large number to
             disable. Default ``None``.
-        d65_weights: ``(3,)`` target color ratios. Default: D65 weights
-            at the standard R/G/B wavelengths from :mod:`helios.merit`.
+        d65_weights: ``(K,)`` target color ratios in radiance space.
+            Default: D65 weights at the standard R/G/B wavelengths from
+            :mod:`helios.merit`.
+        luminance_weights: ``(K,)`` per-wavelength weights for the
+            brightness sum. ``None`` → ``ones`` (radiometric brightness,
+            current default). For photometric brightness, pass
+            ``helios.photometry.luminance_weights(trace_wavelengths)``.
         sigmoid_steepness: Steepness of the "above threshold" sigmoid.
             Larger → sharper threshold, noisier gradient. Default 50.0.
         soft_min_temperature: Temperature for the soft-min over cells in
@@ -161,6 +181,7 @@ class PupilMeritConfig:
     threshold_relative: float = 0.05
     cap_relative: float | None = None
     d65_weights: jnp.ndarray = None
+    luminance_weights: jnp.ndarray | None = None
     sigmoid_steepness: float = 50.0
     soft_min_temperature: float = 20.0
     shape_floor_epsilon: float = 1e-3
@@ -177,6 +198,111 @@ class PupilMeritConfig:
 # ── Merit ───────────────────────────────────────────────────────────────────
 
 
+def _compute_terms(
+    response: jnp.ndarray,
+    input_flux: float,
+    config: PupilMeritConfig,
+    cell_mask: jnp.ndarray | None,
+) -> dict:
+    """Compute every loss term and diagnostic — shared by merit + breakdown.
+
+    Two per-cell scales are computed:
+
+    - ``mean_radiance`` — raw sum of ``response`` over wavelengths, mean
+      over angles. Used by the shape term because the shape template
+      ``D65 × scale`` must share units with ``response`` (radiance).
+    - ``mean_brightness`` — V-weighted (or ones-weighted) sum, mean over
+      angles. Used by the threshold-driven terms (coverage / warm-up /
+      cap). ``input_flux`` must be expressed in the same units.
+
+    When ``config.luminance_weights is None``, ``mean_brightness`` ≡
+    ``mean_radiance`` and behavior is identical to the pre-photometric
+    merit.
+    """
+    num_channels = response.shape[-1]
+    d65_weights = config.d65_weights.reshape(1, 1, num_channels)
+
+    if config.luminance_weights is None:
+        luminance_weights = jnp.ones((num_channels,))
+    else:
+        luminance_weights = jnp.asarray(config.luminance_weights)
+    luminance_weights = luminance_weights.reshape(1, 1, num_channels)
+
+    # ── Per-cell scales ──
+    radiance_per_angle = jnp.sum(response, axis=-1)                     # (S, A)
+    brightness_per_angle = jnp.sum(response * luminance_weights,
+                                   axis=-1)                             # (S, A)
+    mean_radiance = jnp.mean(radiance_per_angle, axis=-1)               # (S,)
+    mean_brightness = jnp.mean(brightness_per_angle, axis=-1)           # (S,)
+
+    # ── Shape error: in radiance units (template uses mean_radiance) ──
+    d65_template = d65_weights * mean_radiance[:, None, None]           # (S,A,K)
+    shape_diff = response - d65_template
+    shape_denom = (mean_radiance ** 2
+                   + config.shape_floor_epsilon * (input_flux ** 2))
+    shape_err_per_cell = (jnp.mean(shape_diff ** 2, axis=(1, 2))
+                          / shape_denom)                                # (S,)
+
+    # ── Above-threshold soft indicator (uses brightness scale) ──
+    brightness_threshold = config.threshold_relative * input_flux
+    above_threshold = jax.nn.sigmoid(
+        config.sigmoid_steepness
+        * (mean_brightness - brightness_threshold) / input_flux
+    )                                                                   # (S,)
+
+    # ── Cell mask handling ──
+    if cell_mask is None:
+        cell_mask = jnp.ones_like(mean_brightness)
+    num_target_cells = jnp.sum(cell_mask) + 1e-8
+
+    # ── Shape term: gated on "cell is usable" ──
+    loss_shape = (jnp.sum(cell_mask * above_threshold * shape_err_per_cell)
+                  / num_target_cells)
+
+    # ── Coverage via soft-min over masked cells ──
+    # soft_min(above) = -(1/β) log( Σ mask·exp(-β·above) / Σ mask )
+    # Focuses gradient on the *weakest* cell, which defines the eyebox
+    # boundary. Masked-out cells contribute 0 to both sums.
+    softmin_temp = config.soft_min_temperature
+    cell_weights = cell_mask / num_target_cells
+    soft_min_above = -(1.0 / softmin_temp) * jnp.log(
+        jnp.sum(cell_weights * jnp.exp(-softmin_temp * above_threshold))
+        + 1e-12
+    )
+    loss_coverage = 1.0 - soft_min_above
+
+    # ── Warm-up hinge: linear gradient for cells still below threshold ──
+    shortfall = jax.nn.relu(brightness_threshold - mean_brightness)
+    loss_warmup = (jnp.sum(cell_mask * shortfall ** 2)
+                   / num_target_cells / (input_flux ** 2))
+
+    # ── Optional soft upper-bound cap ──
+    if config.cap_relative is not None and config.weight_cap > 0.0:
+        brightness_cap = config.cap_relative * input_flux
+        overshoot = jax.nn.relu(mean_brightness - brightness_cap)
+        loss_cap = (jnp.sum(cell_mask * overshoot ** 2)
+                    / num_target_cells / (input_flux ** 2))
+    else:
+        loss_cap = jnp.array(0.0)
+
+    total = (config.weight_shape * loss_shape
+             + config.weight_coverage * loss_coverage
+             + config.weight_warmup * loss_warmup
+             + config.weight_cap * loss_cap)
+
+    return {
+        "shape": loss_shape,
+        "coverage": loss_coverage,
+        "warmup": loss_warmup,
+        "cap": loss_cap,
+        "total": total,
+        "above_threshold": above_threshold,
+        "mean_brightness": mean_brightness,
+        "cell_mask": cell_mask,
+        "num_target_cells": num_target_cells,
+    }
+
+
 def pupil_merit(
     response: jnp.ndarray,
     input_flux: float,
@@ -188,17 +314,23 @@ def pupil_merit(
     Combines four terms as described in the module docstring:
 
     1. Shape error (D65 + FOV-flat, scale-invariant per cell), gated on
-       whether the cell is already above threshold.
+       whether the cell is already above threshold. Always in radiance
+       units — independent of ``config.luminance_weights``.
     2. Coverage (soft-min-over-cells of a soft above-threshold indicator).
-    3. Warm-up hinge to give dark cells a non-zero gradient.
-    4. Optional soft upper-bound cap (off by default).
+       Uses photometric brightness when ``config.luminance_weights`` is
+       set, radiometric otherwise.
+    3. Warm-up hinge to give dark cells a non-zero gradient. Same scale.
+    4. Optional soft upper-bound cap (off by default). Same scale.
 
     Args:
-        response: ``(S, A, 3)`` tensor of intensities at ``S`` eyebox
-            samples × ``A`` FOV angles × 3 colors.
-        input_flux: Reference input flux — the total brightness one FOV
-            direction would deliver if nothing were lost in the combiner.
-            All thresholds are relative to this.
+        response: ``(S, A, K)`` tensor of intensities at ``S`` eyebox
+            samples × ``A`` FOV angles × ``K`` wavelengths/colors.
+        input_flux: Reference input flux. **Must use the same units as
+            the brightness sum** controlled by ``config.luminance_weights``
+            — i.e., either ``N_rays × Σ_λ spectrum(λ)`` (radiometric) or
+            ``N_rays × Σ_λ spectrum(λ) × luminance_weights[λ]``
+            (photometric). Mismatched units silently miscalibrate the
+            threshold/cap percentages.
         config: :class:`PupilMeritConfig` (defaults used if ``None``).
         cell_mask: Optional ``(S,)`` mask of 1/0 selecting which samples
             belong to the target eyebox region. When ``None``, all
@@ -210,68 +342,7 @@ def pupil_merit(
     """
     if config is None:
         config = PupilMeritConfig()
-
-    num_channels = response.shape[-1]
-    d65_weights = config.d65_weights.reshape(1, 1, num_channels)  # (1,1,C)
-
-    # Per-cell totals and brightness
-    brightness_per_angle = jnp.sum(response, axis=-1)             # (S, A)
-    mean_brightness = jnp.mean(brightness_per_angle, axis=-1)     # (S,)
-
-    # ── Shape error: scale-invariant L2 against D65-flat template ──
-    d65_template = d65_weights * mean_brightness[:, None, None]   # (S,A,3)
-    shape_diff = response - d65_template                          # (S, A, 3)
-    shape_denom = (mean_brightness ** 2
-                   + config.shape_floor_epsilon * (input_flux ** 2))        # (S,)
-    shape_err_per_cell = (jnp.mean(shape_diff ** 2, axis=(1, 2))
-                          / shape_denom)                          # (S,)
-
-    # ── Above-threshold soft indicator ──
-    brightness_threshold = config.threshold_relative * input_flux
-    above_threshold = jax.nn.sigmoid(
-        config.sigmoid_steepness
-        * (mean_brightness - brightness_threshold) / input_flux
-    )                                                             # (S,)
-
-    # ── Optional cell mask (target eyebox region) ──
-    if cell_mask is None:
-        cell_mask = jnp.ones_like(mean_brightness)
-    num_target_cells = jnp.sum(cell_mask) + 1e-8
-
-    # ── Shape term: gated on "cell is usable" ──
-    loss_shape = (jnp.sum(cell_mask * above_threshold * shape_err_per_cell)
-                  / num_target_cells)
-
-    # ── Coverage via soft-min over masked cells ──
-    # soft_min(above) = -(1/β) log( Σ mask·exp(-β·above) / Σ mask )
-    # This focuses gradient on the *weakest* cell, which defines the
-    # eyebox boundary. Masked-out cells contribute 0 to both sums.
-    softmin_temp = config.soft_min_temperature
-    cell_weights = cell_mask / num_target_cells
-    soft_min_above = -(1.0 / softmin_temp) * jnp.log(
-        jnp.sum(cell_weights * jnp.exp(-softmin_temp * above_threshold))
-        + 1e-12
-    )
-    loss_coverage = 1.0 - soft_min_above
-
-    # ── Warm-up hinge: linear gradient for cells still below threshold ──
-    shortfall = jax.nn.relu(brightness_threshold - mean_brightness)  # (S,)
-    loss_warmup = (jnp.sum(cell_mask * shortfall ** 2)
-                   / num_target_cells / (input_flux ** 2))
-
-    # ── Optional soft upper-bound cap ──
-    if config.cap_relative is not None and config.weight_cap > 0.0:
-        brightness_cap = config.cap_relative * input_flux
-        overshoot = jax.nn.relu(mean_brightness - brightness_cap)    # (S,)
-        loss_cap = (jnp.sum(cell_mask * overshoot ** 2)
-                    / num_target_cells / (input_flux ** 2))
-    else:
-        loss_cap = jnp.array(0.0)
-
-    return (config.weight_shape * loss_shape
-            + config.weight_coverage * loss_coverage
-            + config.weight_warmup * loss_warmup
-            + config.weight_cap * loss_cap)
+    return _compute_terms(response, input_flux, config, cell_mask)["total"]
 
 
 # ── Diagnostics ─────────────────────────────────────────────────────────────
@@ -298,64 +369,17 @@ def merit_breakdown(
     """
     if config is None:
         config = PupilMeritConfig()
-
-    num_channels = response.shape[-1]
-    d65_weights = config.d65_weights.reshape(1, 1, num_channels)
-    brightness_per_angle = jnp.sum(response, axis=-1)
-    mean_brightness = jnp.mean(brightness_per_angle, axis=-1)
-
-    d65_template = d65_weights * mean_brightness[:, None, None]
-    shape_diff = response - d65_template
-    shape_denom = (mean_brightness ** 2
-                   + config.shape_floor_epsilon * (input_flux ** 2))
-    shape_err_per_cell = jnp.mean(shape_diff ** 2, axis=(1, 2)) / shape_denom
-
-    brightness_threshold = config.threshold_relative * input_flux
-    above_threshold = jax.nn.sigmoid(
-        config.sigmoid_steepness * (mean_brightness - brightness_threshold) / input_flux
-    )
-
-    if cell_mask is None:
-        cell_mask = jnp.ones_like(mean_brightness)
-    num_target_cells = jnp.sum(cell_mask) + 1e-8
-
-    loss_shape = (jnp.sum(cell_mask * above_threshold * shape_err_per_cell)
-                  / num_target_cells)
-
-    softmin_temp = config.soft_min_temperature
-    cell_weights = cell_mask / num_target_cells
-    soft_min_above = -(1.0 / softmin_temp) * jnp.log(
-        jnp.sum(cell_weights * jnp.exp(-softmin_temp * above_threshold))
-        + 1e-12
-    )
-    loss_coverage = 1.0 - soft_min_above
-
-    shortfall = jax.nn.relu(brightness_threshold - mean_brightness)
-    loss_warmup = (jnp.sum(cell_mask * shortfall ** 2)
-                   / num_target_cells / (input_flux ** 2))
-
-    if config.cap_relative is not None and config.weight_cap > 0.0:
-        brightness_cap = config.cap_relative * input_flux
-        overshoot = jax.nn.relu(mean_brightness - brightness_cap)
-        loss_cap = (jnp.sum(cell_mask * overshoot ** 2)
-                    / num_target_cells / (input_flux ** 2))
-    else:
-        loss_cap = jnp.array(0.0)
-
-    total = (config.weight_shape * loss_shape
-             + config.weight_coverage * loss_coverage
-             + config.weight_warmup * loss_warmup
-             + config.weight_cap * loss_cap)
-
+    terms = _compute_terms(response, input_flux, config, cell_mask)
     return {
-        "shape": loss_shape,
-        "coverage": loss_coverage,
-        "warmup": loss_warmup,
-        "cap": loss_cap,
-        "total": total,
-        "active_fraction": (jnp.sum(cell_mask * above_threshold)
-                            / num_target_cells),
+        "shape": terms["shape"],
+        "coverage": terms["coverage"],
+        "warmup": terms["warmup"],
+        "cap": terms["cap"],
+        "total": terms["total"],
+        "active_fraction": (jnp.sum(terms["cell_mask"] * terms["above_threshold"])
+                            / terms["num_target_cells"]),
         "min_brightness_rel": (jnp.min(
-            jnp.where(cell_mask > 0, mean_brightness, jnp.inf))
+            jnp.where(terms["cell_mask"] > 0,
+                      terms["mean_brightness"], jnp.inf))
             / input_flux),
     }
