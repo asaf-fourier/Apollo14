@@ -233,15 +233,16 @@ class PlayNitrideLed(Projector):
     def create_broadband(cls, position, direction, beam_width, beam_height,
                          nx: int, ny: int,
                          falloff_x: float = 0.0, falloff_y: float = 0.0):
-        """Combined R+G+B spectrum, peak-normalized.
+        """Measured panel-white spectrum, peak-normalized.
 
-        Sums the three LED channels and normalizes to a peak of 1.0,
-        giving a single projector whose spectral shape represents the
-        full emission of the micro-LED array.
+        Reads the ``W`` column — the manufacturer's measurement of the
+        panel emitting its calibrated white. This preserves the natural
+        per-color radiance balance set by the panel's white-point drive
+        levels, which a naive ``R + G + B`` sum at full drive would not
+        (R's peak is ~3× B's, so summing full-drive channels overweights
+        red). Peak-normalized to 1.0 to match :meth:`create`.
         """
-        wavelengths, channels = _load_spectrum_columns(
-            _PLAYNITRIDE_CSV, ["R", "G", "B"])
-        combined = sum(channels[c] / channels[c].max() for c in ("R", "G", "B"))
+        wavelengths, radiance = load_spectrum_csv(_PLAYNITRIDE_CSV, column="W")
         return cls(
             position=position,
             direction=normalize(direction),
@@ -249,7 +250,7 @@ class PlayNitrideLed(Projector):
             beam_height=beam_height,
             nx=nx, ny=ny,
             falloff_x=falloff_x, falloff_y=falloff_y,
-            spectrum=(wavelengths, combined),
+            spectrum=(wavelengths, radiance / radiance.max()),
         )
 
 

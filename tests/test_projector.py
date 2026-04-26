@@ -204,6 +204,41 @@ def test_normalize_spectrum_preserves_shape():
     assert jnp.isclose(ratio, 2.0 / 10.0, atol=1e-5)
 
 
+class TestPlayNitrideBroadband:
+    """Smoke tests for the ``W``-column-based broadband projector."""
+
+    def _broadband(self):
+        from apollo14.projector import PlayNitrideLed
+        return PlayNitrideLed.create_broadband(
+            position=jnp.array([0.0, 10.0, 0.0]),
+            direction=jnp.array([0.0, -1.0, 0.0]),
+            beam_width=2.0, beam_height=2.0, nx=2, ny=2,
+        )
+
+    def test_spectrum_is_peak_normalized(self):
+        proj = self._broadband()
+        _, radiance = proj.spectrum
+        assert jnp.isclose(radiance.max(), 1.0)
+
+    def test_spectrum_matches_w_column(self):
+        """The broadband spectrum should be the W column (peak-normalized) —
+        not a per-channel-normalized R+G+B sum."""
+        from apollo14.projector import _PLAYNITRIDE_CSV, load_spectrum_csv
+        proj = self._broadband()
+        wls_w, rad_w = load_spectrum_csv(_PLAYNITRIDE_CSV, column="W")
+        spec_wls, spec_rad = proj.spectrum
+        assert jnp.allclose(spec_wls, wls_w)
+        assert jnp.allclose(spec_rad, rad_w / rad_w.max())
+
+    def test_spectrum_peak_near_red(self):
+        """The W spectrum's peak should sit near the red LED peak (~628 nm),
+        because the panel's red subpixel dominates the measured white."""
+        proj = self._broadband()
+        wls, rad = proj.spectrum
+        peak_wl_nm = float(wls[jnp.argmax(rad)] / nm)
+        assert 600.0 <= peak_wl_nm <= 650.0
+
+
 def test_normalized_channels_equal_peak_intensity():
     """Three projectors with different raw spectra, each peak-normalized,
     should produce the same intensity at their respective peak wavelengths."""
