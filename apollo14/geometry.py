@@ -76,14 +76,31 @@ def ray_rect_intersect(origin, direction, position, normal, local_x, local_y, ha
     return hit, t, in_bounds
 
 
+def ray_intersect_planar_seg(ray, seg):
+    """Intersect ``ray`` with any seg exposing the standard planar fields.
+
+    Wraps :func:`ray_rect_intersect` for the common case where every field
+    comes straight off a planar segment (``position``, ``normal``,
+    ``local_x``, ``local_y``, ``half_extents``). Duck-typed — works for
+    ``FaceSeg``, ``_SingleMirror``, ``ReflectMirrorSeg``, and the outer
+    bound of ``ApertureSeg``.
+    """
+    return ray_rect_intersect(
+        ray.pos, ray.dir, seg.position, seg.normal,
+        seg.local_x, seg.local_y, seg.half_extents,
+    )
+
+
 def compute_local_axes(normal):
     """Compute two orthogonal axes on the plane defined by normal."""
-    n = normalize(normal)
-    # Try global X, fall back to global Y if aligned
-    candidate = jnp.where(jnp.abs(n[0]) < 0.9, jnp.array([1.0, 0.0, 0.0]), jnp.array([0.0, 1.0, 0.0]))
-    local_x = candidate - jnp.dot(candidate, n) * n
+    unit_normal = normalize(normal)
+    # Try global X, fall back to global Y if aligned with the plane normal.
+    candidate = jnp.where(jnp.abs(unit_normal[0]) < 0.9,
+                          jnp.array([1.0, 0.0, 0.0]),
+                          jnp.array([0.0, 1.0, 0.0]))
+    local_x = candidate - jnp.dot(candidate, unit_normal) * unit_normal
     local_x = normalize(local_x)
-    local_y = jnp.cross(n, local_x)
+    local_y = jnp.cross(unit_normal, local_x)
     return local_x, local_y
 
 
@@ -93,13 +110,13 @@ def planar_grid_points(center, normal, half_x, half_y, nx, ny):
     The grid spans ``[-half_x, half_x] × [-half_y, half_y]`` in the plane's
     local axes. Returns a flat ``(nx*ny, 3)`` array of world positions.
     """
-    lx, ly = compute_local_axes(normal)
+    local_x, local_y = compute_local_axes(normal)
     xs = jnp.linspace(-half_x, half_x, nx)
     ys = jnp.linspace(-half_y, half_y, ny)
-    gx, gy = jnp.meshgrid(xs, ys)  # (ny, nx)
+    grid_x, grid_y = jnp.meshgrid(xs, ys)  # (ny, nx)
     positions = (center[None, None, :]
-                 + gx[:, :, None] * lx[None, None, :]
-                 + gy[:, :, None] * ly[None, None, :])
+                 + grid_x[:, :, None] * local_x[None, None, :]
+                 + grid_y[:, :, None] * local_y[None, None, :])
     return positions.reshape(-1, 3)
 
 

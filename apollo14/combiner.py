@@ -2,16 +2,16 @@
 
 import jax.numpy as jnp
 
-from apollo14.units import mm, nm, deg
-from apollo14.materials import air, agc_m074
-from apollo14.elements.partial_mirror import (
-    PartialMirror, DEFAULT_MIRROR_WAVELENGTHS,
-)
-from apollo14.elements.glass_block import GlassBlock
 from apollo14.elements.aperture import RectangularAperture
+from apollo14.elements.glass_block import GlassBlock
+from apollo14.elements.partial_mirror import (
+    DEFAULT_MIRROR_WAVELENGTHS,
+    PartialMirror,
+)
 from apollo14.elements.pupil import RectangularPupil
+from apollo14.materials import agc_m074, air
 from apollo14.system import OpticalSystem
-
+from apollo14.units import deg, mm, nm
 
 # ── Talos projector / scan defaults (not part of the optical system) ────────
 
@@ -26,7 +26,7 @@ DEFAULT_NUM_X_STEPS = 5
 DEFAULT_NUM_Y_STEPS = 5
 
 
-def compensated_reflectances(ratio, num_mirrors, num_samples: int = None):
+def compensated_reflectances(ratio, num_mirrors, num_samples: int | None = None):
     """Compute per-mirror reflectances compensated for upstream losses.
 
     Each mirror reflects ``ratio`` of the *original* beam intensity. Because

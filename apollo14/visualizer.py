@@ -1,20 +1,20 @@
-from collections import defaultdict
 
 import numpy as np
 import plotly.graph_objects as go
 
-from apollo14.system import OpticalSystem
-from apollo14.elements.partial_mirror import PartialMirror
-from apollo14.elements.glass_block import GlassBlock, GlassFace
-from apollo14.elements.aperture import RectangularAperture
-from apollo14.elements.pupil import Pupil, RectangularPupil
-from apollo14.trace import TraceResult
 from apollo14.binning import bin_hits_to_grid_np
+from apollo14.elements.aperture import RectangularAperture
+from apollo14.elements.glass_block import GlassBlock
+from apollo14.elements.partial_mirror import PartialMirror
+from apollo14.elements.pupil import Pupil, RectangularPupil
 from apollo14.geometry import compute_local_axes
+from apollo14.system import OpticalSystem
+from apollo14.trace import TraceResult
 from apollo14.units import mm
 
 
-def plot_system(system: OpticalSystem, trace_results: list[TraceResult] = None,
+def plot_system(system: OpticalSystem,
+                trace_results: list[TraceResult] | None = None,
                 scan_angles=None, projector=None, show=True):
     """Render the optical system in 3D with Plotly.
 
@@ -28,67 +28,16 @@ def plot_system(system: OpticalSystem, trace_results: list[TraceResult] = None,
 
     Returns the Plotly Figure.
     """
-    static_traces = []
-    dynamic_traces = []
+    static_traces = _static_element_traces(system, projector)
+    dynamic_traces: list = []
 
-    # ── static element traces ────────────────────────────────────────────
-    for elem in system.elements:
-        if isinstance(elem, GlassBlock):
-            _add_glass_block(static_traces, elem)
-        elif isinstance(elem, PartialMirror):
-            _add_mirror(static_traces, elem)
-        elif isinstance(elem, RectangularAperture):
-            _add_aperture(static_traces, elem)
-        elif isinstance(elem, (Pupil, RectangularPupil)):
-            _add_pupil(static_traces, elem)
-
-    if projector is not None:
-        _add_projector(static_traces, projector)
-
-    # ── dynamic ray traces (grouped per angle) ───────────────────────────
     if trace_results and scan_angles is not None:
-        num_y, num_x = scan_angles.shape[:2]
-        n_angles = num_y * num_x
-        rays_per_angle = len(trace_results) // n_angles
-
-        for angle_idx in range(n_angles):
-            start = angle_idx * rays_per_angle
-            end = start + rays_per_angle
-            group = trace_results[start:end]
-
-            x, y, z = [], [], []
-            for tr in group:
-                _collect_ray_coords(tr, x, y, z)
-
-            iy, ix = divmod(angle_idx, num_x)
-            ax_deg = float(scan_angles[iy, ix, 0]) * 180 / np.pi
-            ay_deg = float(scan_angles[iy, ix, 1]) * 180 / np.pi
-            label = f"({ax_deg:.1f}, {ay_deg:.1f}) deg"
-
-            dynamic_traces.append(go.Scatter3d(
-                x=x, y=y, z=z,
-                mode='lines',
-                line=dict(color='rgba(0,100,255,0.7)', width=1),
-                name=label,
-                hoverinfo='name',
-                visible=(angle_idx == 0),
-            ))
-
+        dynamic_traces = _dynamic_ray_traces(trace_results, scan_angles)
     elif trace_results:
-        # No angular scan — show all rays in a single trace
-        x, y, z = [], [], []
-        for tr in trace_results:
-            _collect_ray_coords(tr, x, y, z)
-        if x:
-            static_traces.append(go.Scatter3d(
-                x=x, y=y, z=z,
-                mode='lines',
-                line=dict(color='rgba(255,0,0,0.6)', width=1),
-                name="Rays",
-                hoverinfo='name',
-            ))
+        single = _static_ray_trace(trace_results)
+        if single is not None:
+            static_traces.append(single)
 
-    # ── build figure ─────────────────────────────────────────────────────
     fig = go.Figure()
     fig.add_traces(static_traces)
 
@@ -115,6 +64,72 @@ def plot_system(system: OpticalSystem, trace_results: list[TraceResult] = None,
     if show:
         fig.show()
     return fig
+
+
+def _static_element_traces(system: OpticalSystem, projector) -> list:
+    """Build the per-element Plotly traces (geometry, normals, projector box)."""
+    traces: list = []
+    for elem in system.elements:
+        if isinstance(elem, GlassBlock):
+            _add_glass_block(traces, elem)
+        elif isinstance(elem, PartialMirror):
+            _add_mirror(traces, elem)
+        elif isinstance(elem, RectangularAperture):
+            _add_aperture(traces, elem)
+        elif isinstance(elem, (Pupil, RectangularPupil)):
+            _add_pupil(traces, elem)
+    if projector is not None:
+        _add_projector(traces, projector)
+    return traces
+
+
+def _dynamic_ray_traces(trace_results, scan_angles) -> list:
+    """Build one Plotly Scatter3d per scan angle, all but the first hidden."""
+    num_y, num_x = scan_angles.shape[:2]
+    n_angles = num_y * num_x
+    rays_per_angle = len(trace_results) // n_angles
+
+    traces = []
+    for angle_idx in range(n_angles):
+        start = angle_idx * rays_per_angle
+        group = trace_results[start:start + rays_per_angle]
+        x, y, z = _gather_ray_coords(group)
+
+        iy, ix = divmod(angle_idx, num_x)
+        ax_deg = float(scan_angles[iy, ix, 0]) * 180 / np.pi
+        ay_deg = float(scan_angles[iy, ix, 1]) * 180 / np.pi
+
+        traces.append(go.Scatter3d(
+            x=x, y=y, z=z,
+            mode='lines',
+            line=dict(color='rgba(0,100,255,0.7)', width=1),
+            name=f"({ax_deg:.1f}, {ay_deg:.1f}) deg",
+            hoverinfo='name',
+            visible=(angle_idx == 0),
+        ))
+    return traces
+
+
+def _static_ray_trace(trace_results):
+    """Build one combined Plotly Scatter3d for all rays — used without scan."""
+    x, y, z = _gather_ray_coords(trace_results)
+    if not x:
+        return None
+    return go.Scatter3d(
+        x=x, y=y, z=z,
+        mode='lines',
+        line=dict(color='rgba(255,0,0,0.6)', width=1),
+        name="Rays",
+        hoverinfo='name',
+    )
+
+
+def _gather_ray_coords(trace_results):
+    """Collect (x, y, z) polyline coordinates across many ``TraceResult``s."""
+    x, y, z = [], [], []
+    for tr in trace_results:
+        _collect_ray_coords(tr, x, y, z)
+    return x, y, z
 
 
 def plot_pupil_fill(trace_results_per_angle, scan_angles, pupil_element,
@@ -182,7 +197,7 @@ def plot_pupil_fill(trace_results_per_angle, scan_angles, pupil_element,
 
     fig = go.Figure()
 
-    for i, (grid, label) in enumerate(zip(grids, labels)):
+    for i, (grid, label) in enumerate(zip(grids, labels, strict=True)):
         fig.add_trace(go.Heatmap(
             z=grid,
             x=bin_centers_x.tolist(),
@@ -451,7 +466,7 @@ def _collect_ray_coords(trace: TraceResult, x, y, z):
         hits = hits[None]
         valids = valids[None]
 
-    for ray_hits, ray_valids in zip(hits, valids):
+    for ray_hits, ray_valids in zip(hits, valids, strict=True):
         pts = ray_hits[ray_valids.astype(bool)]
         for i in range(len(pts) - 1):
             x.extend([float(pts[i, 0]), float(pts[i + 1, 0]), None])
@@ -464,7 +479,7 @@ def _collect_ray_coords(trace: TraceResult, x, y, z):
 def _build_slider(static_traces, dynamic_traces, scan_angles):
     num_static = len(static_traces)
     num_dynamic = len(dynamic_traces)
-    num_y, num_x = scan_angles.shape[:2]
+    num_x = scan_angles.shape[1]
 
     steps = []
     for i in range(num_dynamic):

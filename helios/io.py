@@ -13,7 +13,7 @@ import json
 import math
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -21,9 +21,8 @@ import jax.numpy as jnp
 import numpy as np
 
 import apollo14
-from apollo14.projector import Projector, FovGrid
+from apollo14.projector import FovGrid, Projector
 from apollo14.system import OpticalSystem
-
 
 FLOAT_SIGFIGS = 6
 
@@ -40,7 +39,7 @@ class ScanConfig:
 def _round_sig(x: float, sigfigs: int = FLOAT_SIGFIGS) -> float:
     if not math.isfinite(x) or x == 0.0:
         return float(x)
-    digits = sigfigs - int(math.floor(math.log10(abs(x)))) - 1
+    digits = sigfigs - math.floor(math.log10(abs(x))) - 1
     return round(float(x), digits)
 
 
@@ -185,7 +184,7 @@ def save_run(
 
     manifest = {
         "git_sha": _git_sha(),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "scan": _serialize_scan(scan),
         "projector": _serialize_projector(projector),
         "system": _serialize_system(system),
@@ -276,7 +275,7 @@ def save_optimization_report(
 
     report = {
         "git_sha": _git_sha(),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "system": _serialize_system(system),
         "projectors": [_serialize_projector(p) for p in projectors],
         "fov_grid": _serialize_fov_grid(fov_grid),

@@ -121,7 +121,6 @@ import jax.numpy as jnp
 
 from helios.merit import D65_WEIGHTS
 
-
 # ── Configuration ───────────────────────────────────────────────────────────
 
 

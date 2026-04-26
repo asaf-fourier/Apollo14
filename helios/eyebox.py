@@ -8,12 +8,10 @@ tensor. Fully differentiable — gradients flow through intensity values.
 import jax
 import jax.numpy as jnp
 
+from apollo14.binning import bin_hits_soft, bin_hits_to_nearest
 from apollo14.geometry import planar_grid_points
 from apollo14.trace import trace_rays
-from apollo14.binning import bin_hits_to_nearest, bin_hits_soft
-
 from helios.merit import DEFAULT_WAVELENGTHS
-
 
 # ── Eyebox sampling ─────────────────────────────────────────────────────────
 

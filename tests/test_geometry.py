@@ -2,8 +2,13 @@ import jax.numpy as jnp
 from jax import grad
 
 from apollo14.geometry import (
-    normalize, reflect, snell_refract, ray_plane_intersection, compute_local_axes,
-    point_in_rect, point_in_circle,
+    compute_local_axes,
+    normalize,
+    point_in_circle,
+    point_in_rect,
+    ray_plane_intersection,
+    reflect,
+    snell_refract,
 )
 
 

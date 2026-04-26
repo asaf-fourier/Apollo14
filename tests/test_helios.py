@@ -4,17 +4,19 @@ import jax
 import jax.numpy as jnp
 
 from apollo14.combiner import (
+    DEFAULT_BEAM_HEIGHT,
+    DEFAULT_BEAM_WIDTH,
+    DEFAULT_LIGHT_DIRECTION,
+    DEFAULT_LIGHT_POSITION,
+    DEFAULT_X_FOV,
+    DEFAULT_Y_FOV,
     build_default_system,
-    DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
-    DEFAULT_BEAM_WIDTH, DEFAULT_BEAM_HEIGHT,
-    DEFAULT_X_FOV, DEFAULT_Y_FOV,
 )
 from apollo14.elements.pupil import RectangularPupil
-from apollo14.projector import Projector, FovGrid
+from apollo14.projector import FovGrid, Projector
 from apollo14.units import mm
-
 from helios import compute_eyebox_response, eyebox_grid_points
-from helios.merit import build_combiner_pupil_routes, DEFAULT_WAVELENGTHS
+from helios.merit import DEFAULT_WAVELENGTHS, build_combiner_pupil_routes
 
 
 def _make_fixtures():
@@ -54,9 +56,9 @@ class TestEyebox:
 
     def test_grad_through_reflectance(self):
         """Gradients must flow through prepare_route → trace_rays."""
-        from apollo14.trace import prepare_route, trace_rays
-        from apollo14.route import combiner_main_path, Route
         from apollo14.elements.partial_mirror import MirrorStackSeg
+        from apollo14.route import Route, combiner_main_path
+        from apollo14.trace import prepare_route, trace_rays
 
         system = build_default_system()
         route = combiner_main_path(system)

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 import jax.numpy as jnp
 
-from apollo14.geometry import normalize, compute_local_axes
+from apollo14.geometry import compute_local_axes, normalize
 
 
 @dataclass

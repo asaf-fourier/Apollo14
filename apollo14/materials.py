@@ -7,7 +7,6 @@ import numpy as np
 
 from apollo14.units import nm
 
-
 # Common visible-spectrum grid. All Material.data pytrees are resampled onto
 # this grid so every route surface has identically-shaped n1/n2 leaves
 # (required for stacking into a single lax.scan pytree).

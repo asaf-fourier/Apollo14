@@ -15,16 +15,18 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
-from apollo14.materials import MaterialData
-from apollo14.ray import Ray
-from apollo14.route import Route
 from apollo14.elements.aperture import ApertureSeg, aperture_interact
 from apollo14.elements.glass_block import FaceSeg, face_interact
 from apollo14.elements.partial_mirror import (
-    MirrorStackSeg, ReflectMirrorSeg,
-    mirror_transmit_one, mirror_reflect_one,
+    MirrorStackSeg,
+    ReflectMirrorSeg,
+    mirror_reflect_one,
+    mirror_transmit_one,
 )
 from apollo14.elements.pupil import PupilSeg, pupil_interact
+from apollo14.materials import MaterialData
+from apollo14.ray import Ray
+from apollo14.route import Route
 
 
 class TraceResult(NamedTuple):

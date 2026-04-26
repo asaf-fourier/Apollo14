@@ -1,16 +1,21 @@
 import json
+
 import jax.numpy as jnp
 
+from apollo14.projector import FovGrid, Projector
 from apollo14.units import mm, nm
+from helios.combiner_params import CombinerParams, build_parametrized_system
 from helios.io import (
-    _round_sig, _to_list, _serialize_element, _serialize_projector,
-    _serialize_system, _serialize_combiner_params, _serialize_merit_config,
+    _round_sig,
+    _serialize_combiner_params,
+    _serialize_element,
+    _serialize_merit_config,
+    _serialize_projector,
+    _serialize_system,
+    _to_list,
     save_optimization_report,
 )
-from helios.combiner_params import CombinerParams, build_parametrized_system
 from helios.pupil_merit import PupilMeritConfig
-from apollo14.projector import Projector, FovGrid
-
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 

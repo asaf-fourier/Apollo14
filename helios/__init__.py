@@ -1,1 +1,1 @@
-from helios.eyebox import eyebox_grid_points, compute_eyebox_response
+from helios.eyebox import compute_eyebox_response, eyebox_grid_points

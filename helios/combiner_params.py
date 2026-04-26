@@ -46,25 +46,24 @@ policy that depends on the merit function's definition of "good"
 specific rule would bias the search.
 """
 
+import math
 from dataclasses import dataclass
 from typing import NamedTuple
 
 import jax.numpy as jnp
 
-from apollo14.units import mm, nm, deg
-from apollo14.materials import air, agc_m074
-from apollo14.elements.glass_block import GlassBlock
-from apollo14.elements.aperture import RectangularAperture
-from apollo14.elements.pupil import RectangularPupil
-from apollo14.elements.partial_mirror import GaussianMirror
-from apollo14.system import OpticalSystem
 from apollo14.combiner import (
-    DEFAULT_LIGHT_POSITION,
     DEFAULT_LIGHT_DIRECTION,
+    DEFAULT_LIGHT_POSITION,
 )
-
+from apollo14.elements.aperture import RectangularAperture
+from apollo14.elements.glass_block import GlassBlock
+from apollo14.elements.partial_mirror import GaussianMirror
+from apollo14.elements.pupil import RectangularPupil
+from apollo14.materials import agc_m074, air
+from apollo14.system import OpticalSystem
+from apollo14.units import deg, mm, nm
 from helios.merit import DEFAULT_WAVELENGTHS
-
 
 # ── Fixed geometry (not optimized) ──────────────────────────────────────────
 # All constants are plain Python floats so they remain concrete under JIT.
@@ -79,8 +78,6 @@ SKEW_ANGLE = 6.0 * deg
 MIRROR_ANGLE = 48.0 * deg
 EYE_RELIEF = 15.0 * mm
 FIRST_MIRROR_OFFSET_Y = 5.0 * mm
-
-import math
 
 _NORMAL_ANGLE = math.pi / 2 - MIRROR_ANGLE
 _MIRROR_NORMAL = jnp.array([
@@ -122,7 +119,7 @@ class CombinerParams(NamedTuple):
         spacing_mm: float = 1.47,
         amplitude: float = 0.05,
         width_nm: float = 20.0,
-    ) -> "CombinerParams":
+    ) -> CombinerParams:
         """Reasonable starting point for optimization.
 
         Flat 5% reflectance per mirror (same as the Talos reference),

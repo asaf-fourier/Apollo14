@@ -4,17 +4,17 @@ import jax
 import jax.numpy as jnp
 
 from apollo14.combiner import (
-    build_default_system,
-    DEFAULT_LIGHT_POSITION,
     DEFAULT_LIGHT_DIRECTION,
+    DEFAULT_LIGHT_POSITION,
     DEFAULT_WAVELENGTH,
+    build_default_system,
 )
-from apollo14.route import build_route, combiner_main_path, Route
-from apollo14.elements.aperture import ApertureSeg  # noqa: F401
+from apollo14.elements.aperture import ApertureSeg
 from apollo14.elements.glass_block import FaceSeg
 from apollo14.elements.partial_mirror import MirrorStackSeg
-from apollo14.elements.pupil import PupilSeg  # noqa: F401
+from apollo14.elements.pupil import PupilSeg
 from apollo14.ray import Ray
+from apollo14.route import Route, build_route, combiner_main_path
 from apollo14.trace import prepare_route, trace, trace_rays
 
 

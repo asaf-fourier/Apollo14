@@ -6,15 +6,14 @@ the Talos combiner — plus shared spectral constants (LED peak
 wavelengths, D65 white-balance weights).
 """
 
-from typing import Sequence
+from collections.abc import Sequence
 
 import jax.numpy as jnp
 
-from apollo14.route import Route, build_route, branch_path, absorb
-from apollo14.trace import prepare_route
+from apollo14.route import Route, absorb, branch_path, build_route
 from apollo14.system import OpticalSystem
+from apollo14.trace import prepare_route
 from apollo14.units import nm
-
 
 # ── PlayNitride microLED peak wavelengths ─────────────────────────────────────
 

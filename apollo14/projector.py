@@ -1,7 +1,6 @@
 import csv
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
 
 import jax.numpy as jnp
 
@@ -10,19 +9,32 @@ from apollo14.ray import Ray
 from apollo14.units import nm
 
 
-def load_spectrum_csv(path, column: str = "W") -> Tuple[jnp.ndarray, jnp.ndarray]:
+def load_spectrum_csv(path, column: str = "W") -> tuple[jnp.ndarray, jnp.ndarray]:
     """Load a spectral curve from a CSV with a ``wavelength`` column (in nm)
     and one or more radiance columns. Returns ``(wavelengths, radiance)`` —
     wavelengths in internal length units (``nm`` scaled), radiance as read.
     """
+    wavelengths, columns = _load_spectrum_columns(path, [column])
+    return wavelengths, columns[column]
+
+
+def _load_spectrum_columns(
+    path, columns: list[str],
+) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
+    """Read multiple radiance columns from one CSV in a single file pass."""
     path = Path(path)
     with path.open() as f:
         reader = csv.DictReader(f)
-        wls, rads = [], []
+        wls: list[float] = []
+        per_column: dict[str, list[float]] = {c: [] for c in columns}
         for row in reader:
             wls.append(float(row["wavelength"]))
-            rads.append(float(row[column]))
-    return jnp.asarray(wls) * nm, jnp.asarray(rads)
+            for column in columns:
+                per_column[column].append(float(row[column]))
+    return (
+        jnp.asarray(wls) * nm,
+        {c: jnp.asarray(vals) for c, vals in per_column.items()},
+    )
 
 
 @dataclass
@@ -47,7 +59,7 @@ class Projector:
     ny: int                   # number of rays across the beam height
     falloff_x: float = 0.0    # linear angular falloff along local x (per rad)
     falloff_y: float = 0.0    # linear angular falloff along local y (per rad)
-    spectrum: Optional[Tuple[jnp.ndarray, jnp.ndarray]] = None
+    spectrum: tuple[jnp.ndarray, jnp.ndarray] | None = None
     """Optional ``(wavelengths, radiance)`` spectral emission curve.
     Units: wavelengths in internal length units, radiance in W/sr/m²/nm."""
 
@@ -87,7 +99,7 @@ class Projector:
             spectrum=(wls, rad),
         )
 
-    def spectral_band(self, threshold: float = 0.05) -> Tuple[float, float]:
+    def spectral_band(self, threshold: float = 0.05) -> tuple[float, float]:
         """Wavelength range where normalized spectral intensity >= ``threshold``.
 
         Returns ``(wl_min, wl_max)`` in internal length units. The spectrum
@@ -109,12 +121,16 @@ class Projector:
 
     def _compute_basis(self, direction=None):
         """Compute the beam cross-section basis vectors for a given direction."""
-        d = normalize(direction if direction is not None else self.direction)
-        # Build local frame: local_x across beam width, local_y across beam height
-        ref = jnp.where(jnp.abs(d[2]) < 0.9, jnp.array([0.0, 0.0, 1.0]),
-                        jnp.array([1.0, 0.0, 0.0]))
-        local_x = normalize(jnp.cross(d, ref))
-        local_y = normalize(jnp.cross(local_x, d))
+        unit_direction = normalize(
+            direction if direction is not None else self.direction)
+        # Pick a reference axis non-aligned with the beam so the cross
+        # product gives a well-defined first basis vector.
+        reference_axis = jnp.where(
+            jnp.abs(unit_direction[2]) < 0.9,
+            jnp.array([0.0, 0.0, 1.0]),
+            jnp.array([1.0, 0.0, 0.0]))
+        local_x = normalize(jnp.cross(unit_direction, reference_axis))
+        local_y = normalize(jnp.cross(local_x, unit_direction))
         return local_x, local_y
 
     def _angular_gain(self, direction) -> jnp.ndarray:
@@ -130,23 +146,23 @@ class Projector:
         The angle is decomposed into two components by projecting
         ``direction`` onto the projector's base local x/y axes::
 
-            ax = arcsin(direction · base_x)   # tilt around base_y
-            ay = arcsin(direction · base_y)   # tilt around base_x
+            angle_x = arcsin(direction · base_x)   # tilt around base_y
+            angle_y = arcsin(direction · base_y)   # tilt around base_x
 
         A linear falloff is then applied independently on each axis::
 
-            gain = (1 - falloff_x · |ax|) · (1 - falloff_y · |ay|)
+            gain = (1 - falloff_x · |angle_x|) · (1 - falloff_y · |angle_y|)
 
         clipped to ``[0, 1]``. For ``direction == self.direction`` the dot
         products are zero, so ``gain == 1``. The clip on the dot products
         guards ``arcsin`` against tiny numerical overshoot past ±1.
         """
         base_x, base_y = self._compute_basis(self.direction)
-        ax = jnp.arcsin(jnp.clip(jnp.dot(direction, base_x), -1.0, 1.0))
-        ay = jnp.arcsin(jnp.clip(jnp.dot(direction, base_y), -1.0, 1.0))
+        angle_x = jnp.arcsin(jnp.clip(jnp.dot(direction, base_x), -1.0, 1.0))
+        angle_y = jnp.arcsin(jnp.clip(jnp.dot(direction, base_y), -1.0, 1.0))
         return jnp.clip(
-            (1.0 - self.falloff_x * jnp.abs(ax))
-            * (1.0 - self.falloff_y * jnp.abs(ay)),
+            (1.0 - self.falloff_x * jnp.abs(angle_x))
+            * (1.0 - self.falloff_y * jnp.abs(angle_y)),
             0.0, 1.0,
         )
 
@@ -161,26 +177,29 @@ class Projector:
         where ``angular_gain`` is a linear falloff from the projector's
         base direction along its local x/y axes.
         """
-        d = normalize(direction if direction is not None else self.direction)
-        local_x, local_y = self._compute_basis(d)
+        unit_direction = normalize(
+            direction if direction is not None else self.direction)
+        local_x, local_y = self._compute_basis(unit_direction)
 
         xs = jnp.linspace(-self.beam_width / 2, self.beam_width / 2, self.nx)
         ys = jnp.linspace(-self.beam_height / 2, self.beam_height / 2, self.ny)
-        gx, gy = jnp.meshgrid(xs, ys)  # (ny, nx)
-        gx_flat = gx.ravel()
-        gy_flat = gy.ravel()
+        grid_x, grid_y = jnp.meshgrid(xs, ys)  # (ny, nx)
+        grid_x_flat = grid_x.ravel()
+        grid_y_flat = grid_y.ravel()
 
-        offsets = gx_flat[:, None] * local_x[None, :] + gy_flat[:, None] * local_y[None, :]
+        offsets = (grid_x_flat[:, None] * local_x[None, :]
+                   + grid_y_flat[:, None] * local_y[None, :])
         origins = self.position[None, :] + offsets  # (N, 3)
 
-        intensities = jnp.full((self.nx * self.ny,), self._angular_gain(d))
+        intensities = jnp.full((self.nx * self.ny,),
+                               self._angular_gain(unit_direction))
 
         if wavelength is not None and self.spectrum is not None:
             spec_wls, spec_rad = self.spectrum
             intensities = intensities * jnp.interp(
                 jnp.asarray(wavelength), spec_wls, spec_rad)
 
-        return Ray(pos=origins, dir=d, intensity=intensities)
+        return Ray(pos=origins, dir=unit_direction, intensity=intensities)
 
 
 _PLAYNITRIDE_CSV = Path(__file__).parent / "data" / "projector" / "PlayNitride_(-1-3)_APL05prc.csv"
@@ -220,10 +239,9 @@ class PlayNitrideLed(Projector):
         giving a single projector whose spectral shape represents the
         full emission of the micro-LED array.
         """
-        wls_r, rad_r = load_spectrum_csv(_PLAYNITRIDE_CSV, column="R")
-        _,     rad_g = load_spectrum_csv(_PLAYNITRIDE_CSV, column="G")
-        _,     rad_b = load_spectrum_csv(_PLAYNITRIDE_CSV, column="B")
-        combined = rad_r / rad_r.max() + rad_g / rad_g.max() + rad_b / rad_b.max()
+        wavelengths, channels = _load_spectrum_columns(
+            _PLAYNITRIDE_CSV, ["R", "G", "B"])
+        combined = sum(channels[c] / channels[c].max() for c in ("R", "G", "B"))
         return cls(
             position=position,
             direction=normalize(direction),
@@ -231,7 +249,7 @@ class PlayNitrideLed(Projector):
             beam_height=beam_height,
             nx=nx, ny=ny,
             falloff_x=falloff_x, falloff_y=falloff_y,
-            spectrum=(wls_r, combined),
+            spectrum=(wavelengths, combined),
         )
 
 
@@ -301,26 +319,30 @@ def scan_directions(base_direction, x_fov, y_fov, num_x, num_y):
 
 
 def _build_scan_grid(base_direction, x_fov, y_fov, num_x, num_y):
-    d = normalize(base_direction)
+    base_unit_direction = normalize(base_direction)
 
-    ref = jnp.where(jnp.abs(d[2]) < 0.9, jnp.array([0.0, 0.0, 1.0]),
-                    jnp.array([1.0, 0.0, 0.0]))
-    axis_x = normalize(jnp.cross(d, ref))
-    axis_y = normalize(jnp.cross(axis_x, d))
+    reference_axis = jnp.where(
+        jnp.abs(base_unit_direction[2]) < 0.9,
+        jnp.array([0.0, 0.0, 1.0]),
+        jnp.array([1.0, 0.0, 0.0]))
+    axis_x = normalize(jnp.cross(base_unit_direction, reference_axis))
+    axis_y = normalize(jnp.cross(axis_x, base_unit_direction))
 
-    ax = jnp.linspace(-x_fov / 2, x_fov / 2, num_x) if num_x > 1 else jnp.array([0.0])
-    ay = jnp.linspace(-y_fov / 2, y_fov / 2, num_y) if num_y > 1 else jnp.array([0.0])
+    x_angles = (jnp.linspace(-x_fov / 2, x_fov / 2, num_x)
+                if num_x > 1 else jnp.array([0.0]))
+    y_angles = (jnp.linspace(-y_fov / 2, y_fov / 2, num_y)
+                if num_y > 1 else jnp.array([0.0]))
 
     directions = []
     angles = []
-    for iy in range(len(ay)):
+    for iy in range(len(y_angles)):
         row_dirs = []
         row_angles = []
-        for ix in range(len(ax)):
-            rotated = _rodrigues(d, axis_y, ay[iy])
-            rotated = _rodrigues(rotated, axis_x, ax[ix])
+        for ix in range(len(x_angles)):
+            rotated = _rodrigues(base_unit_direction, axis_y, y_angles[iy])
+            rotated = _rodrigues(rotated, axis_x, x_angles[ix])
             row_dirs.append(normalize(rotated))
-            row_angles.append(jnp.array([ax[ix], ay[iy]]))
+            row_angles.append(jnp.array([x_angles[ix], y_angles[iy]]))
         directions.append(jnp.stack(row_dirs))
         angles.append(jnp.stack(row_angles))
 

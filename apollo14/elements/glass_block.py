@@ -1,12 +1,15 @@
 """Glass block element — refractive volume defined by planar faces."""
 
 from dataclasses import dataclass, field
-from typing import List, NamedTuple
+from typing import NamedTuple
 
 import jax.numpy as jnp
 
 from apollo14.geometry import (
-    normalize, compute_local_axes, ray_rect_intersect, snell_refract,
+    compute_local_axes,
+    normalize,
+    ray_intersect_planar_seg,
+    snell_refract,
 )
 from apollo14.materials import Material, air
 from apollo14.ray import Ray
@@ -89,9 +92,7 @@ def face_interact(seg: FaceSeg, ray: Ray, wavelength):
     """
     alive_in = ray.intensity > 0
 
-    hit, _, in_bounds = ray_rect_intersect(
-        ray.pos, ray.dir, seg.position, seg.normal,
-        seg.local_x, seg.local_y, seg.half_extents)
+    hit, _, in_bounds = ray_intersect_planar_seg(ray, seg)
 
     facing = jnp.where(jnp.dot(ray.dir, seg.normal) < 0,
                        seg.normal, -seg.normal)
@@ -110,7 +111,7 @@ class GlassBlock:
     name: str
     position: jnp.ndarray
     material: Material
-    faces: List[GlassFace] = field(default_factory=list)
+    faces: list[GlassFace] = field(default_factory=list)
 
     def __post_init__(self):
         for f in self.faces:

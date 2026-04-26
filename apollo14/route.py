@@ -44,11 +44,11 @@ Typical usage::
     result = trace(route, Ray(pos=o, dir=d, intensity=1.0))
 """
 
-from typing import NamedTuple, Sequence, Union
+from collections.abc import Sequence
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
-
 
 # ── Mode tags ────────────────────────────────────────────────────────────────
 # Path-level tags for ``build_route`` — they pick which ``build_segment``
@@ -91,8 +91,8 @@ class Route(NamedTuple):
 # The ``transmit``/``reflect``/``absorb`` helpers produce the tagged form
 # without having to spell out the mode integer.
 
-ElementRef = Union[str, tuple]
-PathEntry = Union[ElementRef, tuple]
+ElementRef = str | tuple
+PathEntry = ElementRef | tuple
 
 
 def transmit(ref: ElementRef) -> PathEntry:
@@ -222,7 +222,7 @@ def _group_mirror_runs(raw_segments: list) -> list:
     *this* module at load time. The reverse edge (route ← partial_mirror)
     is deferred to call time to avoid a circular import.
     """
-    from apollo14.elements.partial_mirror import _SingleMirror, MirrorStackSeg
+    from apollo14.elements.partial_mirror import MirrorStackSeg, _SingleMirror
 
     def stack(run):
         stacked = jax.tree_util.tree_map(
@@ -348,7 +348,7 @@ def branch_path(main_path: Sequence[PathEntry], at: str,
         if _ref_name(entry) == at:
             break
         prefix.append(entry)
-    return prefix + [(at, mode)] + list(tail)
+    return [*prefix, (at, mode), *tail]
 
 
 # ── Combiner helper ──────────────────────────────────────────────────────────

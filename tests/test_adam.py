@@ -3,7 +3,6 @@ import jax.numpy as jnp
 
 from helios.adam import AdamConfig, adam_init, adam_step, lr_schedule
 
-
 # ── LR schedule ────────────────────────────────────────────────────────────
 
 
@@ -52,7 +51,7 @@ def test_adam_init_zeros():
 
 def test_adam_init_preserves_structure():
     params = (jnp.ones(3), jnp.ones((2, 2)))
-    moment, variance, step_count = adam_init(params)
+    moment, _variance, _step_count = adam_init(params)
     assert moment[0].shape == (3,)
     assert moment[1].shape == (2, 2)
 
@@ -65,7 +64,7 @@ def test_adam_step_updates_params():
     grad = {"x": jnp.array([1.0, -1.0])}
     state = adam_init(params)
     cfg = AdamConfig(peak_lr=0.1, warmup_steps=1, num_steps=100)
-    new_params, new_state = adam_step(params, grad, state, cfg)
+    new_params, _new_state = adam_step(params, grad, state, cfg)
     assert not jnp.allclose(new_params["x"], params["x"])
 
 
@@ -92,7 +91,7 @@ def test_adam_minimizes_quadratic():
         return jnp.sum(p ** 2), 2.0 * p
 
     for _ in range(100):
-        loss, grad = loss_and_grad(params)
+        _loss, grad = loss_and_grad(params)
         params, state = adam_step(params, grad, state, cfg)
 
     assert float(jnp.sum(params ** 2)) < 0.1

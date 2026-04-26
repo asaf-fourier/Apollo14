@@ -17,7 +17,7 @@ from typing import NamedTuple
 import jax.numpy as jnp
 
 from apollo14.elements.planar import PlanarElement
-from apollo14.geometry import ray_rect_intersect
+from apollo14.geometry import ray_intersect_planar_seg, ray_rect_intersect
 from apollo14.ray import Ray
 
 
@@ -72,9 +72,8 @@ def aperture_interact(seg: ApertureSeg, ray: Ray, wavelength):
     """
     alive_in = ray.intensity > 0
 
-    hit, _, in_outer = ray_rect_intersect(
-        ray.pos, ray.dir, seg.position, seg.normal,
-        seg.local_x, seg.local_y, seg.half_extents)
+    hit, _, in_outer = ray_intersect_planar_seg(ray, seg)
+    # Inner hole shares the same plane geometry but uses a different extent.
     _, _, in_inner = ray_rect_intersect(
         ray.pos, ray.dir, seg.position, seg.normal,
         seg.local_x, seg.local_y, seg.inner_half_extents)

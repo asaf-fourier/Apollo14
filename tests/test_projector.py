@@ -1,7 +1,7 @@
 import jax.numpy as jnp
 
-from apollo14.projector import Projector, scan_directions
 from apollo14.geometry import normalize
+from apollo14.projector import Projector, scan_directions
 from apollo14.units import deg, nm
 
 

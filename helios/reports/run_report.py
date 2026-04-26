@@ -22,9 +22,8 @@ from pathlib import Path
 import numpy as np
 import plotly.graph_objects as go
 
-from helios.merit import D65_WEIGHTS, d65_weights_at
 from apollo14.units import nm
-
+from helios.merit import D65_WEIGHTS, d65_weights_at
 
 # ── Primitives (fully generic) ──────────────────────────────────────────────
 
@@ -91,7 +90,7 @@ def pupil_heatmap_figure(
 def _reshape_pupil(response: np.ndarray, ny: int, nx: int) -> np.ndarray:
     """(S, A, C) → (ny, nx, A, C)."""
     S, A, C = response.shape
-    if S != ny * nx:
+    if ny * nx != S:
         raise ValueError(f"S={S} does not match pupil grid {ny}x{nx}")
     return response.reshape(ny, nx, A, C)
 
@@ -99,7 +98,7 @@ def _reshape_pupil(response: np.ndarray, ny: int, nx: int) -> np.ndarray:
 def _reshape_fov(response: np.ndarray, n_fov_y: int, n_fov_x: int) -> np.ndarray:
     """(S, A, C) → (S, n_fov_y, n_fov_x, C)."""
     S, A, C = response.shape
-    if A != n_fov_y * n_fov_x:
+    if n_fov_y * n_fov_x != A:
         raise ValueError(f"A={A} does not match FOV grid {n_fov_y}x{n_fov_x}")
     return response.reshape(S, n_fov_y, n_fov_x, C)
 
@@ -261,10 +260,12 @@ def render_report(run_dir: Path | str) -> Path:
     figs.append(("white_balance",
                  white_balance_figure(response, pupil_x_mm, pupil_y_mm,
                                      wavelengths_nm=wavelengths_nm)))
-    figs += [(n, f) for n, f in zip(
+    figs += list(zip(
         ["fov_avg", "fov_worst"],
         fov_global_figures(response, scan_angles,
-                           wavelengths_nm=wavelengths_nm))]
+                           wavelengths_nm=wavelengths_nm),
+        strict=True,
+    ))
     figs.append(("per_cell_fov",
                  per_cell_fov_figure(response, scan_angles,
                                      pupil_x_mm, pupil_y_mm)))
