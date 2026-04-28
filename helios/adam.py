@@ -33,11 +33,15 @@ class AdamConfig:
 
 
 def lr_schedule(step_count, config: AdamConfig) -> jnp.ndarray:
-    warmup = jnp.minimum(step_count / config.warmup_steps, 1.0)
-    decay_fraction = ((step_count - config.warmup_steps)
-                      / (config.num_steps - config.warmup_steps))
-    cosine_decay = 0.5 * (1.0 + jnp.cos(
-        jnp.pi * jnp.clip(decay_fraction, 0.0, 1.0)))
+    # Guard the denominators so degenerate configs (warmup_steps == 0,
+    # warmup_steps >= num_steps) don't produce 0/0 → NaN or a cosine
+    # that's already at full decay before the first step.
+    warmup_steps = max(config.warmup_steps, 1)
+    decay_steps = max(config.num_steps - config.warmup_steps, 1)
+    warmup = jnp.minimum(step_count / warmup_steps, 1.0)
+    decay_fraction = jnp.clip(
+        (step_count - config.warmup_steps) / decay_steps, 0.0, 1.0)
+    cosine_decay = 0.5 * (1.0 + jnp.cos(jnp.pi * decay_fraction))
     return config.peak_lr * warmup * cosine_decay
 
 
