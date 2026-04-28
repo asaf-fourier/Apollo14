@@ -17,6 +17,9 @@ Run::
     python examples/optimize_pupil.py
 """
 
+from datetime import datetime
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 
@@ -41,6 +44,7 @@ from helios.pupil_merit import (
 )
 from helios.adam import AdamConfig, adam_init, adam_step
 from helios.io import save_optimization_report, save_run, ScanConfig
+from helios.reports.pupil_report import render_pupil_report
 
 
 # ── Eyebox target region (pre-defined, fixed) ───────────────────────────────
@@ -197,8 +201,8 @@ value_and_grad_phase2 = jax.jit(jax.value_and_grad(loss_fn_phase2))
 
 # ── Adam optimizer ──────────────────────────────────────────────────────────
 
-PHASE1_STEPS = 50
-PHASE2_STEPS = 50
+PHASE1_STEPS = 20
+PHASE2_STEPS = 5
 
 adam_cfg_phase1 = AdamConfig(peak_lr=3e-3, warmup_steps=20, num_steps=PHASE1_STEPS)
 adam_cfg_phase2 = AdamConfig(peak_lr=2e-3, warmup_steps=10, num_steps=PHASE2_STEPS)
@@ -216,7 +220,14 @@ def _print_breakdown(label, bd):
           f"min_rel={float(bd['min_brightness_rel']):.4f}")
 
 
+RUNS_ROOT = Path("examples/reports/optimize_pupil")
+
+
 def main():
+    run_dir = RUNS_ROOT / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Run directory: {run_dir}")
+
     initial_params = CombinerParams.initial(amplitude=0.10)
     params = initial_params
     state = adam_init(params)
@@ -296,7 +307,7 @@ def main():
     final_system = build_parametrized_system(
         params, probe_wavelengths=TRACE_WAVELENGTHS)
     report_path = save_optimization_report(
-        "examples/reports/optimize_pupil",
+        run_dir,
         system=final_system,
         projectors=[PROJECTOR],
         fov_grid=FOV_GRID,
@@ -339,8 +350,8 @@ def main():
         x_fov=float(X_FOV), y_fov=float(Y_FOV),
         num_x=FOV_GRID.num_x, num_y=FOV_GRID.num_y,
     )
-    run_dir = save_run(
-        "examples/reports/optimize_pupil",
+    save_run(
+        run_dir,
         final_system, PROJECTOR, scan_cfg,
         response=response,
         pupil_x_mm=pupil_x_mm,
@@ -348,6 +359,10 @@ def main():
         scan_angles=FOV_GRID.angles_grid,
         wavelengths_nm=TRACE_WAVELENGTHS / nm,
     )
+    print(f"Saved run inputs + response to: {run_dir}")
+
+    pupil_report_path = render_pupil_report(run_dir)
+    print(f"Saved pupil report: {pupil_report_path}")
 
 
 if __name__ == "__main__":
