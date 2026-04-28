@@ -17,6 +17,7 @@ from helios.combiner_params import (
     CombinerParams,
     ParamBounds,
     build_parametrized_system,
+    fwhm_to_sigma,
 )
 from helios.merit import DEFAULT_WAVELENGTHS
 
@@ -181,8 +182,10 @@ class TestParamBounds:
         bounds = ParamBounds()
         clipped = bounds.clip(params)
         eps_nm = 1e-3 * nm
-        assert float(jnp.min(clipped.widths)) >= bounds.width_min_nm * nm - eps_nm
-        assert float(jnp.max(clipped.widths)) <= bounds.width_max_nm * nm + eps_nm
+        sigma_min = fwhm_to_sigma(bounds.fwhm_min_nm * nm)
+        sigma_max = fwhm_to_sigma(bounds.fwhm_max_nm * nm)
+        assert float(jnp.min(clipped.widths)) >= sigma_min - eps_nm
+        assert float(jnp.max(clipped.widths)) <= sigma_max + eps_nm
 
     def test_spacing_clipped_to_range(self):
         params = CombinerParams(

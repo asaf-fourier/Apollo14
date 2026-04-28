@@ -201,8 +201,8 @@ value_and_grad_phase2 = jax.jit(jax.value_and_grad(loss_fn_phase2))
 
 # ── Adam optimizer ──────────────────────────────────────────────────────────
 
-PHASE1_STEPS = 20
-PHASE2_STEPS = 5
+PHASE1_STEPS = 100
+PHASE2_STEPS = 50
 
 adam_cfg_phase1 = AdamConfig(peak_lr=3e-3, warmup_steps=20, num_steps=PHASE1_STEPS)
 adam_cfg_phase2 = AdamConfig(peak_lr=2e-3, warmup_steps=10, num_steps=PHASE2_STEPS)
@@ -228,7 +228,7 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Run directory: {run_dir}")
 
-    initial_params = CombinerParams.initial(amplitude=0.10)
+    initial_params = CombinerParams.initial(amplitude=0.10, width_nm=10)
     params = initial_params
     state = adam_init(params)
 

@@ -136,6 +136,22 @@ class CombinerParams(NamedTuple):
 # ── Bounds & reparametrization ──────────────────────────────────────────────
 
 
+# FWHM = 2·sqrt(2·ln2)·σ for a Gaussian. Bounds are expressed in FWHM
+# (intuitive optical-design units), but ``params.widths`` carries σ
+# (what the Gaussian math consumes), so we convert at clip time.
+_FWHM_OVER_SIGMA = 2.0 * math.sqrt(2.0 * math.log(2.0))
+
+
+def fwhm_to_sigma(fwhm):
+    """FWHM → Gaussian σ. Works on scalars and JAX/NumPy arrays."""
+    return fwhm / _FWHM_OVER_SIGMA
+
+
+def sigma_to_fwhm(sigma):
+    """Gaussian σ → FWHM. Works on scalars and JAX/NumPy arrays."""
+    return sigma * _FWHM_OVER_SIGMA
+
+
 @dataclass
 class ParamBounds:
     """Hard bounds for post-step clipping.
@@ -143,13 +159,15 @@ class ParamBounds:
     Not a reparametrization — the optimizer sees raw values and we clip
     after each Adam step to keep the design physical. The chassis is
     ``chassis_y = 20 mm``; the sum of spacings must fit inside it.
+
+    Width bounds are given as FWHM (nm); ``params.widths`` stores σ.
     """
     spacing_min_mm: float = 0.5
     spacing_max_mm: float = 3.0
-    amplitude_min: float = 0.005
-    amplitude_max: float = 0.40
-    width_min_nm: float = 10.0
-    width_max_nm: float = 150.0
+    amplitude_min: float = 0.0
+    amplitude_max: float = 0.20
+    fwhm_min_nm: float = 20.0
+    fwhm_max_nm: float = 50.0
     chassis_usable_mm: float = 18.0  # margin below 20 mm
 
     def clip(self, params: CombinerParams) -> CombinerParams:
@@ -161,13 +179,13 @@ class ParamBounds:
         rescale = jnp.where(total_spacing > usable_length,
                             usable_length / total_spacing, 1.0)
         clipped_spacings = clipped_spacings * rescale
+        sigma_min = fwhm_to_sigma(self.fwhm_min_nm * nm)
+        sigma_max = fwhm_to_sigma(self.fwhm_max_nm * nm)
         return CombinerParams(
             spacings=clipped_spacings,
             amplitudes=jnp.clip(params.amplitudes,
                                 self.amplitude_min, self.amplitude_max),
-            widths=jnp.clip(params.widths,
-                            self.width_min_nm * nm,
-                            self.width_max_nm * nm),
+            widths=jnp.clip(params.widths, sigma_min, sigma_max),
         )
 
 
