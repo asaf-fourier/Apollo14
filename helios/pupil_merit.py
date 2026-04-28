@@ -59,7 +59,7 @@ denominator during warm-up.
 a soft-min over samples so the *weakest* cell dominates the gradient
 (that's the one actually limiting the usable eyebox)::
 
-    above(s) = σ( k · (Ī(s)/I_in − τ) )                   # (S,)  in (0,1)
+    above(s) = σ( k · (Ī(s) − τ·I_in) / (τ·I_in) )        # (S,)  in (0,1)
     soft_min = −(1/β) · log( mean_s exp(−β · above(s)) )  # scalar in (0,1)
     L_cov    = 1 − soft_min
 
@@ -162,7 +162,10 @@ class PupilMeritConfig:
             brightness sum. ``None`` → ``ones`` (radiometric brightness,
             current default). For photometric brightness, pass
             ``helios.photometry.luminance_weights(trace_wavelengths)``.
-        sigmoid_steepness: Steepness of the "above threshold" sigmoid.
+        sigmoid_steepness: Steepness of the "above threshold" sigmoid,
+            in units of *fractional excess over threshold* — i.e., the
+            sigmoid argument is ``k · (mean − threshold) / threshold``,
+            so ``k=10`` means a 10% over/undershoot saturates near 0 / 1.
             Larger → sharper threshold, noisier gradient. Default 50.0.
         soft_min_temperature: Temperature for the soft-min over cells in
             the coverage term. Larger → closer to a hard min (focus on
@@ -182,7 +185,7 @@ class PupilMeritConfig:
     cap_relative: float | None = None
     d65_weights: jnp.ndarray = None
     luminance_weights: jnp.ndarray | None = None
-    sigmoid_steepness: float = 50.0
+    sigmoid_steepness: float = 8.0
     soft_min_temperature: float = 20.0
     shape_floor_epsilon: float = 1e-3
     weight_shape: float = 1.0
@@ -244,10 +247,17 @@ def _compute_terms(
                           / shape_denom)                                # (S,)
 
     # ── Above-threshold soft indicator (uses brightness scale) ──
+    # Sigmoid argument is normalized by ``brightness_threshold`` (not
+    # ``input_flux``), so ``sigmoid_steepness`` is the slope per unit
+    # *fractional excess over threshold*. Without this rescaling, the
+    # natural span of (mean − threshold) is ``threshold_relative · input_flux``,
+    # which makes the sigmoid sit in its linear regime over the entire
+    # useful range and effectively turns the coverage term into a linear
+    # function of brightness instead of a threshold indicator.
     brightness_threshold = config.threshold_relative * input_flux
     above_threshold = jax.nn.sigmoid(
         config.sigmoid_steepness
-        * (mean_brightness - brightness_threshold) / input_flux
+        * (mean_brightness - brightness_threshold) / brightness_threshold
     )                                                                   # (S,)
 
     # ── Cell mask handling ──
