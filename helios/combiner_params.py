@@ -176,7 +176,8 @@ class ParamBounds:
 
 def build_parametrized_system(
     params: CombinerParams,
-    wavelengths: jnp.ndarray = None,
+    centers: jnp.ndarray = None,
+    probe_wavelengths: jnp.ndarray = None,
 ) -> OpticalSystem:
     """Build the Talos combiner using ``params`` as the design variables.
 
@@ -188,17 +189,26 @@ def build_parametrized_system(
     Args:
         params: :class:`CombinerParams` holding spacings + Gaussian
             reflectance parameters.
-        wavelengths: ``(K,)`` wavelengths used as the mirror's spectral
-            sample grid (also the Gaussian centers, and the wavelengths
-            the tracer will probe). Defaults to
-            :data:`helios.merit.DEFAULT_WAVELENGTHS` (R/G/B primaries).
+        centers: ``(C,)`` Gaussian centers, fixed at the projector's
+            primary wavelengths. Defaults to
+            :data:`helios.merit.DEFAULT_WAVELENGTHS` (R/G/B).
+        probe_wavelengths: ``(K,)`` dense sample grid where the
+            sum-of-Gaussians curve is evaluated before being stored on
+            the mirror. The tracer's ``jnp.interp`` then interpolates
+            between dense samples — pass the same wavelength grid the
+            trace uses for an effectively-exact Gaussian curve.
+            Defaults to ``centers`` (3 points — back-compat; will give
+            a piecewise-linear curve through the 3 peaks).
 
     Returns:
         :class:`OpticalSystem` with chassis, aperture, mirrors, pupil.
     """
-    if wavelengths is None:
-        wavelengths = DEFAULT_WAVELENGTHS
-    wavelengths = jnp.asarray(wavelengths)
+    if centers is None:
+        centers = DEFAULT_WAVELENGTHS
+    centers = jnp.asarray(centers)
+    if probe_wavelengths is None:
+        probe_wavelengths = centers
+    probe_wavelengths = jnp.asarray(probe_wavelengths)
 
     system = OpticalSystem(env_material=air)
 
@@ -241,7 +251,8 @@ def build_parametrized_system(
             height=_MIRROR_Y_WIDTH,
             amplitude=params.amplitudes[mirror_idx],
             sigma=params.widths[mirror_idx],
-            probe_wavelengths=wavelengths,
+            centers=centers,
+            probe_wavelengths=probe_wavelengths,
         ))
 
     # Pupil — fixed

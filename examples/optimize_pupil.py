@@ -39,9 +39,8 @@ from helios.photometry import luminance_weights as photopic_luminance_weights
 from helios.pupil_merit import (
     PupilMeritConfig, pupil_merit, merit_breakdown,
 )
-from helios.adam import AdamConfig, adam_init, adam_step, lr_schedule
+from helios.adam import AdamConfig, adam_init, adam_step
 from helios.io import save_optimization_report, save_run, ScanConfig
-from helios.reports.run_report import render_report
 
 
 # ── Eyebox target region (pre-defined, fixed) ───────────────────────────────
@@ -49,8 +48,8 @@ from helios.reports.run_report import render_report
 EYEBOX_RADIUS = 5.0 * mm         # 10×10 mm centered eyebox
 EYEBOX_NX, EYEBOX_NY = 7, 7      # 49 cells, ~1.4 mm each
 
-X_FOV = 7.0 * deg
-Y_FOV = 7.0 * deg
+X_FOV = 8.0 * deg
+Y_FOV = 8.0 * deg
 
 # ── Broadband projector (PlayNitride micro-LED, combined R+G+B) ───────────
 
@@ -64,7 +63,7 @@ PROJECTOR = PlayNitrideLed.create_broadband(
 
 # ── Wavelength sampling (spectral band above 5% of peak) ─────────────────
 
-SPECTRAL_THRESHOLD = 0.05
+SPECTRAL_THRESHOLD = 0.03
 SPECTRAL_SAMPLES = 100
 
 _wl_min, _wl_max = PROJECTOR.spectral_band(threshold=SPECTRAL_THRESHOLD)
@@ -91,7 +90,7 @@ LUMINANCE_TRACE_WEIGHTS = photopic_luminance_weights(TRACE_WAVELENGTHS)
 
 NUM_EYEBOX_CELLS = EYEBOX_NX * EYEBOX_NY    # 49
 PER_CELL_THRESHOLD = 0.002
-PER_CELL_CAP = 0.003
+PER_CELL_CAP = 0.0022
 
 
 # ── Merit & tracer configuration ────────────────────────────────────────────
@@ -107,7 +106,7 @@ merit_cfg_phase1 = PupilMeritConfig(
     weight_coverage=5.0,
     weight_warmup=1.0,
     weight_cap=0.1,
-    sigmoid_steepness=40.0,
+    sigmoid_steepness=8.0,
     soft_min_temperature=15.0,
 )
 
@@ -120,7 +119,7 @@ merit_cfg_phase2 = PupilMeritConfig(
     weight_coverage=3.0,
     weight_warmup=0.5,
     weight_cap=0.2,
-    sigmoid_steepness=40.0,
+    sigmoid_steepness=8.0,
     soft_min_temperature=15.0,
 )
 
@@ -141,7 +140,8 @@ INPUT_FLUX = float(NUM_RAYS * jnp.sum(_spectral_weights * LUMINANCE_TRACE_WEIGHT
 # We build the grid from the pupil element in the reference system. The
 # grid is fixed for the whole optimization (target eyebox is pre-defined).
 
-_ref_system = build_parametrized_system(CombinerParams.initial())
+_ref_system = build_parametrized_system(
+    CombinerParams.initial(), probe_wavelengths=TRACE_WAVELENGTHS)
 _pupil = next(e for e in _ref_system.elements if isinstance(e, RectangularPupil))
 EYEBOX_POINTS = eyebox_grid_points(
     _pupil.position, _pupil.normal, EYEBOX_RADIUS, EYEBOX_NX, EYEBOX_NY,
@@ -156,7 +156,8 @@ BINNING_SIGMA = 0.8 * mm   # ~half grid spacing for smooth spatial gradients
 
 def _compute_spectral_response(params: CombinerParams):
     """Trace the broadband projector at each wavelength, vmapped over wavelengths."""
-    system = build_parametrized_system(params)
+    system = build_parametrized_system(
+        params, probe_wavelengths=TRACE_WAVELENGTHS)
     branch_routes = build_combiner_branch_routes(
         system, num_mirrors=NUM_MIRRORS,
     )
@@ -196,8 +197,8 @@ value_and_grad_phase2 = jax.jit(jax.value_and_grad(loss_fn_phase2))
 
 # ── Adam optimizer ──────────────────────────────────────────────────────────
 
-PHASE1_STEPS = 100
-PHASE2_STEPS = 300
+PHASE1_STEPS = 50
+PHASE2_STEPS = 50
 
 adam_cfg_phase1 = AdamConfig(peak_lr=3e-3, warmup_steps=20, num_steps=PHASE1_STEPS)
 adam_cfg_phase2 = AdamConfig(peak_lr=2e-3, warmup_steps=10, num_steps=PHASE2_STEPS)
@@ -273,9 +274,14 @@ def main():
               f"{float(mirror_width[1])*1e6:.1f}  {float(mirror_width[2])*1e6:.1f}")
 
     response = _compute_spectral_response(params)
-    mean_over_fov = response.mean(axis=1)          # (S, 3)
-    total_brightness = mean_over_fov.sum(axis=-1)  # (S,)
-    relative_brightness = total_brightness / INPUT_FLUX
+    # Match the merit's brightness definition: luminance (V-weighted sum),
+    # not radiometric sum. ``INPUT_FLUX`` is in luminance units, so
+    # mixing radiance numerator with luminance denominator was hiding
+    # values ~2000× below ``threshold_relative`` in the printed grid.
+    luminance_per_angle = jnp.sum(
+        response * LUMINANCE_TRACE_WEIGHTS.reshape(1, 1, -1), axis=-1)  # (S, A)
+    mean_luminance = jnp.mean(luminance_per_angle, axis=-1)             # (S,)
+    relative_brightness = mean_luminance / INPUT_FLUX
 
     threshold = merit_cfg_phase1.threshold_relative
     grid = relative_brightness.reshape(EYEBOX_NY, EYEBOX_NX)
@@ -287,7 +293,8 @@ def main():
           f"min={float(relative_brightness.min()):.5f}  "
           f"max={float(relative_brightness.max()):.5f}")
 
-    final_system = build_parametrized_system(params)
+    final_system = build_parametrized_system(
+        params, probe_wavelengths=TRACE_WAVELENGTHS)
     report_path = save_optimization_report(
         "examples/reports/optimize_pupil",
         system=final_system,
@@ -341,8 +348,6 @@ def main():
         scan_angles=FOV_GRID.angles_grid,
         wavelengths_nm=TRACE_WAVELENGTHS / nm,
     )
-    html_path = render_report(run_dir)
-    print(f"Saved run report: {html_path}")
 
 
 if __name__ == "__main__":

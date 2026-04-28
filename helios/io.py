@@ -101,6 +101,7 @@ def _serialize_element(e) -> dict:
             base.update({
                 "amplitude": _to_list(e.amplitude),
                 "sigma": _to_list(e.sigma),
+                "centers": _to_list(e.centers),
             })
     elif cls == "RectangularAperture":
         base.update({

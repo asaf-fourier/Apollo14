@@ -117,37 +117,53 @@ class GaussianMirror(PartialMirror):
         r(λ) = Σ_c amplitude[c] · exp( −(λ − center[c])² / (2·sigma[c]²) )
 
     The ``amplitude`` and ``sigma`` arrays are the design variables for
-    optimization. The ``reflectance`` and ``wavelengths`` fields on the
-    parent ``PartialMirror`` are computed automatically by sampling the
-    Gaussians at ``probe_wavelengths``.
+    optimization (6 per mirror). The ``centers`` are fixed at the
+    projector primaries and are *not* optimized.
+
+    The dense curve is evaluated at ``probe_wavelengths`` and stored on
+    the parent ``PartialMirror``'s ``wavelengths``/``reflectance`` fields.
+    The trace's ``jnp.interp`` then linearly interpolates between dense
+    samples — visually and numerically a smooth Gaussian sum, provided
+    ``probe_wavelengths`` is fine enough relative to the smallest σ.
 
     Args:
-        amplitude: ``(3,)`` per-color peak reflectance.
-        sigma: ``(3,)`` per-color Gaussian width (same units as
-            wavelengths — typically mm, since the project uses
-            ``apollo14.units.nm`` which converts to mm).
-        probe_wavelengths: ``(K,)`` wavelengths at which to sample the
-            curve. Also used as the Gaussian centers. Defaults to
-            ``DEFAULT_MIRROR_WAVELENGTHS`` (460/525/630 nm).
+        amplitude: ``(C,)`` per-color peak reflectance — design variable.
+        sigma: ``(C,)`` per-color Gaussian width (in length units —
+            typically mm, since the project uses ``apollo14.units.nm``)
+            — design variable.
+        centers: ``(C,)`` Gaussian centers, fixed (e.g. R/G/B projector
+            peaks). Defaults to ``DEFAULT_MIRROR_WAVELENGTHS``.
+        probe_wavelengths: ``(K,)`` dense sample grid where the curve is
+            evaluated before being stored. Defaults to ``centers``
+            (3 points — back-compat; pass a dense grid like the trace
+            wavelengths to get a smooth Gaussian shape).
     """
-    amplitude: jnp.ndarray = None        # (3,) per-color peak reflectance
-    sigma: jnp.ndarray = None            # (3,) per-color Gaussian width
-    probe_wavelengths: jnp.ndarray = None  # (K,) also used as Gaussian centers
+    amplitude: jnp.ndarray = None          # (C,) per-color peak reflectance
+    sigma: jnp.ndarray = None              # (C,) per-color Gaussian width
+    centers: jnp.ndarray = None            # (C,) Gaussian centers (fixed)
+    probe_wavelengths: jnp.ndarray = None  # (K,) dense sample grid
 
     def __post_init__(self):
+        if self.centers is None:
+            self.centers = DEFAULT_MIRROR_WAVELENGTHS
+        else:
+            self.centers = jnp.asarray(self.centers, dtype=jnp.float32)
+
         if self.probe_wavelengths is None:
-            self.probe_wavelengths = DEFAULT_MIRROR_WAVELENGTHS
+            self.probe_wavelengths = self.centers
         else:
             self.probe_wavelengths = jnp.asarray(self.probe_wavelengths,
                                                   dtype=jnp.float32)
 
         if self.amplitude is None:
-            self.amplitude = jnp.full((3,), 0.05, dtype=jnp.float32)
+            self.amplitude = jnp.full((self.centers.shape[0],), 0.05,
+                                       dtype=jnp.float32)
         else:
             self.amplitude = jnp.asarray(self.amplitude, dtype=jnp.float32)
 
         if self.sigma is None:
-            self.sigma = jnp.full((3,), 20.0 * nm, dtype=jnp.float32)
+            self.sigma = jnp.full((self.centers.shape[0],), 20.0 * nm,
+                                   dtype=jnp.float32)
         else:
             self.sigma = jnp.asarray(self.sigma, dtype=jnp.float32)
 
@@ -156,13 +172,16 @@ class GaussianMirror(PartialMirror):
         super().__post_init__()
 
     def _build_reflectance_curve(self) -> jnp.ndarray:
-        """Evaluate sum-of-Gaussians at each probe wavelength."""
-        centers = self.probe_wavelengths                       # (K,)
-        wavelength_offset = (centers[None, :] - centers[:, None])  # (3, K)
-        exponent = -(wavelength_offset ** 2) / (
+        """Evaluate sum-of-Gaussians at each probe wavelength.
+
+        ``offset[c, k] = probe_wavelengths[k] − centers[c]``.
+        """
+        offset = (self.probe_wavelengths[None, :]
+                  - self.centers[:, None])                       # (C, K)
+        exponent = -(offset ** 2) / (
             2.0 * self.sigma[:, None] ** 2 + 1e-18)
-        per_color = self.amplitude[:, None] * jnp.exp(exponent)    # (3, K)
-        return jnp.sum(per_color, axis=0)                          # (K,)
+        per_color = self.amplitude[:, None] * jnp.exp(exponent)  # (C, K)
+        return jnp.sum(per_color, axis=0)                        # (K,)
 
 
 def _interp_reflectance(wavelengths, reflectance, wavelength):

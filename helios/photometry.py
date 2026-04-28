@@ -122,3 +122,19 @@ def photopic_v_np(wavelengths_nm: np.ndarray) -> np.ndarray:
     """numpy version of :func:`photopic_v`. Input wavelengths in *nanometers*."""
     return np.interp(np.asarray(wavelengths_nm),
                      np.asarray(_V_TABLE_NM), np.asarray(_V_TABLE))
+
+
+def luminance_weights_np(wavelengths_nm: np.ndarray,
+                         delta_nm: float | None = None) -> np.ndarray:
+    """numpy version of :func:`luminance_weights`. Wavelengths in *nanometers*.
+
+    Multiplying a per-nm spectral-radiance sample by the corresponding
+    weight and summing yields luminance in cd/m² (nits).
+    """
+    wavelengths_nm = np.asarray(wavelengths_nm, dtype=float)
+    if delta_nm is None:
+        if wavelengths_nm.shape[0] < 2:
+            raise ValueError(
+                "Cannot infer Δλ from a single wavelength — pass delta_nm.")
+        delta_nm = float(np.mean(np.diff(wavelengths_nm)))
+    return K_M * photopic_v_np(wavelengths_nm) * delta_nm

@@ -97,13 +97,61 @@ class TestSystemBuild:
         for color_idx in range(3):
             assert abs(float(first_mirror.reflectance[color_idx]) - 0.08) < 1e-3
 
-    def test_custom_wavelengths_used_as_probe_grid(self):
+    def test_custom_centers_used(self):
         custom = jnp.array([500.0, 550.0, 600.0]) * nm
         system = build_parametrized_system(
-            CombinerParams.initial(), wavelengths=custom)
+            CombinerParams.initial(), centers=custom)
         first_mirror = next(e for e in system.elements
                             if isinstance(e, GaussianMirror))
-        assert jnp.allclose(first_mirror.probe_wavelengths, custom)
+        assert jnp.allclose(first_mirror.centers, custom)
+
+    def test_custom_probe_wavelengths_used(self):
+        dense = jnp.linspace(400.0, 700.0, 64) * nm
+        system = build_parametrized_system(
+            CombinerParams.initial(), probe_wavelengths=dense)
+        first_mirror = next(e for e in system.elements
+                            if isinstance(e, GaussianMirror))
+        assert jnp.allclose(first_mirror.probe_wavelengths, dense)
+        assert first_mirror.reflectance.shape == (64,)
+
+    def test_dense_curve_traces_three_gaussian_peaks(self):
+        """With a dense probe grid, the stored reflectance should be a
+        smooth sum of three Gaussians: peaks at the centers (matching
+        amplitudes), troughs between centers (small at narrow σ)."""
+        dense = jnp.linspace(400.0, 700.0, 301) * nm   # 1 nm spacing
+        params = CombinerParams.initial(amplitude=0.10, width_nm=10.0)
+        system = build_parametrized_system(
+            params, probe_wavelengths=dense)
+        mirror = next(e for e in system.elements
+                      if isinstance(e, GaussianMirror))
+        # Indices closest to each Gaussian center
+        for color_idx in range(3):
+            center = mirror.centers[color_idx]
+            i = int(jnp.argmin(jnp.abs(dense - center)))
+            assert abs(float(mirror.reflectance[i]) - 0.10) < 5e-3
+        # Midpoint between blue (446) and green (545) ≈ 495 nm should be
+        # near zero with σ=10 nm (peaks don't overlap there).
+        i_mid = int(jnp.argmin(jnp.abs(dense - 495.5 * nm)))
+        assert float(mirror.reflectance[i_mid]) < 0.01
+
+    def test_wider_sigma_makes_peaks_overlap(self):
+        """σ=150 nm should make adjacent Gaussians overlap heavily —
+        the midpoint is no longer near zero."""
+        dense = jnp.linspace(400.0, 700.0, 301) * nm
+        params_narrow = CombinerParams.initial(amplitude=0.10, width_nm=10.0)
+        params_wide = CombinerParams.initial(amplitude=0.10, width_nm=150.0)
+        sys_narrow = build_parametrized_system(
+            params_narrow, probe_wavelengths=dense)
+        sys_wide = build_parametrized_system(
+            params_wide, probe_wavelengths=dense)
+        m_narrow = next(e for e in sys_narrow.elements
+                        if isinstance(e, GaussianMirror))
+        m_wide = next(e for e in sys_wide.elements
+                      if isinstance(e, GaussianMirror))
+        i_mid = int(jnp.argmin(jnp.abs(dense - 495.5 * nm)))
+        # Wider σ ⇒ much higher reflectance at the inter-peak midpoint.
+        assert float(m_wide.reflectance[i_mid]) > 5 * float(
+            m_narrow.reflectance[i_mid])
 
 
 # ── ParamBounds ─────────────────────────────────────────────────────────────
@@ -185,7 +233,7 @@ class TestGradient:
         params = CombinerParams.initial()
 
         def first_mirror_reflectance_sum(p):
-            system = build_parametrized_system(p, wavelengths=DEFAULT_WAVELENGTHS)
+            system = build_parametrized_system(p, centers=DEFAULT_WAVELENGTHS)
             first = next(e for e in system.elements
                          if isinstance(e, GaussianMirror))
             return jnp.sum(first.reflectance)
@@ -201,7 +249,7 @@ class TestGradient:
         params = CombinerParams.initial()
 
         def first_to_last_mirror_distance(p):
-            system = build_parametrized_system(p, wavelengths=DEFAULT_WAVELENGTHS)
+            system = build_parametrized_system(p, centers=DEFAULT_WAVELENGTHS)
             mirrors = [e for e in system.elements
                        if isinstance(e, GaussianMirror)]
             return jnp.linalg.norm(mirrors[-1].position - mirrors[0].position)

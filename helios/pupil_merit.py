@@ -16,7 +16,7 @@ This merit evaluates a combiner design against three decoupled goals:
 
 3. **Efficiency (optional soft cap)** — an optional soft upper bound
    ``I_cap`` discourages wasting projector light once a cell is already
-   well above threshold. Useful once ambient transparency matters.
+   well above threshold.
 
 The variables the merit is designed to be differentiated against are the
 per-mirror **Gaussian reflectance parameters** (amplitude, width per
