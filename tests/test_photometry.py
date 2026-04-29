@@ -115,70 +115,59 @@ def _response_at_wavelengths(wavelengths: jnp.ndarray, brightness: float):
 class TestPhotopicMerit:
 
     def test_back_compat_when_luminance_weights_none(self):
-        """With ``luminance_weights=None`` the merit should match the old
-        radiometric behavior exactly."""
+        """``luminance_weights=None`` should match an explicit ones vector."""
         wls = jnp.array([446.0, 545.0, 627.0]) * nm
         response = _response_at_wavelengths(wls, brightness=0.20)
         cfg_radiometric = PupilMeritConfig(
-            d65_weights=D65_WEIGHTS,
-            luminance_weights=None,
-            threshold_relative=0.05,
+            d65_weights=D65_WEIGHTS, luminance_weights=None,
+            target_relative=0.05,
         )
         cfg_explicit_ones = PupilMeritConfig(
-            d65_weights=D65_WEIGHTS,
-            luminance_weights=jnp.ones((3,)),
-            threshold_relative=0.05,
+            d65_weights=D65_WEIGHTS, luminance_weights=jnp.ones((3,)),
+            target_relative=0.05,
         )
         loss_a = float(pupil_merit(response, 1.0, cfg_radiometric))
         loss_b = float(pupil_merit(response, 1.0, cfg_explicit_ones))
         assert abs(loss_a - loss_b) < 1e-6
 
-    def test_brightness_threshold_uses_luminance(self):
-        """A response with all energy in blue should look much *dimmer*
-        than one with all energy in green, even at the same total radiance.
-        The coverage term should fire on blue but not on green."""
+    def test_target_term_uses_luminance(self):
+        """A green-only response is much brighter (per watt) than a
+        blue-only one; with target = green's luminance, green sits at
+        target, blue is far below, and the photometric merit reflects
+        that asymmetry."""
         wls = jnp.array([446.0, 545.0, 627.0]) * nm
         v_weights = luminance_weights(wls, delta_nm=1.0)
 
-        # Concentrate radiance entirely in blue vs green vs red, total = 1.0.
         blue_only = jnp.zeros((4, 3, 3)).at[..., 0].set(1.0)
         green_only = jnp.zeros((4, 3, 3)).at[..., 1].set(1.0)
 
-        # Threshold = 50% of green's per-watt luminance — green clears it,
-        # blue (~3% as visible) does not.
-        green_brightness = float(v_weights[1])
-        threshold_relative = 0.50 * green_brightness  # absolute brightness
-        # input_flux of 1.0 means the threshold is the bare luminance value.
+        # Pick input_flux = green's luminance so target_relative = 1.0
+        # places the target exactly on green. Green hits it; blue (~3%
+        # as visible per watt) sits way below.
+        green_luminance = float(v_weights[1])
         cfg = PupilMeritConfig(
-            d65_weights=D65_WEIGHTS,
-            luminance_weights=v_weights,
-            threshold_relative=threshold_relative,
-            weight_shape=0.0, weight_coverage=1.0,
-            weight_warmup=0.0, weight_cap=0.0,
+            d65_weights=D65_WEIGHTS, luminance_weights=v_weights,
+            target_relative=1.0,
+            weight_shape=0.0, weight_target=1.0,
         )
-        loss_blue = float(pupil_merit(blue_only, 1.0, cfg))
-        loss_green = float(pupil_merit(green_only, 1.0, cfg))
-        assert loss_blue > 0.5      # blue can't reach the threshold
-        assert loss_green < 0.1     # green easily clears it
+        loss_blue = float(pupil_merit(blue_only, green_luminance, cfg))
+        loss_green = float(pupil_merit(green_only, green_luminance, cfg))
+        assert loss_green < 1e-6
+        assert loss_blue > 0.5
 
     def test_shape_term_unchanged_by_luminance_weights(self):
-        """The shape term should depend only on ``response`` and
-        ``d65_weights`` — not on the luminance weighting (which only
-        affects the threshold-driven terms)."""
+        """Shape error is in radiance space — luminance weights don't enter."""
         wls = jnp.array([446.0, 545.0, 627.0]) * nm
-        # Wrong-color response (RGB swapped to BGR) — pure shape error.
         ideal = _response_at_wavelengths(wls, brightness=0.5)
         wrong = ideal[..., ::-1]
 
         cfg_radio = PupilMeritConfig(
             luminance_weights=None,
-            weight_shape=1.0, weight_coverage=0.0,
-            weight_warmup=0.0, weight_cap=0.0,
+            weight_shape=1.0, weight_target=0.0,
         )
         cfg_photo = PupilMeritConfig(
             luminance_weights=luminance_weights(wls, delta_nm=1.0),
-            weight_shape=1.0, weight_coverage=0.0,
-            weight_warmup=0.0, weight_cap=0.0,
+            weight_shape=1.0, weight_target=0.0,
         )
         loss_radio = float(pupil_merit(wrong, 1.0, cfg_radio))
         loss_photo = float(pupil_merit(wrong, 1.0, cfg_photo))
@@ -189,7 +178,7 @@ class TestPhotopicMerit:
         response = _response_at_wavelengths(wls, brightness=0.02)
         cfg = PupilMeritConfig(
             luminance_weights=luminance_weights(wls, delta_nm=1.0),
-            threshold_relative=0.5,
+            target_relative=0.5,
         )
         grads = jax.grad(lambda r: pupil_merit(r, 1.0, cfg))(response)
         assert grads.shape == response.shape

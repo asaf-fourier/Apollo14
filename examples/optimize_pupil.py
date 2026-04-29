@@ -2,15 +2,15 @@
 
 Optimizes the Talos combiner's 41 design variables (5 spacings + 36
 Gaussian amplitude/width params) against :func:`helios.pupil_merit` so
-that a pre-defined target eyebox region on the pupil is:
+that every cell of a pre-defined target eyebox region delivers the
+same brightness (``target_relative`` of input flux), D65 white-balanced
+and FOV-flat.
 
-1. As **full** as possible — every cell above a relative brightness
-   threshold.
-2. **D65 white-balanced and FOV-flat** on the cells that make it into
-   the eyebox.
+Two phases:
 
-Everything the merit reports is relative to an input-flux reference,
-so tuning ``threshold_relative`` doesn't depend on ray count.
+1. **Target** — pull every cell's brightness to the target.
+2. **Target + shape** — keep brightness at target while polishing D65
+   white balance and FOV uniformity.
 
 Run::
 
@@ -32,6 +32,7 @@ from apollo14.projector import PlayNitrideLed, FovGrid
 
 from helios.combiner_params import (
     CombinerParams, ParamBounds, build_parametrized_system, NUM_MIRRORS,
+    fwhm_to_sigma,
 )
 from apollo14.trace import prepare_route
 from helios.merit import build_combiner_branch_routes, d65_weights_at
@@ -80,51 +81,39 @@ D65_TRACE_WEIGHTS = d65_weights_at(TRACE_WAVELENGTHS)
 
 # ── Photopic V(λ)·Δλ·K_m weights at the traced wavelengths ─────────────────
 # Photometric "brightness" — blue at 446 nm counts ~3% of green at 545 nm
-# per watt. The merit's coverage / warm-up / cap thresholds become
-# perceptually meaningful instead of radiometric.
+# per watt. The merit's per-cell target becomes perceptually meaningful
+# instead of radiometric.
 
 LUMINANCE_TRACE_WEIGHTS = photopic_luminance_weights(TRACE_WAVELENGTHS)
 
-# ── Per-cell brightness targets ─────────────────────────────────────────────
-# Fractions of input flux each of the 49 eyebox cells should receive.
-# With NUM_EYEBOX_CELLS=49: threshold 0.002 ≈ 9.8% of input flux reaching
-# the eyebox uniformly, cap 0.003 ≈ 14.7% — a ~50% headroom band lets the
-# optimizer find a uniform-ish solution without being whipsawed by an
-# equality-only constraint.
+# ── Per-cell brightness target ─────────────────────────────────────────────
+# Fraction of input flux each of the 49 eyebox cells should receive.
+# 0.002 × 49 ≈ 9.8% of input flux reaching the eyebox uniformly.
 
 NUM_EYEBOX_CELLS = EYEBOX_NX * EYEBOX_NY    # 49
-PER_CELL_THRESHOLD = 0.002
-PER_CELL_CAP = 0.0022
+PER_CELL_TARGET = 0.002
 
 
 # ── Merit & tracer configuration ────────────────────────────────────────────
 
 FOV_GRID = FovGrid(DEFAULT_LIGHT_DIRECTION, X_FOV, Y_FOV, num_x=14, num_y=14)
 
+# Phase 1: drive every cell toward the target brightness; ignore color.
 merit_cfg_phase1 = PupilMeritConfig(
-    threshold_relative=PER_CELL_THRESHOLD,
-    cap_relative=PER_CELL_CAP,
+    target_relative=PER_CELL_TARGET,
     d65_weights=D65_TRACE_WEIGHTS,
     luminance_weights=LUMINANCE_TRACE_WEIGHTS,
-    weight_shape=0.2,
-    weight_coverage=5.0,
-    weight_warmup=1.0,
-    weight_cap=0.1,
-    sigmoid_steepness=8.0,
-    soft_min_temperature=15.0,
+    weight_target=1.0,
+    weight_shape=0.0,
 )
 
+# Phase 2: keep cells at target while polishing D65 + FOV uniformity.
 merit_cfg_phase2 = PupilMeritConfig(
-    threshold_relative=PER_CELL_THRESHOLD,
-    cap_relative=PER_CELL_CAP,
+    target_relative=PER_CELL_TARGET,
     d65_weights=D65_TRACE_WEIGHTS,
     luminance_weights=LUMINANCE_TRACE_WEIGHTS,
+    weight_target=1.0,
     weight_shape=1.0,
-    weight_coverage=3.0,
-    weight_warmup=0.5,
-    weight_cap=0.2,
-    sigmoid_steepness=8.0,
-    soft_min_temperature=15.0,
 )
 
 bounds = ParamBounds()
@@ -202,7 +191,7 @@ value_and_grad_phase2 = jax.jit(jax.value_and_grad(loss_fn_phase2))
 # ── Adam optimizer ──────────────────────────────────────────────────────────
 
 PHASE1_STEPS = 100
-PHASE2_STEPS = 50
+PHASE2_STEPS = 200
 
 adam_cfg_phase1 = AdamConfig(peak_lr=3e-3, warmup_steps=20, num_steps=PHASE1_STEPS)
 adam_cfg_phase2 = AdamConfig(peak_lr=2e-3, warmup_steps=10, num_steps=PHASE2_STEPS)
@@ -212,12 +201,12 @@ adam_cfg_phase2 = AdamConfig(peak_lr=2e-3, warmup_steps=10, num_steps=PHASE2_STE
 
 def _print_breakdown(label, bd):
     print(f"\n{label}: {float(bd['total']):.5f}")
-    print(f"  shape={float(bd['shape']):.5f}  "
-          f"coverage={float(bd['coverage']):.5f}  "
-          f"warmup={float(bd['warmup']):.5f}  "
-          f"cap={float(bd['cap']):.5f}")
-    print(f"  active_fraction={float(bd['active_fraction']):.3f}  "
-          f"min_rel={float(bd['min_brightness_rel']):.4f}")
+    print(f"  target={float(bd['target']):.5f}  "
+          f"shape={float(bd['shape']):.5f}")
+    print(f"  brightness mean_rel={float(bd['mean_brightness_rel']):.5f}  "
+          f"std_rel={float(bd['brightness_std_rel']):.5f}  "
+          f"min_rel={float(bd['min_brightness_rel']):.5f}  "
+          f"max_rel={float(bd['max_brightness_rel']):.5f}")
 
 
 RUNS_ROOT = Path("examples/reports/optimize_pupil")
@@ -228,7 +217,9 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Run directory: {run_dir}")
 
-    initial_params = CombinerParams.initial(amplitude=0.10, width_nm=10)
+    # σ=15 nm sits comfortably above ParamBounds.fwhm_min_nm=20 ⇒ σ_min ≈ 8.5 nm,
+    # so the first Adam step doesn't immediately get clipped.
+    initial_params = CombinerParams.initial(amplitude=0.10, width_nm=15)
     params = initial_params
     state = adam_init(params)
 
@@ -241,14 +232,36 @@ def main():
     print(f"Spectrum:  {SPECTRAL_SAMPLES} samples/channel, "
           f">{SPECTRAL_THRESHOLD:.0%} of peak")
     print(f"I_in:      {INPUT_FLUX:.1f}  "
-          f"(threshold_relative={merit_cfg_phase1.threshold_relative})")
+          f"(target_relative={merit_cfg_phase1.target_relative})")
+
+    # Ceiling diagnostic — what brightness can we hope for?
+    # Saturate amplitudes and widths at their upper bounds (spacings stay
+    # at the initial value). This isn't a true ceiling — the optimizer
+    # may actually find higher per-cell brightness with non-uniform
+    # amplitudes — but it tells you whether ``PER_CELL_TARGET`` is
+    # plausibly reachable at all.
+    ceiling_params = CombinerParams(
+        spacings=initial_params.spacings,
+        amplitudes=jnp.full_like(initial_params.amplitudes, bounds.amplitude_max),
+        widths=jnp.full_like(initial_params.widths,
+                              fwhm_to_sigma(bounds.fwhm_max_nm * nm)),
+    )
+    ceiling_response = _compute_spectral_response(ceiling_params)
+    ceiling_lum_per_angle = jnp.sum(
+        ceiling_response * LUMINANCE_TRACE_WEIGHTS.reshape(1, 1, -1), axis=-1)
+    ceiling_brightness = jnp.mean(ceiling_lum_per_angle, axis=-1) / INPUT_FLUX
+    print(f"Ceiling per-cell brightness (amp=max, FWHM=max): "
+          f"min={float(ceiling_brightness.min()):.5f}  "
+          f"mean={float(ceiling_brightness.mean()):.5f}  "
+          f"max={float(ceiling_brightness.max()):.5f}  "
+          f"(target={PER_CELL_TARGET})")
 
     initial_breakdown = breakdown_fn(params, merit_cfg_phase1)
     _print_breakdown("Initial merit (phase 1 weights)", initial_breakdown)
 
     loss_history = []
 
-    print("\n── Phase 1: coverage-focused (fill the eyebox) ──")
+    print("\n── Phase 1: target-focused (drive every cell to target) ──")
     for step in range(PHASE1_STEPS):
         loss, grad = value_and_grad_phase1(params)
         params, state = adam_step(params, grad, state, adam_cfg_phase1)
@@ -259,7 +272,7 @@ def main():
     phase1_breakdown = breakdown_fn(params, merit_cfg_phase1)
     _print_breakdown("Phase 1 result", phase1_breakdown)
 
-    print("\n── Phase 2: shape-focused (D65 white balance + uniformity) ──")
+    print("\n── Phase 2: target + D65/FOV uniformity ──")
     state = adam_init(params)
     for step in range(PHASE2_STEPS):
         loss, grad = value_and_grad_phase2(params)
@@ -285,24 +298,21 @@ def main():
               f"{float(mirror_width[1])*1e6:.1f}  {float(mirror_width[2])*1e6:.1f}")
 
     response = _compute_spectral_response(params)
-    # Match the merit's brightness definition: luminance (V-weighted sum),
-    # not radiometric sum. ``INPUT_FLUX`` is in luminance units, so
-    # mixing radiance numerator with luminance denominator was hiding
-    # values ~2000× below ``threshold_relative`` in the printed grid.
+    # Match the merit's brightness definition: luminance (V-weighted sum).
+    # ``INPUT_FLUX`` is in the same units, so the printed values are
+    # directly comparable to ``PER_CELL_TARGET``.
     luminance_per_angle = jnp.sum(
         response * LUMINANCE_TRACE_WEIGHTS.reshape(1, 1, -1), axis=-1)  # (S, A)
     mean_luminance = jnp.mean(luminance_per_angle, axis=-1)             # (S,)
     relative_brightness = mean_luminance / INPUT_FLUX
 
-    threshold = merit_cfg_phase1.threshold_relative
     grid = relative_brightness.reshape(EYEBOX_NY, EYEBOX_NX)
-    print(f"\nEyebox brightness map (relative to input flux, threshold={threshold}):")
+    print(f"\nEyebox brightness map (relative to input flux, target={PER_CELL_TARGET}):")
     for row in grid:
         print("  " + "  ".join(f"{float(v):.4f}" for v in row))
-    active_cells = int((relative_brightness >= threshold).sum())
-    print(f"Active cells: {active_cells}/{relative_brightness.shape[0]}  "
-          f"min={float(relative_brightness.min()):.5f}  "
-          f"max={float(relative_brightness.max()):.5f}")
+    print(f"min={float(relative_brightness.min()):.5f}  "
+          f"max={float(relative_brightness.max()):.5f}  "
+          f"std={float(relative_brightness.std()):.5f}")
 
     final_system = build_parametrized_system(
         params, probe_wavelengths=TRACE_WAVELENGTHS)
@@ -318,13 +328,13 @@ def main():
                 "steps": PHASE1_STEPS,
                 "peak_lr": adam_cfg_phase1.peak_lr,
                 "warmup_steps": adam_cfg_phase1.warmup_steps,
-                "focus": "coverage",
+                "focus": "target",
             },
             "phase2": {
                 "steps": PHASE2_STEPS,
                 "peak_lr": adam_cfg_phase2.peak_lr,
                 "warmup_steps": adam_cfg_phase2.warmup_steps,
-                "focus": "shape",
+                "focus": "target+shape",
             },
             "schedule": "warmup_cosine_decay",
             "total_steps": PHASE1_STEPS + PHASE2_STEPS,

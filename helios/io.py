@@ -233,16 +233,10 @@ def _serialize_combiner_params(params) -> dict:
 
 def _serialize_merit_config(config) -> dict:
     return {
-        "threshold_relative": _round_sig(float(config.threshold_relative)),
-        "cap_relative": (_round_sig(float(config.cap_relative))
-                         if config.cap_relative is not None else None),
-        "sigmoid_steepness": _round_sig(float(config.sigmoid_steepness)),
-        "soft_min_temperature": _round_sig(float(config.soft_min_temperature)),
+        "target_relative": _round_sig(float(config.target_relative)),
         "shape_floor_epsilon": float(config.shape_floor_epsilon),
+        "weight_target": _round_sig(float(config.weight_target)),
         "weight_shape": _round_sig(float(config.weight_shape)),
-        "weight_coverage": _round_sig(float(config.weight_coverage)),
-        "weight_warmup": _round_sig(float(config.weight_warmup)),
-        "weight_cap": _round_sig(float(config.weight_cap)),
     }
 
 

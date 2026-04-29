@@ -153,17 +153,12 @@ def test_serialize_combiner_params():
 
 
 def test_serialize_merit_config():
-    cfg = PupilMeritConfig(threshold_relative=0.05, cap_relative=0.15)
+    cfg = PupilMeritConfig(target_relative=0.05,
+                           weight_target=2.0, weight_shape=0.5)
     serialized = _serialize_merit_config(cfg)
-    assert serialized["threshold_relative"] == 0.05
-    assert serialized["cap_relative"] == 0.15
-    assert "weight_shape" in serialized
-
-
-def test_serialize_merit_config_no_cap():
-    cfg = PupilMeritConfig(cap_relative=None)
-    serialized = _serialize_merit_config(cfg)
-    assert serialized["cap_relative"] is None
+    assert serialized["target_relative"] == 0.05
+    assert serialized["weight_target"] == 2.0
+    assert serialized["weight_shape"] == 0.5
 
 
 # ── save_optimization_report ───────────────────────────────────────────────
