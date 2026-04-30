@@ -48,6 +48,9 @@ from helios.adam import AdamConfig, adam_init, adam_step
 from helios.io import save_optimization_report, save_run, ScanConfig
 from helios.reports.pupil_report import render_pupil_report
 
+jax.config.update("jax_compilation_cache_dir", "/home/ubuntu/.cache/jax")
+jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 
 # ── Eyebox target region (pre-defined, fixed) ───────────────────────────────
 
@@ -149,7 +152,13 @@ BINNING_SIGMA = 0.8 * mm   # ~half grid spacing for smooth spatial gradients
 
 
 def _compute_spectral_response(params: CombinerParams):
-    """Trace the broadband projector at each wavelength, vmapped over wavelengths."""
+    """Trace the broadband projector at each wavelength, scanned over wavelengths.
+
+    Scan (not vmap) keeps the compiled kernel small — the per-wavelength
+    body already has plenty of parallelism (FOV × ray vmaps) to saturate
+    the GPU, and vmapping the wavelength axis on top blows up register
+    pressure and ptxas compile size.
+    """
     system = build_parametrized_system(
         params, probe_wavelengths=TRACE_WAVELENGTHS)
     branch_routes = build_combiner_branch_routes(
@@ -157,16 +166,17 @@ def _compute_spectral_response(params: CombinerParams):
     )
     directions = FOV_GRID.flat_directions  # (A, 3)
 
-    def trace_one_wavelength(wavelength):
+    def trace_one_wavelength(_, wavelength):
         binned = jnp.zeros((directions.shape[0], EYEBOX_POINTS.shape[0]))
         for route in branch_routes:
             prepared = prepare_route(route, wavelength)
             binned = binned + trace_branch_over_fov(
                 prepared, PROJECTOR, EYEBOX_POINTS, wavelength,
                 directions, sigma=BINNING_SIGMA)  # (A, S)
-        return binned.T  # (S, A)
+        return None, binned.T  # (S, A)
 
-    all_responses = jax.vmap(trace_one_wavelength)(TRACE_WAVELENGTHS)  # (N, S, A)
+    _, all_responses = jax.lax.scan(
+        trace_one_wavelength, None, TRACE_WAVELENGTHS)  # (N, S, A)
     return jnp.transpose(all_responses, (1, 2, 0))  # (S, A, N)
 
 
