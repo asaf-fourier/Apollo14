@@ -24,20 +24,31 @@ def eyebox_grid_points(center, normal, radius, nx, ny):
 
 def trace_branch_over_fov(route, projector, eyebox_points, wavelength,
                           directions, sigma=None):
-    """Trace one branch route across all FOV directions via vmap.
+    """Trace one branch route across all FOV directions, scanned over directions.
 
     Returns ``(A, S)`` binned intensity at each eyebox sample for each
     FOV direction.
+
+    Uses ``lax.scan`` (not ``vmap``) to keep the compiled kernel small —
+    the per-direction binning intermediate has shape
+    ``(rays, eyebox_cells, 3)`` and vmapping the direction axis on top
+    multiplies that by ``A`` (≈1024), exhausting GPU shared memory in
+    one fused Triton kernel. The inner ray vmap inside
+    ``projector.generate_rays`` / ``trace_rays`` already saturates the
+    GPU per direction, so the scan is roughly free at runtime.
     """
-    def per_direction(direction):
+    def per_direction(_, direction):
         ray = projector.generate_rays(direction=direction,
                                       wavelength=wavelength)
         traced = trace_rays(route, ray, wavelength=wavelength)
         if sigma is not None:
-            return bin_hits_soft(traced, eyebox_points, sigma)
-        return bin_hits_to_nearest(traced, eyebox_points, stop_grad=True)
+            binned = bin_hits_soft(traced, eyebox_points, sigma)
+        else:
+            binned = bin_hits_to_nearest(traced, eyebox_points, stop_grad=True)
+        return None, binned
 
-    return jax.vmap(per_direction)(directions)  # (A, S)
+    _, binned_per_direction = jax.lax.scan(per_direction, None, directions)
+    return binned_per_direction  # (A, S)
 
 
 def compute_eyebox_response(routes_per_wavelength, projector,
