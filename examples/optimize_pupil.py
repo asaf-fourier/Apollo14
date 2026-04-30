@@ -175,8 +175,11 @@ def _compute_spectral_response(params: CombinerParams):
                 directions, sigma=BINNING_SIGMA)  # (A, S)
         return None, binned.T  # (S, A)
 
+    # ``jax.checkpoint`` rematerializes each wavelength's forward during
+    # backward instead of saving the full per-(wavelength, direction, ray,
+    # cell) activation tape — without it value_and_grad needs ~200 GB.
     _, all_responses = jax.lax.scan(
-        trace_one_wavelength, None, TRACE_WAVELENGTHS)  # (N, S, A)
+        jax.checkpoint(trace_one_wavelength), None, TRACE_WAVELENGTHS)  # (N, S, A)
     return jnp.transpose(all_responses, (1, 2, 0))  # (S, A, N)
 
 
