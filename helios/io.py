@@ -84,11 +84,29 @@ def _serialize_projector(p: Projector) -> dict:
     return out
 
 
+def _serialize_curve(curve) -> dict:
+    """Serialize a :class:`apollo14.spectral.SpectralCurve` to a dict.
+
+    Each curve type writes its own field set under a discriminating
+    ``type`` key, so a reader can dispatch without importing the curve
+    classes.
+    """
+    cls = type(curve).__name__
+    if cls == "SumOfGaussiansCurve":
+        return {
+            "type": cls,
+            "amplitude": _to_list(curve.amplitude),
+            "sigma": _to_list(curve.sigma),
+            "centers": _to_list(curve.centers),
+        }
+    raise ValueError(f"No serializer for curve type {cls!r}")
+
+
 def _serialize_element(e) -> dict:
     cls = type(e).__name__
     base = {"type": cls, "name": getattr(e, "name", None)}
 
-    if cls in ("PartialMirror", "GaussianMirror"):
+    if cls == "PartialMirror":
         base.update({
             "position": _to_list(e.position),
             "normal": _to_list(e.normal),
@@ -97,12 +115,8 @@ def _serialize_element(e) -> dict:
             "wavelengths": _to_list(e.wavelengths),
             "reflectance": _to_list(e.reflectance),
         })
-        if cls == "GaussianMirror":
-            base.update({
-                "amplitude": _to_list(e.amplitude),
-                "sigma": _to_list(e.sigma),
-                "centers": _to_list(e.centers),
-            })
+        if e.curve is not None:
+            base["curve"] = _serialize_curve(e.curve)
     elif cls == "RectangularAperture":
         base.update({
             "position": _to_list(e.position),
@@ -226,8 +240,7 @@ def _serialize_fov_grid(fov_grid: FovGrid) -> dict:
 def _serialize_combiner_params(params) -> dict:
     return {
         "spacings": _to_list(params.spacings),
-        "amplitudes": _to_list(params.amplitudes),
-        "widths": _to_list(params.widths),
+        "curve": _serialize_curve(params.curves),
     }
 
 

@@ -26,7 +26,15 @@ from helios.reports.figures.overview import (
     pupil_d65_distance_figure,
 )
 from helios.reports.figures.per_cell import per_cell_d65_fov_figure
+from helios.reports.figures.projector import (
+    mirror_input_spectrum_figure,
+    projector_spectrum_figure,
+)
 from helios.reports.figures.visible_color import per_cell_visible_color_figure
+from helios.reports.headline import (
+    compute_headline_numbers,
+    headline_numbers_html,
+)
 
 
 def render_pupil_report(
@@ -71,7 +79,8 @@ def render_pupil_report(
         )),
     ]
 
-    body = [_html_header(manifest)]
+    headline = compute_headline_numbers(manifest, response, wavelengths_nm)
+    body = [_html_header(manifest), headline_numbers_html(headline)]
     figure_index = 0
     for page_title, blocks in pages:
         body.append(f"<h2>{page_title}</h2>")
@@ -179,6 +188,20 @@ def _diagnostics_page(manifest, response, scan_angles, wavelengths_nm):
         "and overall reflectance levels. The legend lists the mirrors in "
         "stack order from projector to pupil."
     )
+    projector_caption = (
+        "The projector's emitted spectrum (peak-normalized). The R/G/B "
+        "primaries are visible as three distinct bumps; the relative "
+        "heights determine how much each color the optimizer has to "
+        "work with."
+    )
+    mirror_input_caption = (
+        "What spectrum each mirror actually sees. The first curve is the "
+        "projector; each subsequent curve is the previous one multiplied "
+        "by ``(1 − r_j(λ))`` — the fraction the upstream mirror "
+        "transmitted. The dashed curve is what exits the stack after the "
+        "last mirror. Reveals where the projector's light is being "
+        "absorbed and which mirrors run on a starved spectrum."
+    )
     fov_total_caption = (
         "Total light delivered at each FOV direction, summed over all "
         "channels and averaged over pupil cells. Inverts the pupil/FOV "
@@ -197,6 +220,10 @@ def _diagnostics_page(manifest, response, scan_angles, wavelengths_nm):
     return [
         ("Mirror reflectance r(λ)", mirror_caption,
          mirror_reflectance_figure(manifest)),
+        ("Projector spectrum", projector_caption,
+         projector_spectrum_figure(manifest)),
+        ("Spectrum incident on each mirror", mirror_input_caption,
+         mirror_input_spectrum_figure(manifest)),
         ("FOV total intensity (pupil-averaged)", fov_total_caption,
          fov_total_fig),
         ("FOV worst-cell weakness map", fov_worst_caption,
@@ -233,6 +260,12 @@ def _html_wrap(body: str) -> str:
         "p.caption{margin:0 0 .8em 0;color:#555;font-size:.92em;"
         "max-width:780px;}"
         ".meta{color:#666;font-size:.9em;margin-bottom:2em;}"
-        ".row{display:flex;flex-wrap:wrap;gap:1em;}</style>"
+        ".row{display:flex;flex-wrap:wrap;gap:1em;}"
+        ".headline{background:#f7f7f9;border:1px solid #e1e1e8;"
+        "border-radius:6px;padding:1em 1.2em;margin-bottom:2em;}"
+        ".headline-table{border-collapse:collapse;font-size:.95em;}"
+        ".headline-table th{text-align:left;font-weight:600;"
+        "padding:.2em .9em .2em 0;color:#444;}"
+        ".headline-table td{padding:.2em 0;font-variant-numeric:tabular-nums;}</style>"
         f"</head><body>{body}</body></html>"
     )

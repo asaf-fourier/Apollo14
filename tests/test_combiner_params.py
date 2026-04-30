@@ -2,7 +2,7 @@
 
 Covers the four moving parts: ``CombinerParams.initial`` shape, system
 build (positions + reflectance), ``ParamBounds.clip`` clamping/rescaling,
-and gradient flow back to params via the GaussianMirror reflectance curve.
+and gradient flow back to params via the curve's reflectance samples.
 """
 
 import jax
@@ -10,8 +10,9 @@ import jax.numpy as jnp
 
 from apollo14.elements.aperture import RectangularAperture
 from apollo14.elements.glass_block import GlassBlock
-from apollo14.elements.partial_mirror import GaussianMirror
+from apollo14.elements.partial_mirror import PartialMirror
 from apollo14.elements.pupil import RectangularPupil
+from apollo14.spectral import SumOfGaussiansCurve
 from apollo14.units import mm, nm
 from helios.combiner_params import (
     CombinerParams,
@@ -29,21 +30,30 @@ class TestInitial:
     def test_default_shapes(self):
         params = CombinerParams.initial()
         assert params.spacings.shape == (5,)
-        assert params.amplitudes.shape == (6, 3)
-        assert params.widths.shape == (6, 3)
+        assert params.curves.amplitude.shape == (6, 3)
+        assert params.curves.sigma.shape == (6, 3)
+        assert params.curves.centers.shape == (6, 3)
 
     def test_custom_num_mirrors(self):
         params = CombinerParams.initial(num_mirrors=4)
         assert params.spacings.shape == (3,)
-        assert params.amplitudes.shape == (4, 3)
-        assert params.widths.shape == (4, 3)
+        assert params.curves.amplitude.shape == (4, 3)
+        assert params.curves.sigma.shape == (4, 3)
 
     def test_uniform_initialization(self):
         params = CombinerParams.initial(
             spacing_mm=2.0, amplitude=0.07, width_nm=30.0)
         assert jnp.allclose(params.spacings, 2.0 * mm)
-        assert jnp.allclose(params.amplitudes, 0.07)
-        assert jnp.allclose(params.widths, 30.0 * nm)
+        assert jnp.allclose(params.curves.amplitude, 0.07)
+        assert jnp.allclose(params.curves.sigma, 30.0 * nm)
+
+    def test_custom_basis_size(self):
+        """Centers of arbitrary length B configure a B-basis curve."""
+        custom_centers = jnp.linspace(420.0, 680.0, 5) * nm
+        params = CombinerParams.initial(centers=custom_centers)
+        assert params.curves.amplitude.shape == (6, 5)
+        assert params.curves.sigma.shape == (6, 5)
+        assert jnp.allclose(params.curves.centers[0], custom_centers)
 
 
 # ── build_parametrized_system ───────────────────────────────────────────────
@@ -58,16 +68,22 @@ class TestSystemBuild:
         assert sum(isinstance(e, GlassBlock) for e in system.elements) == 1
         assert sum(isinstance(e, RectangularAperture)
                    for e in system.elements) == 1
-        assert sum(isinstance(e, GaussianMirror)
+        assert sum(isinstance(e, PartialMirror)
                    for e in system.elements) == 6
         assert sum(isinstance(e, RectangularPupil)
                    for e in system.elements) == 1
 
     def test_mirrors_named_in_order(self):
         system = build_parametrized_system(CombinerParams.initial())
-        mirrors = [e for e in system.elements if isinstance(e, GaussianMirror)]
+        mirrors = [e for e in system.elements if isinstance(e, PartialMirror)]
         names = [m.name for m in mirrors]
         assert names == [f"mirror_{i}" for i in range(6)]
+
+    def test_each_mirror_has_a_curve(self):
+        system = build_parametrized_system(CombinerParams.initial())
+        mirrors = [e for e in system.elements if isinstance(e, PartialMirror)]
+        for m in mirrors:
+            assert isinstance(m.curve, SumOfGaussiansCurve)
 
     def test_mirror_positions_follow_spacings(self):
         """Mirrors should sit at uniformly-spaced positions when given
@@ -77,7 +93,7 @@ class TestSystemBuild:
         the spacing value directly."""
         params = CombinerParams.initial(spacing_mm=1.5)
         system = build_parametrized_system(params)
-        mirrors = [e for e in system.elements if isinstance(e, GaussianMirror)]
+        mirrors = [e for e in system.elements if isinstance(e, PartialMirror)]
         steps = jnp.array([
             float(jnp.linalg.norm(mirrors[i + 1].position - mirrors[i].position))
             for i in range(len(mirrors) - 1)
@@ -86,33 +102,33 @@ class TestSystemBuild:
         assert float(steps[0]) > 0.0
 
     def test_gaussian_reflectance_peaks_match_amplitude(self):
-        """At each Gaussian's center wavelength the off-color contributions
-        are nearly zero (narrow widths), so the on-color reflectance is
+        """At each Gaussian's center wavelength the off-basis contributions
+        are nearly zero (narrow widths), so the on-basis reflectance is
         essentially the amplitude."""
         params = CombinerParams.initial(amplitude=0.08, width_nm=5.0)
         system = build_parametrized_system(params)
         first_mirror = next(e for e in system.elements
-                            if isinstance(e, GaussianMirror))
+                            if isinstance(e, PartialMirror))
         # reflectance is sampled at probe_wavelengths == DEFAULT_WAVELENGTHS,
-        # which are also the Gaussian centers — peak per color.
-        for color_idx in range(3):
-            assert abs(float(first_mirror.reflectance[color_idx]) - 0.08) < 1e-3
+        # which are also the Gaussian centers — peak per basis bump.
+        for basis_idx in range(3):
+            assert abs(float(first_mirror.reflectance[basis_idx]) - 0.08) < 1e-3
 
     def test_custom_centers_used(self):
         custom = jnp.array([500.0, 550.0, 600.0]) * nm
-        system = build_parametrized_system(
-            CombinerParams.initial(), centers=custom)
+        params = CombinerParams.initial(centers=custom)
+        system = build_parametrized_system(params)
         first_mirror = next(e for e in system.elements
-                            if isinstance(e, GaussianMirror))
-        assert jnp.allclose(first_mirror.centers, custom)
+                            if isinstance(e, PartialMirror))
+        assert jnp.allclose(first_mirror.curve.centers, custom)
 
     def test_custom_probe_wavelengths_used(self):
         dense = jnp.linspace(400.0, 700.0, 64) * nm
         system = build_parametrized_system(
             CombinerParams.initial(), probe_wavelengths=dense)
         first_mirror = next(e for e in system.elements
-                            if isinstance(e, GaussianMirror))
-        assert jnp.allclose(first_mirror.probe_wavelengths, dense)
+                            if isinstance(e, PartialMirror))
+        assert jnp.allclose(first_mirror.wavelengths, dense)
         assert first_mirror.reflectance.shape == (64,)
 
     def test_dense_curve_traces_three_gaussian_peaks(self):
@@ -124,10 +140,10 @@ class TestSystemBuild:
         system = build_parametrized_system(
             params, probe_wavelengths=dense)
         mirror = next(e for e in system.elements
-                      if isinstance(e, GaussianMirror))
+                      if isinstance(e, PartialMirror))
         # Indices closest to each Gaussian center
-        for color_idx in range(3):
-            center = mirror.centers[color_idx]
+        for basis_idx in range(3):
+            center = mirror.curve.centers[basis_idx]
             i = int(jnp.argmin(jnp.abs(dense - center)))
             assert abs(float(mirror.reflectance[i]) - 0.10) < 5e-3
         # Midpoint between blue (446) and green (545) ≈ 495 nm should be
@@ -146,9 +162,9 @@ class TestSystemBuild:
         sys_wide = build_parametrized_system(
             params_wide, probe_wavelengths=dense)
         m_narrow = next(e for e in sys_narrow.elements
-                        if isinstance(e, GaussianMirror))
+                        if isinstance(e, PartialMirror))
         m_wide = next(e for e in sys_wide.elements
-                      if isinstance(e, GaussianMirror))
+                      if isinstance(e, PartialMirror))
         i_mid = int(jnp.argmin(jnp.abs(dense - 495.5 * nm)))
         # Wider σ ⇒ much higher reflectance at the inter-peak midpoint.
         assert float(m_wide.reflectance[i_mid]) > 5 * float(
@@ -158,40 +174,57 @@ class TestSystemBuild:
 # ── ParamBounds ─────────────────────────────────────────────────────────────
 
 
+def _curves_with(amplitude, sigma, num_mirrors=6):
+    """Build a uniform 6×3 batched curve at default centers with given
+    amplitude/sigma arrays (broadcast as needed)."""
+    centers = jnp.broadcast_to(DEFAULT_WAVELENGTHS, (num_mirrors, 3)).copy()
+    return SumOfGaussiansCurve(
+        amplitude=jnp.broadcast_to(jnp.asarray(amplitude),
+                                    (num_mirrors, 3)).copy(),
+        sigma=jnp.broadcast_to(jnp.asarray(sigma),
+                                (num_mirrors, 3)).copy(),
+        centers=centers,
+    )
+
+
 class TestParamBounds:
 
     def test_amplitude_clipped_to_range(self):
         params = CombinerParams(
             spacings=jnp.full((5,), 1.5 * mm),
-            amplitudes=jnp.array([[0.001, 0.5, 0.05]] * 6),
-            widths=jnp.full((6, 3), 20.0 * nm),
+            curves=_curves_with(amplitude=jnp.array([0.001, 0.5, 0.05]),
+                                 sigma=20.0 * nm),
         )
         bounds = ParamBounds()
         clipped = bounds.clip(params)
         # Use a tiny tolerance — float32 round-trip can shave the last bit.
         eps = 1e-7
-        assert float(jnp.min(clipped.amplitudes)) >= bounds.amplitude_min - eps
-        assert float(jnp.max(clipped.amplitudes)) <= bounds.amplitude_max + eps
+        assert float(jnp.min(clipped.curves.amplitude)) >= bounds.amplitude_min - eps
+        assert float(jnp.max(clipped.curves.amplitude)) <= bounds.amplitude_max + eps
 
     def test_width_clipped_to_range(self):
         params = CombinerParams(
             spacings=jnp.full((5,), 1.5 * mm),
-            amplitudes=jnp.full((6, 3), 0.05),
-            widths=jnp.array([[5.0 * nm, 200.0 * nm, 50.0 * nm]] * 6),
+            curves=_curves_with(amplitude=0.05,
+                                 sigma=jnp.array([5.0, 200.0, 50.0]) * nm),
         )
         bounds = ParamBounds()
         clipped = bounds.clip(params)
         eps_nm = 1e-3 * nm
         sigma_min = fwhm_to_sigma(bounds.fwhm_min_nm * nm)
         sigma_max = fwhm_to_sigma(bounds.fwhm_max_nm * nm)
-        assert float(jnp.min(clipped.widths)) >= sigma_min - eps_nm
-        assert float(jnp.max(clipped.widths)) <= sigma_max + eps_nm
+        assert float(jnp.min(clipped.curves.sigma)) >= sigma_min - eps_nm
+        assert float(jnp.max(clipped.curves.sigma)) <= sigma_max + eps_nm
+
+    def test_centers_unchanged_by_clip(self):
+        original = CombinerParams.initial()
+        clipped = ParamBounds().clip(original)
+        assert jnp.allclose(clipped.curves.centers, original.curves.centers)
 
     def test_spacing_clipped_to_range(self):
         params = CombinerParams(
             spacings=jnp.array([0.1, 5.0, 1.0, 1.0, 1.0]) * mm,
-            amplitudes=jnp.full((6, 3), 0.05),
-            widths=jnp.full((6, 3), 20.0 * nm),
+            curves=_curves_with(amplitude=0.05, sigma=20.0 * nm),
         )
         bounds = ParamBounds()
         clipped = bounds.clip(params)
@@ -209,8 +242,7 @@ class TestParamBounds:
                              spacing_min_mm=0.5, spacing_max_mm=4.0)
         too_long = CombinerParams(
             spacings=jnp.full((5,), 4.0 * mm),
-            amplitudes=jnp.full((6, 3), 0.05),
-            widths=jnp.full((6, 3), 20.0 * nm),
+            curves=_curves_with(amplitude=0.05, sigma=20.0 * nm),
         )
         clipped = bounds.clip(too_long)
         assert float(jnp.sum(clipped.spacings)) <= bounds.chassis_usable_mm * mm + 1e-6
@@ -219,8 +251,7 @@ class TestParamBounds:
         bounds = ParamBounds(chassis_usable_mm=18.0)
         ok = CombinerParams(
             spacings=jnp.full((5,), 1.5 * mm),  # total 7.5 mm
-            amplitudes=jnp.full((6, 3), 0.05),
-            widths=jnp.full((6, 3), 20.0 * nm),
+            curves=_curves_with(amplitude=0.05, sigma=20.0 * nm),
         )
         clipped = bounds.clip(ok)
         assert jnp.allclose(clipped.spacings, ok.spacings)
@@ -232,29 +263,44 @@ class TestParamBounds:
 class TestGradient:
 
     def test_grad_through_amplitude(self):
-        """Grad of a downstream sum-of-reflectance should reach amplitudes."""
+        """Grad of a downstream sum-of-reflectance should reach the curve's
+        amplitude leaf."""
         params = CombinerParams.initial()
 
         def first_mirror_reflectance_sum(p):
-            system = build_parametrized_system(p, centers=DEFAULT_WAVELENGTHS)
+            system = build_parametrized_system(p)
             first = next(e for e in system.elements
-                         if isinstance(e, GaussianMirror))
+                         if isinstance(e, PartialMirror))
             return jnp.sum(first.reflectance)
 
         grads = jax.grad(first_mirror_reflectance_sum)(params)
-        assert grads.amplitudes.shape == params.amplitudes.shape
+        assert grads.curves.amplitude.shape == params.curves.amplitude.shape
         # Only mirror_0's amplitude row affects mirror_0's reflectance.
-        assert jnp.any(grads.amplitudes[0] != 0.0)
-        assert jnp.all(grads.amplitudes[1:] == 0.0)
+        assert jnp.any(grads.curves.amplitude[0] != 0.0)
+        assert jnp.all(grads.curves.amplitude[1:] == 0.0)
+
+    def test_grad_through_centers_is_zero(self):
+        """Centers are wrapped in stop_gradient inside the curve, so no
+        gradient flows back to them even though they're a pytree leaf."""
+        params = CombinerParams.initial()
+
+        def first_mirror_reflectance_sum(p):
+            system = build_parametrized_system(p)
+            first = next(e for e in system.elements
+                         if isinstance(e, PartialMirror))
+            return jnp.sum(first.reflectance)
+
+        grads = jax.grad(first_mirror_reflectance_sum)(params)
+        assert jnp.all(grads.curves.centers == 0.0)
 
     def test_grad_through_spacing(self):
         """Grad of mirror position separation should reach the spacings."""
         params = CombinerParams.initial()
 
         def first_to_last_mirror_distance(p):
-            system = build_parametrized_system(p, centers=DEFAULT_WAVELENGTHS)
+            system = build_parametrized_system(p)
             mirrors = [e for e in system.elements
-                       if isinstance(e, GaussianMirror)]
+                       if isinstance(e, PartialMirror)]
             return jnp.linalg.norm(mirrors[-1].position - mirrors[0].position)
 
         grads = jax.grad(first_to_last_mirror_distance)(params)

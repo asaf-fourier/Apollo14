@@ -1,10 +1,10 @@
 """Parametrized Talos combiner — design variables for optimization.
 
 This module exposes the Talos reference combiner as a **function of its
-design variables**: inter-mirror spacings and Gaussian reflectance
-parameters (amplitude + width per color, per mirror).  Everything else
-(chassis geometry, mirror tilt, aperture, pupil position) is held fixed
-and lifted from :func:`apollo14.combiner.build_default_system`.
+design variables**: inter-mirror spacings and a parametric reflectance
+curve per mirror.  Everything else (chassis geometry, mirror tilt,
+aperture, pupil position) is held fixed and lifted from
+:func:`apollo14.combiner.build_default_system`.
 
 Usage::
 
@@ -23,17 +23,15 @@ and mirror-position fields.
 - ``spacings``  ``(M-1,)``  — distance between consecutive mirrors, in
   the same units as the chassis (``mm``). Cumulative sum gives the
   offset of each mirror from ``mirror_0``.
-- ``amplitudes`` ``(M, 3)`` — Gaussian amplitude per mirror × color.
-  Sets the peak reflectance each mirror provides to each projector
-  primary.
-- ``widths``     ``(M, 3)`` — Gaussian width per mirror × color. Controls
-  how much each mirror's coating spills into neighboring color probes.
+- ``curves``    a batched :class:`apollo14.spectral.SumOfGaussiansCurve`
+  with leaves shaped ``(M, B)``.  Each mirror's reflectance is the sum
+  of ``B`` Gaussians at fixed ``centers``; the optimizer tunes the
+  per-basis ``amplitude`` and ``sigma``.
 
-Total: ``(M-1) + 2·M·3`` variables. For ``M=6`` that's **41**.
-
-The Gaussian centers are **fixed** at the projector's R/G/B peak
-wavelengths (:data:`helios.merit.DEFAULT_WAVELENGTHS`) and are not
-optimized.
+For ``M=6`` and ``B=3`` (R/G/B primaries) that's ``5 + 2·6·3 = 41``
+variables.  Switching ``B`` (e.g. denser sampling, or a different basis
+type entirely) just means handing a different curve to ``initial`` —
+nothing else in the optimizer or tracer needs to change.
 
 ## Compensation — left to the optimizer
 
@@ -46,10 +44,13 @@ policy that depends on the merit function's definition of "good"
 specific rule would bias the search.
 """
 
+from __future__ import annotations
+
 import math
 from dataclasses import dataclass
 from typing import NamedTuple
 
+import jax
 import jax.numpy as jnp
 
 from apollo14.combiner import (
@@ -58,9 +59,10 @@ from apollo14.combiner import (
 )
 from apollo14.elements.aperture import RectangularAperture
 from apollo14.elements.glass_block import GlassBlock
-from apollo14.elements.partial_mirror import GaussianMirror
+from apollo14.elements.partial_mirror import PartialMirror
 from apollo14.elements.pupil import RectangularPupil
 from apollo14.materials import agc_m074, air
+from apollo14.spectral import SumOfGaussiansCurve
 from apollo14.system import OpticalSystem
 from apollo14.units import deg, mm, nm
 from helios.merit import DEFAULT_WAVELENGTHS
@@ -108,9 +110,8 @@ class CombinerParams(NamedTuple):
     Registered as a :class:`NamedTuple` so JAX treats it as a pytree —
     ``jax.grad`` and optimizers like Adam can consume it directly.
     """
-    spacings: jnp.ndarray      # (M-1,) inter-mirror spacing, mm
-    amplitudes: jnp.ndarray    # (M, 3) Gaussian amplitude per mirror × color
-    widths: jnp.ndarray        # (M, 3) Gaussian width per mirror × color, nm
+    spacings: jnp.ndarray             # (M-1,) inter-mirror spacing, mm
+    curves: SumOfGaussiansCurve       # batched, leaves shape (M, B)
 
     @classmethod
     def initial(
@@ -119,17 +120,27 @@ class CombinerParams(NamedTuple):
         spacing_mm: float = 1.47,
         amplitude: float = 0.05,
         width_nm: float = 20.0,
-    ) -> CombinerParams:
+        centers: jnp.ndarray | None = None,
+    ) -> "CombinerParams":
         """Reasonable starting point for optimization.
 
-        Flat 5% reflectance per mirror (same as the Talos reference),
-        narrow Gaussians so colors are initially decoupled, and even
-        spacing throughout the chassis.
+        Flat per-basis reflectance per mirror, narrow Gaussians so basis
+        bumps are initially decoupled, and even spacing throughout the
+        chassis. ``centers`` defaults to
+        :data:`helios.merit.DEFAULT_WAVELENGTHS` (R/G/B primaries) — pass
+        a different array (any length ``B``) to optimize against a
+        different basis.
         """
+        if centers is None:
+            centers = DEFAULT_WAVELENGTHS
         return cls(
             spacings=jnp.full((num_mirrors - 1,), spacing_mm * mm),
-            amplitudes=jnp.full((num_mirrors, 3), amplitude),
-            widths=jnp.full((num_mirrors, 3), width_nm * nm),
+            curves=SumOfGaussiansCurve.uniform(
+                centers=centers,
+                amplitude=amplitude,
+                sigma=width_nm * nm,
+                num_mirrors=num_mirrors,
+            ),
         )
 
 
@@ -137,7 +148,7 @@ class CombinerParams(NamedTuple):
 
 
 # FWHM = 2·sqrt(2·ln2)·σ for a Gaussian. Bounds are expressed in FWHM
-# (intuitive optical-design units), but ``params.widths`` carries σ
+# (intuitive optical-design units), but ``params.curves.sigma`` carries σ
 # (what the Gaussian math consumes), so we convert at clip time.
 _FWHM_OVER_SIGMA = 2.0 * math.sqrt(2.0 * math.log(2.0))
 
@@ -160,7 +171,9 @@ class ParamBounds:
     after each Adam step to keep the design physical. The chassis is
     ``chassis_y = 20 mm``; the sum of spacings must fit inside it.
 
-    Width bounds are given as FWHM (nm); ``params.widths`` stores σ.
+    Width bounds are given as FWHM (nm); ``params.curves.sigma`` stores σ.
+    Bounds are specific to :class:`SumOfGaussiansCurve`; a different
+    curve type would call for its own bounds object.
     """
     spacing_min_mm: float = 0.5
     spacing_max_mm: float = 3.0
@@ -181,12 +194,13 @@ class ParamBounds:
         clipped_spacings = clipped_spacings * rescale
         sigma_min = fwhm_to_sigma(self.fwhm_min_nm * nm)
         sigma_max = fwhm_to_sigma(self.fwhm_max_nm * nm)
-        return CombinerParams(
-            spacings=clipped_spacings,
-            amplitudes=jnp.clip(params.amplitudes,
+        clipped_curves = SumOfGaussiansCurve(
+            amplitude=jnp.clip(params.curves.amplitude,
                                 self.amplitude_min, self.amplitude_max),
-            widths=jnp.clip(params.widths, sigma_min, sigma_max),
+            sigma=jnp.clip(params.curves.sigma, sigma_min, sigma_max),
+            centers=params.curves.centers,
         )
+        return CombinerParams(spacings=clipped_spacings, curves=clipped_curves)
 
 
 # ── System builder ──────────────────────────────────────────────────────────
@@ -194,38 +208,35 @@ class ParamBounds:
 
 def build_parametrized_system(
     params: CombinerParams,
-    centers: jnp.ndarray = None,
-    probe_wavelengths: jnp.ndarray = None,
+    probe_wavelengths: jnp.ndarray | None = None,
 ) -> OpticalSystem:
     """Build the Talos combiner using ``params`` as the design variables.
 
     All JAX arrays inside ``params`` propagate into the resulting
     system's elements, so differentiating a downstream merit function
-    w.r.t. ``params`` produces gradients on spacings, amplitudes, and
-    widths.
+    w.r.t. ``params`` produces gradients on spacings and the curve's
+    leaves (amplitude/sigma).
 
     Args:
-        params: :class:`CombinerParams` holding spacings + Gaussian
-            reflectance parameters.
-        centers: ``(C,)`` Gaussian centers, fixed at the projector's
-            primary wavelengths. Defaults to
-            :data:`helios.merit.DEFAULT_WAVELENGTHS` (R/G/B).
-        probe_wavelengths: ``(K,)`` dense sample grid where the
-            sum-of-Gaussians curve is evaluated before being stored on
-            the mirror. The tracer's ``jnp.interp`` then interpolates
-            between dense samples — pass the same wavelength grid the
-            trace uses for an effectively-exact Gaussian curve.
-            Defaults to ``centers`` (3 points — back-compat; will give
-            a piecewise-linear curve through the 3 peaks).
+        params: :class:`CombinerParams` holding spacings + a batched
+            :class:`SumOfGaussiansCurve`.
+        probe_wavelengths: ``(K,)`` dense sample grid where each
+            mirror's curve is evaluated before being stored. The
+            tracer's ``jnp.interp`` then interpolates between dense
+            samples — pass the same wavelength grid the trace uses for
+            an effectively-exact curve. Defaults to the curve's
+            ``centers`` (B points — back-compat; gives a piecewise-
+            linear curve through the basis peaks).
 
     Returns:
         :class:`OpticalSystem` with chassis, aperture, mirrors, pupil.
     """
-    if centers is None:
-        centers = DEFAULT_WAVELENGTHS
-    centers = jnp.asarray(centers)
     if probe_wavelengths is None:
-        probe_wavelengths = centers
+        # Default probe grid = the curve's centers (back-compat with the
+        # 3-point R/G/B grid). ``stop_gradient`` keeps the centers from
+        # picking up a gradient via the wavelength axis — they're fixed
+        # by design and the curve's own ``sample`` already wraps them.
+        probe_wavelengths = jax.lax.stop_gradient(params.curves.centers[0])
     probe_wavelengths = jnp.asarray(probe_wavelengths)
 
     system = OpticalSystem(env_material=air)
@@ -250,7 +261,7 @@ def build_parametrized_system(
         inner_height=1.0 * mm,
     ))
 
-    # Mirrors — positions from cumulative spacings, reflectance from Gaussians
+    # Mirrors — positions from cumulative spacings, reflectance from the curve.
     cumulative_offset = jnp.concatenate(
         [jnp.zeros(1), jnp.cumsum(params.spacings)]
     )  # (M,)
@@ -259,18 +270,17 @@ def build_parametrized_system(
         - cumulative_offset[:, None] * _UNIT_OFFSET[None, :]
     )  # (M, 3)
 
-    num_mirrors = params.amplitudes.shape[0]
+    num_mirrors = params.curves.amplitude.shape[0]
     for mirror_idx in range(num_mirrors):
-        system.add(GaussianMirror(
+        mirror_curve = params.curves.at(mirror_idx)
+        system.add(PartialMirror(
             name=f"mirror_{mirror_idx}",
             position=mirror_positions[mirror_idx],
             normal=_MIRROR_NORMAL.copy(),
             width=_MIRROR_X_WIDTH,
             height=_MIRROR_Y_WIDTH,
-            amplitude=params.amplitudes[mirror_idx],
-            sigma=params.widths[mirror_idx],
-            centers=centers,
-            probe_wavelengths=probe_wavelengths,
+            wavelengths=probe_wavelengths,
+            curve=mirror_curve,
         ))
 
     # Pupil — fixed

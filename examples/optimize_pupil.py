@@ -29,6 +29,7 @@ from apollo14.combiner import (
 )
 from apollo14.elements.pupil import RectangularPupil
 from apollo14.projector import PlayNitrideLed, FovGrid
+from apollo14.spectral import SumOfGaussiansCurve
 
 from helios.combiner_params import (
     CombinerParams, ParamBounds, build_parametrized_system, NUM_MIRRORS,
@@ -51,14 +52,14 @@ from helios.reports.pupil_report import render_pupil_report
 # ── Eyebox target region (pre-defined, fixed) ───────────────────────────────
 
 EYEBOX_RADIUS = 5.0 * mm         # 10×10 mm centered eyebox
-EYEBOX_NX, EYEBOX_NY = 7, 7      # 49 cells, ~1.4 mm each
+EYEBOX_NX, EYEBOX_NY = 9, 9      # 49 cells, ~1.4 mm each
 
 X_FOV = 8.0 * deg
 Y_FOV = 8.0 * deg
 
 # ── Broadband projector (PlayNitride micro-LED, combined R+G+B) ───────────
 
-PROJECTOR_NX, PROJECTOR_NY = 14, 14
+PROJECTOR_NX, PROJECTOR_NY = 100, 20
 
 PROJECTOR = PlayNitrideLed.create_broadband(
     position=DEFAULT_LIGHT_POSITION, direction=DEFAULT_LIGHT_DIRECTION,
@@ -96,7 +97,7 @@ PER_CELL_TARGET = 0.002
 
 # ── Merit & tracer configuration ────────────────────────────────────────────
 
-FOV_GRID = FovGrid(DEFAULT_LIGHT_DIRECTION, X_FOV, Y_FOV, num_x=14, num_y=14)
+FOV_GRID = FovGrid(DEFAULT_LIGHT_DIRECTION, X_FOV, Y_FOV, num_x=32, num_y=32)
 
 # Phase 1: drive every cell toward the target brightness; ignore color.
 merit_cfg_phase1 = PupilMeritConfig(
@@ -191,7 +192,7 @@ value_and_grad_phase2 = jax.jit(jax.value_and_grad(loss_fn_phase2))
 # ── Adam optimizer ──────────────────────────────────────────────────────────
 
 PHASE1_STEPS = 100
-PHASE2_STEPS = 200
+PHASE2_STEPS = 300
 
 adam_cfg_phase1 = AdamConfig(peak_lr=3e-3, warmup_steps=20, num_steps=PHASE1_STEPS)
 adam_cfg_phase2 = AdamConfig(peak_lr=2e-3, warmup_steps=10, num_steps=PHASE2_STEPS)
@@ -224,7 +225,7 @@ def main():
     state = adam_init(params)
 
     print("── Pupil optimization (spacings + Gaussian reflectance) ──")
-    print(f"Variables: {params.spacings.size + params.amplitudes.size + params.widths.size}")
+    print(f"Variables: {params.spacings.size + params.curves.amplitude.size + params.curves.sigma.size}")
     print(f"Eyebox:    {2*EYEBOX_RADIUS/mm:.1f}×{2*EYEBOX_RADIUS/mm:.1f} mm, "
           f"{EYEBOX_NX}×{EYEBOX_NY} cells")
     print(f"FOV:       ±{X_FOV/deg:.1f}° × ±{Y_FOV/deg:.1f}°, "
@@ -240,11 +241,16 @@ def main():
     # may actually find higher per-cell brightness with non-uniform
     # amplitudes — but it tells you whether ``PER_CELL_TARGET`` is
     # plausibly reachable at all.
+    ceiling_curves = SumOfGaussiansCurve(
+        amplitude=jnp.full_like(initial_params.curves.amplitude,
+                                 bounds.amplitude_max),
+        sigma=jnp.full_like(initial_params.curves.sigma,
+                             fwhm_to_sigma(bounds.fwhm_max_nm * nm)),
+        centers=initial_params.curves.centers,
+    )
     ceiling_params = CombinerParams(
         spacings=initial_params.spacings,
-        amplitudes=jnp.full_like(initial_params.amplitudes, bounds.amplitude_max),
-        widths=jnp.full_like(initial_params.widths,
-                              fwhm_to_sigma(bounds.fwhm_max_nm * nm)),
+        curves=ceiling_curves,
     )
     ceiling_response = _compute_spectral_response(ceiling_params)
     ceiling_lum_per_angle = jnp.sum(
@@ -286,16 +292,16 @@ def main():
 
     print("\nFinal spacings (mm):",
           [f"{float(spacing)/mm:.3f}" for spacing in params.spacings])
-    print("Final amplitudes per mirror (R, G, B):")
+    print("Final amplitudes per mirror (per basis):")
     for mirror_idx in range(NUM_MIRRORS):
-        mirror_amplitude = params.amplitudes[mirror_idx]
-        print(f"  m{mirror_idx}: {float(mirror_amplitude[0]):.4f}  "
-              f"{float(mirror_amplitude[1]):.4f}  {float(mirror_amplitude[2]):.4f}")
+        mirror_amplitude = params.curves.amplitude[mirror_idx]
+        row = "  ".join(f"{float(a):.4f}" for a in mirror_amplitude)
+        print(f"  m{mirror_idx}: {row}")
     print("Final widths per mirror (nm):")
     for mirror_idx in range(NUM_MIRRORS):
-        mirror_width = params.widths[mirror_idx]
-        print(f"  m{mirror_idx}: {float(mirror_width[0])*1e6:.1f}  "
-              f"{float(mirror_width[1])*1e6:.1f}  {float(mirror_width[2])*1e6:.1f}")
+        mirror_width = params.curves.sigma[mirror_idx]
+        row = "  ".join(f"{float(w) / nm:.1f}" for w in mirror_width)
+        print(f"  m{mirror_idx}: {row}")
 
     response = _compute_spectral_response(params)
     # Match the merit's brightness definition: luminance (V-weighted sum).

@@ -62,26 +62,27 @@ def test_to_list_2d():
 # ── serialize_element ──────────────────────────────────────────────────────
 
 
-def test_serialize_gaussian_mirror():
+def test_serialize_partial_mirror_with_curve():
     params = CombinerParams.initial()
     system = build_parametrized_system(params)
     mirrors = [e for e in system.elements
-               if type(e).__name__ == "GaussianMirror"]
+               if type(e).__name__ == "PartialMirror"]
     assert len(mirrors) == 6
     serialized = _serialize_element(mirrors[0])
-    assert serialized["type"] == "GaussianMirror"
+    assert serialized["type"] == "PartialMirror"
     assert "position" in serialized
     assert "reflectance" in serialized
-    assert "amplitude" in serialized
-    assert "sigma" in serialized
-    assert len(serialized["amplitude"]) == 3
+    # Curve parameters are nested under a discriminating sub-block.
+    assert "curve" in serialized
+    assert serialized["curve"]["type"] == "SumOfGaussiansCurve"
+    assert len(serialized["curve"]["amplitude"]) == 3
 
 
 def test_serialize_partial_mirror_base_fields():
     params = CombinerParams.initial()
     system = build_parametrized_system(params)
     mirror = next(e for e in system.elements
-                  if type(e).__name__ == "GaussianMirror")
+                  if type(e).__name__ == "PartialMirror")
     serialized = _serialize_element(mirror)
     assert "wavelengths" in serialized
     assert "width" in serialized
@@ -143,10 +144,10 @@ def test_serialize_combiner_params():
     params = CombinerParams.initial()
     serialized = _serialize_combiner_params(params)
     assert "spacings" in serialized
-    assert "amplitudes" in serialized
-    assert "widths" in serialized
+    assert "curve" in serialized
+    assert serialized["curve"]["type"] == "SumOfGaussiansCurve"
     assert len(serialized["spacings"]) == 5
-    assert len(serialized["amplitudes"]) == 6
+    assert len(serialized["curve"]["amplitude"]) == 6
 
 
 # ── serialize_merit_config ─────────────────────────────────────────────────
