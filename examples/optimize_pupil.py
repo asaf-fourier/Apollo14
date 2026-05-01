@@ -62,7 +62,7 @@ Y_FOV = 8.0 * deg
 
 # ── Broadband projector (PlayNitride micro-LED, combined R+G+B) ───────────
 
-PROJECTOR_NX, PROJECTOR_NY = 100, 20
+PROJECTOR_NX, PROJECTOR_NY = 50, 10
 
 PROJECTOR = PlayNitrideLed.create_broadband(
     position=DEFAULT_LIGHT_POSITION, direction=DEFAULT_LIGHT_DIRECTION,
@@ -72,7 +72,7 @@ PROJECTOR = PlayNitrideLed.create_broadband(
 
 # ── Wavelength sampling (spectral band above 5% of peak) ─────────────────
 
-SPECTRAL_THRESHOLD = 0.03
+SPECTRAL_THRESHOLD = 0.02
 SPECTRAL_SAMPLES = 100
 
 _wl_min, _wl_max = PROJECTOR.spectral_band(threshold=SPECTRAL_THRESHOLD)
@@ -94,13 +94,14 @@ LUMINANCE_TRACE_WEIGHTS = photopic_luminance_weights(TRACE_WAVELENGTHS)
 # Fraction of input flux each of the 49 eyebox cells should receive.
 # 0.002 × 49 ≈ 9.8% of input flux reaching the eyebox uniformly.
 
-NUM_EYEBOX_CELLS = EYEBOX_NX * EYEBOX_NY    # 49
-PER_CELL_TARGET = 0.002
+NUM_EYEBOX_CELLS = EYEBOX_NX * EYEBOX_NY
+EYEBOX_TARGET = 0.12
+PER_CELL_TARGET = EYEBOX_TARGET / NUM_EYEBOX_CELLS
 
 
 # ── Merit & tracer configuration ────────────────────────────────────────────
 
-FOV_GRID = FovGrid(DEFAULT_LIGHT_DIRECTION, X_FOV, Y_FOV, num_x=32, num_y=32)
+FOV_GRID = FovGrid(DEFAULT_LIGHT_DIRECTION, X_FOV, Y_FOV, num_x=16, num_y=16)
 
 # Phase 1: drive every cell toward the target brightness; ignore color.
 merit_cfg_phase1 = PupilMeritConfig(
@@ -120,7 +121,7 @@ merit_cfg_phase2 = PupilMeritConfig(
     weight_shape=1.0,
 )
 
-bounds = ParamBounds()
+bounds = ParamBounds(amplitude_max=0.30, fwhm_max_nm=70)
 
 
 # ── Reference input flux (photometric, matches luminance_weights) ──────────
@@ -205,7 +206,7 @@ value_and_grad_phase2 = jax.jit(jax.value_and_grad(loss_fn_phase2))
 # ── Adam optimizer ──────────────────────────────────────────────────────────
 
 PHASE1_STEPS = 100
-PHASE2_STEPS = 300
+PHASE2_STEPS = 200
 
 adam_cfg_phase1 = AdamConfig(peak_lr=3e-3, warmup_steps=20, num_steps=PHASE1_STEPS)
 adam_cfg_phase2 = AdamConfig(peak_lr=2e-3, warmup_steps=10, num_steps=PHASE2_STEPS)
