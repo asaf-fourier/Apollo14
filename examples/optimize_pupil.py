@@ -28,6 +28,7 @@ from apollo14.combiner import (
     DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
 )
 from apollo14.elements.pupil import RectangularPupil
+from apollo14.geometry import planar_grid_points
 from apollo14.projector import PlayNitrideLed, FovGrid
 from apollo14.spectral import SumOfGaussiansCurve
 
@@ -37,9 +38,7 @@ from helios.combiner_params import (
 )
 from apollo14.trace import prepare_route
 from helios.merit import build_combiner_branch_routes, d65_weights_at
-from helios.eyebox import (
-    trace_branch_over_fov, eyebox_grid_points,
-)
+from helios.eyebox import trace_branch_over_fov
 from helios.photometry import luminance_weights as photopic_luminance_weights
 from helios.pupil_merit import (
     PupilMeritConfig, pupil_merit, merit_breakdown,
@@ -54,8 +53,9 @@ jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 
 # ── Eyebox target region (pre-defined, fixed) ───────────────────────────────
 
-EYEBOX_RADIUS = 5.0 * mm         # 10×10 mm centered eyebox
-EYEBOX_NX, EYEBOX_NY = 9, 9      # 49 cells, ~1.4 mm each
+EYEBOX_HALF_X = 4.0 * mm         # 8 mm full width on x
+EYEBOX_HALF_Y = 5.0 * mm         # 10 mm full width on y
+EYEBOX_NX, EYEBOX_NY = 8, 10      # 81 cells, ~1.0×1.25 mm each
 
 X_FOV = 8.0 * deg
 Y_FOV = 8.0 * deg
@@ -121,7 +121,7 @@ merit_cfg_phase2 = PupilMeritConfig(
     weight_shape=1.0,
 )
 
-bounds = ParamBounds(amplitude_max=0.30, fwhm_max_nm=70)
+bounds = ParamBounds(amplitude_max=0.25, fwhm_max_nm=60, fwhm_min_nm=10)
 
 
 # ── Reference input flux (photometric, matches luminance_weights) ──────────
@@ -141,8 +141,9 @@ INPUT_FLUX = float(NUM_RAYS * jnp.sum(_spectral_weights * LUMINANCE_TRACE_WEIGHT
 _ref_system = build_parametrized_system(
     CombinerParams.initial(), probe_wavelengths=TRACE_WAVELENGTHS)
 _pupil = next(e for e in _ref_system.elements if isinstance(e, RectangularPupil))
-EYEBOX_POINTS = eyebox_grid_points(
-    _pupil.position, _pupil.normal, EYEBOX_RADIUS, EYEBOX_NX, EYEBOX_NY,
+EYEBOX_POINTS = planar_grid_points(
+    _pupil.position, _pupil.normal,
+    EYEBOX_HALF_X, EYEBOX_HALF_Y, EYEBOX_NX, EYEBOX_NY,
 )   # (S, 3)
 CELL_MASK = jnp.ones(EYEBOX_POINTS.shape[0])   # all grid cells belong to the target
 
@@ -240,7 +241,7 @@ def main():
 
     print("── Pupil optimization (spacings + Gaussian reflectance) ──")
     print(f"Variables: {params.spacings.size + params.curves.amplitude.size + params.curves.sigma.size}")
-    print(f"Eyebox:    {2*EYEBOX_RADIUS/mm:.1f}×{2*EYEBOX_RADIUS/mm:.1f} mm, "
+    print(f"Eyebox:    {2*EYEBOX_HALF_X/mm:.1f}×{2*EYEBOX_HALF_Y/mm:.1f} mm, "
           f"{EYEBOX_NX}×{EYEBOX_NY} cells")
     print(f"FOV:       ±{X_FOV/deg:.1f}° × ±{Y_FOV/deg:.1f}°, "
           f"{FOV_GRID.num_x}×{FOV_GRID.num_y} samples")
@@ -366,15 +367,16 @@ def main():
         final_breakdown={k: float(v) for k, v in final_breakdown.items()},
         loss_history=loss_history,
         eyebox_config={
-            "radius": EYEBOX_RADIUS,
+            "half_x": EYEBOX_HALF_X,
+            "half_y": EYEBOX_HALF_Y,
             "nx": EYEBOX_NX,
             "ny": EYEBOX_NY,
         },
     )
     print(f"\nSaved optimization report: {report_path}")
 
-    pupil_x_mm = jnp.linspace(-EYEBOX_RADIUS, EYEBOX_RADIUS, EYEBOX_NX)
-    pupil_y_mm = jnp.linspace(-EYEBOX_RADIUS, EYEBOX_RADIUS, EYEBOX_NY)
+    pupil_x_mm = jnp.linspace(-EYEBOX_HALF_X, EYEBOX_HALF_X, EYEBOX_NX)
+    pupil_y_mm = jnp.linspace(-EYEBOX_HALF_Y, EYEBOX_HALF_Y, EYEBOX_NY)
     scan_cfg = ScanConfig(
         base_direction=DEFAULT_LIGHT_DIRECTION,
         x_fov=float(X_FOV), y_fov=float(Y_FOV),

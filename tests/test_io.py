@@ -185,7 +185,7 @@ def test_save_optimization_report_creates_json(tmp_path):
         initial_breakdown={"total": 1.0, "shape": 0.5},
         final_breakdown={"total": 0.5, "shape": 0.2},
         loss_history=[1.0, 0.9, 0.8],
-        eyebox_config={"radius": 5.0, "nx": 3, "ny": 3},
+        eyebox_config={"half_x": 5.0, "half_y": 5.0, "nx": 3, "ny": 3},
     )
     assert report_path.exists()
     data = json.loads(report_path.read_text())

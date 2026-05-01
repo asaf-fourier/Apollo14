@@ -79,8 +79,8 @@ for name, r in branch_routes.items():
 
 RGB_COLOR_IDX = {"R": 0, "G": 1, "B": 2}
 
-PROJECTOR_NX = 15
-PROJECTOR_NY = 15
+PROJECTOR_NX = 25
+PROJECTOR_NY = 5
 
 # Blue has a linear angular falloff of 2% per 6° in both axes.
 BLUE_FALLOFF = 0.02 / (6.0 * deg)
@@ -133,10 +133,10 @@ viz_branch_routes = {
 
 # ── Scan grid ──────────────────────────────────────────────────────────────
 
-x_fov = 6.0 * deg
-y_fov = 6.0 * deg
-num_x = 15
-num_y = 15
+x_fov = 8.0 * deg
+y_fov = 8.0 * deg
+num_x = 16
+num_y = 16
 
 scan_dirs, scan_angles = scan_directions(
     DEFAULT_LIGHT_DIRECTION, x_fov, y_fov, num_x, num_y,

@@ -288,7 +288,8 @@ def save_optimization_report(
         "projectors": [_serialize_projector(p) for p in projectors],
         "fov_grid": _serialize_fov_grid(fov_grid),
         "eyebox": {
-            "radius": _round_sig(float(eyebox_config["radius"])),
+            "half_x": _round_sig(float(eyebox_config["half_x"])),
+            "half_y": _round_sig(float(eyebox_config["half_y"])),
             "nx": int(eyebox_config["nx"]),
             "ny": int(eyebox_config["ny"]),
         },
