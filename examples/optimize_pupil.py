@@ -147,7 +147,12 @@ EYEBOX_POINTS = planar_grid_points(
 )   # (S, 3)
 CELL_MASK = jnp.ones(EYEBOX_POINTS.shape[0])   # all grid cells belong to the target
 
-BINNING_SIGMA = 0.8 * mm   # ~half grid spacing for smooth spatial gradients
+_CELL_PITCH_X = 2 * EYEBOX_HALF_X / (EYEBOX_NX - 1)
+_CELL_PITCH_Y = 2 * EYEBOX_HALF_Y / (EYEBOX_NY - 1)
+# σ ≈ ½ the smaller cell pitch — enough overlap that a ray straddling a
+# cell boundary contributes to both neighbors (so spacing gradients flow),
+# small enough that cells stay individually addressable.
+BINNING_SIGMA = 0.5 * min(_CELL_PITCH_X, _CELL_PITCH_Y)
 
 
 # ── Loss function ───────────────────────────────────────────────────────────
