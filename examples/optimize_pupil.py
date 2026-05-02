@@ -72,7 +72,7 @@ PROJECTOR = PlayNitrideLed.create_broadband(
 
 # ── Wavelength sampling (spectral band above 5% of peak) ─────────────────
 
-SPECTRAL_THRESHOLD = 0.02
+SPECTRAL_THRESHOLD = 0.03
 SPECTRAL_SAMPLES = 100
 
 _wl_min, _wl_max = PROJECTOR.spectral_band(threshold=SPECTRAL_THRESHOLD)
@@ -95,7 +95,7 @@ LUMINANCE_TRACE_WEIGHTS = photopic_luminance_weights(TRACE_WAVELENGTHS)
 # 0.002 × 49 ≈ 9.8% of input flux reaching the eyebox uniformly.
 
 NUM_EYEBOX_CELLS = EYEBOX_NX * EYEBOX_NY
-EYEBOX_TARGET = 0.12
+EYEBOX_TARGET = 0.09
 PER_CELL_TARGET = EYEBOX_TARGET / NUM_EYEBOX_CELLS
 
 
