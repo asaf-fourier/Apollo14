@@ -44,6 +44,31 @@ def _mirrors(manifest: dict):
     ]
 
 
+def _mirror_spacings_mm(manifest: dict) -> list[dict]:
+    """Perpendicular distance between consecutive mirror pairs.
+
+    Spacing is ``|normal · (pos_{i+1} − pos_i)|`` — independent of how
+    the mirrors are tilted, so the headline doesn't have to know anything
+    about the chassis geometry. Positions in the manifest are already in
+    mm (``apollo14.units.mm == 1.0``).
+    """
+    elements = manifest.get("system", {}).get("elements", [])
+    mirrors = [e for e in elements
+               if e.get("type") in ("PartialMirror", "GaussianMirror")]
+    spacings = []
+    for prev, curr in zip(mirrors, mirrors[1:]):
+        prev_pos = np.asarray(prev["position"])
+        curr_pos = np.asarray(curr["position"])
+        normal = np.asarray(prev["normal"])
+        distance = abs(float(np.dot(normal, curr_pos - prev_pos)))
+        spacings.append({
+            "from": prev["name"],
+            "to": curr["name"],
+            "distance_mm": distance,
+        })
+    return spacings
+
+
 def compute_headline_numbers(
     manifest: dict,
     response: np.ndarray,
@@ -110,6 +135,8 @@ def compute_headline_numbers(
         numbers["avg_per_mirror_reflectance"] = None
         numbers["avg_ambient_transparency"] = None
 
+    numbers["mirror_spacings_mm"] = _mirror_spacings_mm(manifest)
+
     return numbers
 
 
@@ -140,6 +167,12 @@ def headline_numbers_html(numbers: dict) -> str:
         for m in numbers.get("per_mirror_avg_reflectance", [])
     )
 
+    spacing_rows = "".join(
+        f"<tr><td>{s['from']} → {s['to']}</td>"
+        f"<td>{s['distance_mm']:.3f} mm</td></tr>"
+        for s in numbers.get("mirror_spacings_mm", [])
+    )
+
     return (
         "<div class='headline'>"
         "<h3 style='margin-top:0;'>Headline numbers</h3>"
@@ -158,6 +191,10 @@ def headline_numbers_html(numbers: dict) -> str:
         "<table class='headline-table' style='margin-top:.6em;'>"
         "<tr><th>Mirror</th><th>λ-avg reflectance</th></tr>"
         f"{rows}"
+        "</table>"
+        "<table class='headline-table' style='margin-top:.6em;'>"
+        "<tr><th>Mirror pair</th><th>Perpendicular distance</th></tr>"
+        f"{spacing_rows}"
         "</table>"
         "</div>"
     )
