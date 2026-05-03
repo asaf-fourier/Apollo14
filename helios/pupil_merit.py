@@ -32,9 +32,12 @@ Per-cell scales::
     Ī_radiance(s)     = mean_a radiance(s, a)
     Ī_brightness(s)   = mean_a brightness(s, a)
 
-**Target** (scale-invariant per cell — at-target ⇒ 0, dark or 2× over ⇒ 1)::
+**Target** (scale-invariant per cell — at-target ⇒ 0, dark or 2× over ⇒ 1).
+With ``asymmetric_target=True``, only the under-target deficit counts; cells
+brighter than the target contribute zero::
 
-    L_target = mean_s ( ( Ī_brightness(s) − τ·I_in ) / (τ·I_in) )²
+    L_target = mean_s ( ( Ī_brightness(s) − τ·I_in ) / (τ·I_in) )²       [symmetric]
+    L_target = mean_s ( min(0, Ī_brightness(s) − τ·I_in) / (τ·I_in) )²   [asymmetric]
 
 **Shape** (radiance space, scale-invariant per cell)::
 
@@ -72,6 +75,12 @@ class PupilMeritConfig:
         weight_target: Weight for the target (squared-error-to-target)
             term.
         weight_shape: Weight for the shape (D65 + FOV uniformity) term.
+        asymmetric_target: When True, the target term penalizes only
+            cells that fall *below* ``target_relative · input_flux``;
+            cells above target contribute zero. Useful when the design
+            is brightness-bound and there's no reason to drag the
+            brightest cells back down to match the dim corners — only
+            the dim cells need pulling up.
     """
 
     target_relative: float = 0.05
@@ -80,6 +89,7 @@ class PupilMeritConfig:
     shape_floor_epsilon: float = 1e-3
     weight_target: float = 1.0
     weight_shape: float = 1.0
+    asymmetric_target: bool = False
 
     def __post_init__(self):
         if self.d65_weights is None:
@@ -129,11 +139,14 @@ def _compute_terms(
     loss_shape = (jnp.sum(cell_mask * shape_err_per_cell)
                   / num_target_cells)
 
-    # Target (symmetric squared error to ``target_relative · input_flux``,
-    # normalized by the target itself so loss is O(1) — comparable to
-    # the shape term when used together).
+    # Target (squared error to ``target_relative · input_flux``, normalized
+    # by the target itself so loss is O(1) — comparable to the shape term
+    # when used together). When ``asymmetric_target`` is set, only the
+    # under-target deficit is penalized — over-target cells get zero cost.
     brightness_target = config.target_relative * input_flux
     deviation = mean_brightness - brightness_target
+    if config.asymmetric_target:
+        deviation = jnp.minimum(deviation, 0.0)
     loss_target = (jnp.sum(cell_mask * deviation ** 2)
                    / num_target_cells / (brightness_target ** 2))
 

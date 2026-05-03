@@ -1,25 +1,33 @@
-"""Pupil optimization driver — three independent R/G/B projectors.
+"""Pupil optimization driver — single broadband W projector with a
+threshold-based wavelength sampling and a spectrum-preserving merit.
 
-Sibling to :mod:`examples.optimize_pupil`. The broadband driver feeds the
-optimizer a single W-spectrum projector and integrates the response
-across ~100 fine wavelength samples; this driver instead traces three
-separate narrow-band projectors (one per LED primary) and integrates
-each channel's per-wavelength response into a single luminance value
-before merit evaluation.
+How this differs from :mod:`examples.optimize_pupil`
+----------------------------------------------------
+The original broadband driver compared the per-wavelength response to a
+*continuous D65 reference SPD*. That target is unsatisfiable for a 3-band
+micro-LED whose W spectrum has deep valleys between R/G/B peaks: the merit
+penalizes the design for not emitting at wavelengths the projector itself
+can't supply, and phase 2 plateaus at ~0.5.
 
-Why three projectors instead of W-with-a-fine-wavelength-axis
--------------------------------------------------------------
-The broadband driver's phase-2 shape term penalizes deviation from
-``D65[c] · mean_radiance(s)`` at *every* wavelength sample. The
-projector is a 3-band micro-LED — it has effectively zero radiance at
-wavelengths between the R/G/B peaks. No mirror tuning can put light at
-wavelengths the projector doesn't emit, so the shape term is
-structurally unsatisfiable: phase 2 plateaus at ~0.5 and never moves.
+This driver fixes that by changing the merit's shape target. Instead of
+"deliver D65", it asks the design to "preserve the projector's spectrum"
+— i.e. ``response(s, a, λ) ∝ W(λ)`` at every (cell, FOV). Since the
+panel's W column **is** the manufacturer's calibrated D65 white, matching
+the projector's shape is equivalent to producing D65 at the eye, but it
+is satisfiable: at valley wavelengths both the response and the shape
+target are small, so shape_diff naturally vanishes. The mirrors only need
+to apply approximately wavelength-uniform reflectance to satisfy the
+shape term — a target that lives inside the design space.
 
-Folding the response into three channel luminances *before* the merit
-collapses the wavelength axis to a 3-element vector that the existing
-``pupil_merit`` shape term can actually drive to zero — D65 ratio is a
-3-vector, the response is a 3-vector, the comparison is well-posed.
+Wavelength sampling
+-------------------
+Tracing wavelengths span ``W``'s above-``SPECTRAL_THRESHOLD`` band, sampled
+uniformly. ``SPECTRAL_THRESHOLD = 0.10`` is the recommended default — it
+trims the dead zones in the deep blue/red wings while keeping the three
+LED peaks contiguous, so ``mean(diff)`` gives the correct Δλ for the
+report's V(λ) integration. ``0.05`` keeps essentially the whole spectrum
+including valleys at a slightly higher loss floor; ``0.15`` splits the B
+sub-pixel into two parts (its measured spectrum has a dual peak), avoid.
 
 Run::
 
@@ -46,9 +54,7 @@ from helios.combiner_params import (
     fwhm_to_sigma,
 )
 from apollo14.trace import prepare_route
-from helios.merit import (
-    build_combiner_branch_routes, D65_WEIGHTS, DEFAULT_WAVELENGTHS,
-)
+from helios.merit import build_combiner_branch_routes
 from helios.eyebox import trace_branch_over_fov
 from helios.photometry import luminance_weights as photopic_luminance_weights
 from helios.pupil_merit import (
@@ -58,9 +64,9 @@ from helios.adam import AdamConfig, adam_init, adam_step
 from helios.io import save_optimization_report, save_run, ScanConfig
 from helios.reports.pupil_report import render_pupil_report
 
-jax.config.update("jax_compilation_cache_dir", "/home/ubuntu/.cache/jax")
-jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
-jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+# jax.config.update("jax_compilation_cache_dir", "/home/ubuntu/.cache/jax")
+# jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+# jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 
 # ── Eyebox target region (pre-defined, fixed) ───────────────────────────────
 
@@ -71,89 +77,81 @@ EYEBOX_NX, EYEBOX_NY = 8, 10     # 80 cells, ~1.0×1.1 mm each
 X_FOV = 8.0 * deg
 Y_FOV = 8.0 * deg
 
-# ── Three independent narrow-band projectors (R, G, B) ────────────────────
-# All three sit at the same module location with the same beam geometry —
-# they only differ in spectral content. ``PlayNitrideLed.create`` reads the
-# corresponding column from the panel CSV and peak-normalizes it.
+# ── Single broadband projector (panel's calibrated white) ─────────────────
 
 PROJECTOR_NX, PROJECTOR_NY = 50, 10
-BEAM_WIDTH, BEAM_HEIGHT = 10.0 * mm, 2.0 * mm
+ANGULAR_STEPS_X, ANGULAR_STEPS_Y = 16, 16
 
-CHANNELS = ("R", "G", "B")
+PROJECTOR = PlayNitrideLed.create_broadband(
+    position=DEFAULT_LIGHT_POSITION, direction=DEFAULT_LIGHT_DIRECTION,
+    beam_width=10.0 * mm, beam_height=2.0 * mm,
+    nx=PROJECTOR_NX, ny=PROJECTOR_NY,
+)
 
-PROJECTORS = {
-    color: PlayNitrideLed.create(
-        position=DEFAULT_LIGHT_POSITION,
-        direction=DEFAULT_LIGHT_DIRECTION,
-        beam_width=BEAM_WIDTH,
-        beam_height=BEAM_HEIGHT,
-        nx=PROJECTOR_NX, ny=PROJECTOR_NY,
-        color=color,
-    )
-    for color in CHANNELS
-}
+# ── Wavelength sampling ─────────────────────────────────────────────────────
+# Span W's above-threshold band uniformly. Threshold 0.10 gives a clean
+# three-peak envelope without splitting any LED's measured spectrum, and
+# excludes ~7 % of the panel's luminance — recoverable post-build via the
+# panel's RGB drive trim.
 
-# ── Per-channel wavelength sampling ────────────────────────────────────────
-# Each LED primary covers a narrow band; spending 30 samples inside each
-# band integrates per-channel luminance accurately while keeping the
-# wavelength axis short overall (90 samples vs the broadband 100).
+SPECTRAL_THRESHOLD = 0.10
+SPECTRAL_SAMPLES = 100
 
-SPECTRAL_THRESHOLD = 0.05
-SAMPLES_PER_CHANNEL = 30
+_w_lo, _w_hi = PROJECTOR.spectral_band(threshold=SPECTRAL_THRESHOLD)
+TRACE_WAVELENGTHS = jnp.linspace(_w_lo, _w_hi, SPECTRAL_SAMPLES)
 
-WAVELENGTHS_PER_CHANNEL = {
-    color: jnp.linspace(
-        *PROJECTORS[color].spectral_band(threshold=SPECTRAL_THRESHOLD),
-        SAMPLES_PER_CHANNEL,
-    )
-    for color in CHANNELS
-}
+# ── Spectrum-preserving shape target ───────────────────────────────────────
+# The merit's ``d65_weights`` should be the per-wavelength shape the
+# response should match. Using the projector's own spectrum (peak-
+# normalized, then re-normalized to sum=1 across the trace samples) makes
+# the shape term ask the design to *preserve* the projector's emission
+# shape — which is already calibrated to D65. Result: at valley
+# wavelengths both response and target are small, shape_diff stays
+# bounded, and the merit is satisfiable.
 
-# Probe grid for evaluating mirror reflectance curves — must span every
-# trace wavelength used by any channel. We linspace across the union of
-# band extents at the same density as the per-channel grids.
-_band_lo = min(float(WAVELENGTHS_PER_CHANNEL[c][0]) for c in CHANNELS)
-_band_hi = max(float(WAVELENGTHS_PER_CHANNEL[c][-1]) for c in CHANNELS)
-PROBE_WAVELENGTHS = jnp.linspace(_band_lo, _band_hi, 120)
+_spec_wls, _spec_rad = PROJECTOR.spectrum
+_W_AT_TRACE = jnp.interp(TRACE_WAVELENGTHS, _spec_wls, _spec_rad)
+SHAPE_TARGET = _W_AT_TRACE / _W_AT_TRACE.sum()
 
-# Photopic V·Δλ·K_m weights *per channel* — used to integrate each
-# channel's per-wavelength response into a single luminance value.
-LUMINANCE_WEIGHTS_PER_CHANNEL = {
-    color: photopic_luminance_weights(WAVELENGTHS_PER_CHANNEL[color])
-    for color in CHANNELS
-}
+# Photopic V·Δλ·K_m weights at the trace wavelengths (uniform spacing,
+# so ``mean(diff)`` inside ``photopic_luminance_weights`` is the actual
+# per-sample Δλ — the report's report-time V-weighting matches).
+LUMINANCE_TRACE_WEIGHTS = photopic_luminance_weights(TRACE_WAVELENGTHS)
 
 # ── Per-cell brightness target ─────────────────────────────────────────────
 
 NUM_EYEBOX_CELLS = EYEBOX_NX * EYEBOX_NY
-EYEBOX_TARGET = 0.12
+EYEBOX_TARGET = 0.08
 PER_CELL_TARGET = EYEBOX_TARGET / NUM_EYEBOX_CELLS
 
 
-# ── Merit configuration (3-channel) ────────────────────────────────────────
-# ``pupil_merit`` is reused as-is. The response we feed it has shape
-# ``(S, A, 3)`` instead of ``(S, A, N_wavelengths)``, and the channel
-# values are *already* luminances — so ``luminance_weights`` is just
-# ones(3) and ``d65_weights`` is the 3-element D65 simplex.
+# ── Merit & tracer configuration ────────────────────────────────────────────
 
-D65_3CH = D65_WEIGHTS                # already shape (3,) at R/G/B peaks
-ONES_3CH = jnp.ones(3)               # channel sum = total luminance
+FOV_GRID = FovGrid(DEFAULT_LIGHT_DIRECTION, X_FOV, Y_FOV, num_x=ANGULAR_STEPS_X, num_y=ANGULAR_STEPS_Y)
 
-FOV_GRID = FovGrid(DEFAULT_LIGHT_DIRECTION, X_FOV, Y_FOV, num_x=16, num_y=16)
-
+# Phase 1: drive every cell toward the target brightness; ignore shape.
+# ``asymmetric_target`` only penalizes cells *below* the brightness target —
+# cells already at or above target add zero cost. Right for a brightness-
+# bound design: no reason to drag the bright corner cells back down to match
+# the dim ones; just lift the dim ones up.
 merit_cfg_phase1 = PupilMeritConfig(
     target_relative=PER_CELL_TARGET,
-    d65_weights=D65_3CH,
-    luminance_weights=ONES_3CH,
+    d65_weights=SHAPE_TARGET,
+    luminance_weights=LUMINANCE_TRACE_WEIGHTS,
     weight_target=1.0,
     weight_shape=0.0,
+    asymmetric_target=True,
 )
+
+# Phase 2: keep cells at target while preserving the projector's spectrum
+# and FOV-flatness per cell.
 merit_cfg_phase2 = PupilMeritConfig(
     target_relative=PER_CELL_TARGET,
-    d65_weights=D65_3CH,
-    luminance_weights=ONES_3CH,
+    d65_weights=SHAPE_TARGET,
+    luminance_weights=LUMINANCE_TRACE_WEIGHTS,
     weight_target=1.0,
     weight_shape=1.0,
+    asymmetric_target=True,
 )
 
 bounds = ParamBounds(amplitude_max=0.25, fwhm_max_nm=60, fwhm_min_nm=10)
@@ -164,31 +162,15 @@ bounds = ParamBounds(amplitude_max=0.25, fwhm_max_nm=60, fwhm_min_nm=10)
 OPTIMIZE_SPACINGS = True
 
 
-# ── Reference input flux (sum of per-channel luminances) ───────────────────
-# Each projector contributes its own per-direction luminous flux:
-# N_rays × Σ_λ spec_c(λ) × V(λ) × Δλ × K_m. Total is the sum across the
-# three channels — running R, G, B simultaneously at their max-drive
-# (peak-normalized) spectra. The merit's ``target_relative`` is then a
-# fraction of this combined max-drive luminance.
+# ── Reference input flux (photometric, matches luminance_weights) ──────────
 
 NUM_RAYS = PROJECTOR_NX * PROJECTOR_NY
-
-
-def _channel_input_luminance(color: str) -> float:
-    spec_wls, spec_rad = PROJECTORS[color].spectrum
-    wavelengths = WAVELENGTHS_PER_CHANNEL[color]
-    spec_at_wls = jnp.interp(wavelengths, spec_wls, spec_rad)
-    luminance_weights = LUMINANCE_WEIGHTS_PER_CHANNEL[color]
-    return float(NUM_RAYS * jnp.sum(spec_at_wls * luminance_weights))
-
-
-CHANNEL_INPUT_LUMINANCE = {c: _channel_input_luminance(c) for c in CHANNELS}
-INPUT_FLUX = float(sum(CHANNEL_INPUT_LUMINANCE.values()))
+INPUT_FLUX = float(NUM_RAYS * jnp.sum(_W_AT_TRACE * LUMINANCE_TRACE_WEIGHTS))
 
 # ── Build the pupil cell grid and mask for the target region ────────────────
 
 _ref_system = build_parametrized_system(
-    CombinerParams.initial(), probe_wavelengths=PROBE_WAVELENGTHS)
+    CombinerParams.initial(), probe_wavelengths=TRACE_WAVELENGTHS)
 _pupil = next(e for e in _ref_system.elements if isinstance(e, RectangularPupil))
 EYEBOX_POINTS = planar_grid_points(
     _pupil.position, _pupil.normal,
@@ -198,25 +180,26 @@ CELL_MASK = jnp.ones(EYEBOX_POINTS.shape[0])
 
 _CELL_PITCH_X = 2 * EYEBOX_HALF_X / (EYEBOX_NX - 1)
 _CELL_PITCH_Y = 2 * EYEBOX_HALF_Y / (EYEBOX_NY - 1)
+# σ ≈ ½ the smaller cell pitch — enough overlap that a ray straddling a
+# cell boundary contributes to both neighbors (so spacing gradients flow),
+# small enough that cells stay individually addressable.
 BINNING_SIGMA = 0.5 * min(_CELL_PITCH_X, _CELL_PITCH_Y)
 
 
 # ── Loss function ───────────────────────────────────────────────────────────
 
 
-def _trace_channel(
-    branch_routes,
-    projector,
-    wavelengths,
-    luminance_weights,
-):
-    """Trace one projector across its band, return (S, A) channel luminance.
+def _compute_spectral_response(params: CombinerParams) -> jnp.ndarray:
+    """Trace the W projector at each wavelength, scanned over wavelengths.
 
-    Inner ``lax.scan`` walks the channel's narrow wavelength grid; for each
-    wavelength we accumulate over branches and bin onto the eyebox. After
-    the scan we do a V-weighted sum over the channel's wavelength axis to
-    collapse it into a single per-(cell, FOV) luminance value.
+    Returns ``(S, A, N)`` per-wavelength radiance — same shape the merit
+    and the report both expect.
     """
+    system = build_parametrized_system(
+        params, probe_wavelengths=TRACE_WAVELENGTHS)
+    branch_routes = build_combiner_branch_routes(
+        system, num_mirrors=NUM_MIRRORS,
+    )
     directions = FOV_GRID.flat_directions  # (A, 3)
 
     def trace_one_wavelength(_, wavelength):
@@ -224,49 +207,31 @@ def _trace_channel(
         for route in branch_routes:
             prepared = prepare_route(route, wavelength)
             binned = binned + trace_branch_over_fov(
-                prepared, projector, EYEBOX_POINTS, wavelength,
+                prepared, PROJECTOR, EYEBOX_POINTS, wavelength,
                 directions,
-                sigma=BINNING_SIGMA if OPTIMIZE_SPACINGS else None)
+                sigma=BINNING_SIGMA if OPTIMIZE_SPACINGS else None)  # (A, S)
         return None, binned.T  # (S, A)
 
-    _, per_wavelength = jax.lax.scan(
-        jax.checkpoint(trace_one_wavelength), None, wavelengths)  # (N, S, A)
-
-    # V-weighted sum over the wavelength axis → (S, A) luminance.
-    return jnp.tensordot(luminance_weights, per_wavelength, axes=(0, 0))
-
-
-def _compute_3channel_response(params: CombinerParams) -> jnp.ndarray:
-    """Trace all three projectors, return ``(S, A, 3)`` luminance per channel."""
-    system = build_parametrized_system(
-        params, probe_wavelengths=PROBE_WAVELENGTHS)
-    branch_routes = build_combiner_branch_routes(
-        system, num_mirrors=NUM_MIRRORS)
-
-    channel_responses = [
-        _trace_channel(
-            branch_routes,
-            PROJECTORS[color],
-            WAVELENGTHS_PER_CHANNEL[color],
-            LUMINANCE_WEIGHTS_PER_CHANNEL[color],
-        )
-        for color in CHANNELS
-    ]
-    return jnp.stack(channel_responses, axis=-1)  # (S, A, 3)
+    # ``jax.checkpoint`` rematerializes each wavelength's forward during
+    # backward instead of saving the full per-(wavelength, direction, ray,
+    # cell) activation tape — without it value_and_grad needs ~200 GB.
+    _, all_responses = jax.lax.scan(
+        jax.checkpoint(trace_one_wavelength), None, TRACE_WAVELENGTHS)  # (N, S, A)
+    return jnp.transpose(all_responses, (1, 2, 0))  # (S, A, N)
 
 
 def loss_fn_phase1(params: CombinerParams) -> jnp.ndarray:
-    response = _compute_3channel_response(params)
+    response = _compute_spectral_response(params)
     return pupil_merit(response, INPUT_FLUX, merit_cfg_phase1, cell_mask=CELL_MASK)
 
 
 def loss_fn_phase2(params: CombinerParams) -> jnp.ndarray:
-    response = _compute_3channel_response(params)
+    response = _compute_spectral_response(params)
     return pupil_merit(response, INPUT_FLUX, merit_cfg_phase2, cell_mask=CELL_MASK)
 
 
 def breakdown_fn(params: CombinerParams, merit_cfg: PupilMeritConfig) -> dict:
-    response = _compute_3channel_response(params)
+    response = _compute_spectral_response(params)
     return merit_breakdown(response, INPUT_FLUX, merit_cfg, cell_mask=CELL_MASK)
 
 
@@ -275,6 +240,7 @@ value_and_grad_phase2 = jax.jit(jax.value_and_grad(loss_fn_phase2))
 
 
 def _mask_frozen(grad: CombinerParams) -> CombinerParams:
+    """Zero out gradient on frozen design variables before the Adam update."""
     if OPTIMIZE_SPACINGS:
         return grad
     return grad._replace(spacings=jnp.zeros_like(grad.spacings))
@@ -290,7 +256,6 @@ adam_cfg_phase2 = AdamConfig(peak_lr=2e-3, warmup_steps=10, num_steps=PHASE2_STE
 
 
 # ── Run ─────────────────────────────────────────────────────────────────────
-
 
 def _print_breakdown(label, bd):
     print(f"\n{label}: {float(bd['total']):.5f}")
@@ -319,21 +284,20 @@ def main():
     num_vars = params.curves.amplitude.size + params.curves.sigma.size
     if OPTIMIZE_SPACINGS:
         num_vars += params.spacings.size
-    print(f"── RGB pupil optimization ({optimized_label}) ──")
+    print(f"── Pupil optimization ({optimized_label}) ──")
     print(f"Variables: {num_vars}")
     print(f"Eyebox:    {2*EYEBOX_HALF_X/mm:.1f}×{2*EYEBOX_HALF_Y/mm:.1f} mm, "
           f"{EYEBOX_NX}×{EYEBOX_NY} cells")
     print(f"FOV:       ±{X_FOV/deg:.1f}° × ±{Y_FOV/deg:.1f}°, "
           f"{FOV_GRID.num_x}×{FOV_GRID.num_y} samples")
-    for color in CHANNELS:
-        wavelengths = WAVELENGTHS_PER_CHANNEL[color]
-        print(f"Channel {color}: {SAMPLES_PER_CHANNEL} samples, "
-              f"{float(wavelengths[0])/nm:.1f}–{float(wavelengths[-1])/nm:.1f} nm, "
-              f"luminance contribution = {CHANNEL_INPUT_LUMINANCE[color]:.1f}")
+    print(f"Spectrum:  {SPECTRAL_SAMPLES} uniform samples, "
+          f"{float(_w_lo)/nm:.0f}–{float(_w_hi)/nm:.0f} nm "
+          f"(W > {SPECTRAL_THRESHOLD:.0%} of peak)")
+    print(f"Shape target: projector W spectrum (preserve panel's D65 white)")
     print(f"I_in:      {INPUT_FLUX:.1f}  "
           f"(target_relative={merit_cfg_phase1.target_relative})")
 
-    # Ceiling diagnostic — saturate amplitudes/widths at their upper bounds.
+    # Ceiling diagnostic — what brightness can we hope for?
     ceiling_curves = SumOfGaussiansCurve(
         amplitude=jnp.full_like(initial_params.curves.amplitude,
                                  bounds.amplitude_max),
@@ -345,9 +309,10 @@ def main():
         spacings=initial_params.spacings,
         curves=ceiling_curves,
     )
-    ceiling_response = _compute_3channel_response(ceiling_params)
-    ceiling_brightness = (jnp.mean(jnp.sum(ceiling_response, axis=-1), axis=-1)
-                          / INPUT_FLUX)
+    ceiling_response = _compute_spectral_response(ceiling_params)
+    ceiling_lum_per_angle = jnp.sum(
+        ceiling_response * LUMINANCE_TRACE_WEIGHTS.reshape(1, 1, -1), axis=-1)
+    ceiling_brightness = jnp.mean(ceiling_lum_per_angle, axis=-1) / INPUT_FLUX
     print(f"Ceiling per-cell brightness (amp=max, FWHM=max): "
           f"min={float(ceiling_brightness.min()):.5f}  "
           f"mean={float(ceiling_brightness.mean()):.5f}  "
@@ -371,7 +336,7 @@ def main():
     phase1_breakdown = breakdown_fn(params, merit_cfg_phase1)
     _print_breakdown("Phase 1 result", phase1_breakdown)
 
-    print("\n── Phase 2: target + D65/FOV uniformity (3-channel) ──")
+    print("\n── Phase 2: target + spectrum-preserving shape ──")
     state = adam_init(params)
     for step in range(PHASE2_STEPS):
         loss, grad = value_and_grad_phase2(params)
@@ -397,11 +362,10 @@ def main():
         row = "  ".join(f"{float(w) / nm:.1f}" for w in mirror_width)
         print(f"  m{mirror_idx}: {row}")
 
-    response = _compute_3channel_response(params)
-    # Each channel value is already a luminance, so the per-cell brightness
-    # is the channel sum (luminance_weights = ones(3)).
-    luminance_per_angle = jnp.sum(response, axis=-1)                # (S, A)
-    mean_luminance = jnp.mean(luminance_per_angle, axis=-1)         # (S,)
+    response = _compute_spectral_response(params)
+    luminance_per_angle = jnp.sum(
+        response * LUMINANCE_TRACE_WEIGHTS.reshape(1, 1, -1), axis=-1)  # (S, A)
+    mean_luminance = jnp.mean(luminance_per_angle, axis=-1)             # (S,)
     relative_brightness = mean_luminance / INPUT_FLUX
 
     grid = relative_brightness.reshape(EYEBOX_NY, EYEBOX_NX)
@@ -412,28 +376,16 @@ def main():
           f"max={float(relative_brightness.max()):.5f}  "
           f"std={float(relative_brightness.std()):.5f}")
 
-    # Per-channel relative brightness (mean over cells × FOV).
-    per_channel_rel = (jnp.mean(response, axis=(0, 1))
-                       / (INPUT_FLUX / 3.0))
-    print(f"Per-channel mean brightness (R, G, B) relative to I_in/3: "
-          f"{float(per_channel_rel[0]):.4f}  "
-          f"{float(per_channel_rel[1]):.4f}  "
-          f"{float(per_channel_rel[2]):.4f}")
-    print(f"D65 target ratios:                                     "
-          f"{float(D65_3CH[0]):.4f}  "
-          f"{float(D65_3CH[1]):.4f}  "
-          f"{float(D65_3CH[2]):.4f}")
-
     final_system = build_parametrized_system(
-        params, probe_wavelengths=PROBE_WAVELENGTHS)
+        params, probe_wavelengths=TRACE_WAVELENGTHS)
     report_path = save_optimization_report(
         run_dir,
         system=final_system,
-        projectors=[PROJECTORS[c] for c in CHANNELS],
+        projectors=[PROJECTOR],
         fov_grid=FOV_GRID,
         merit_config=merit_cfg_phase2,
         optimizer_config={
-            "algorithm": "adam_two_phase_rgb",
+            "algorithm": "adam_two_phase",
             "phase1": {
                 "steps": PHASE1_STEPS,
                 "peak_lr": adam_cfg_phase1.peak_lr,
@@ -444,12 +396,12 @@ def main():
                 "steps": PHASE2_STEPS,
                 "peak_lr": adam_cfg_phase2.peak_lr,
                 "warmup_steps": adam_cfg_phase2.warmup_steps,
-                "focus": "target+shape (3-channel)",
+                "focus": "target+shape (spectrum-preserving)",
             },
             "schedule": "warmup_cosine_decay",
             "total_steps": PHASE1_STEPS + PHASE2_STEPS,
-            "channels": list(CHANNELS),
-            "samples_per_channel": SAMPLES_PER_CHANNEL,
+            "spectral_threshold": SPECTRAL_THRESHOLD,
+            "spectral_samples": SPECTRAL_SAMPLES,
             "optimize_spacings": OPTIMIZE_SPACINGS,
         },
         param_bounds=bounds,
@@ -474,18 +426,14 @@ def main():
         x_fov=float(X_FOV), y_fov=float(Y_FOV),
         num_x=FOV_GRID.num_x, num_y=FOV_GRID.num_y,
     )
-    # ``save_run`` accepts a single representative projector; the three
-    # channels share position/direction/beam geometry so any of them is
-    # sufficient for the manifest. The 3-element ``wavelengths_nm`` axis
-    # carries the actual channel labels (LED peak wavelengths).
     save_run(
         run_dir,
-        final_system, PROJECTORS["G"], scan_cfg,
+        final_system, PROJECTOR, scan_cfg,
         response=response,
         pupil_x_mm=pupil_x_mm,
         pupil_y_mm=pupil_y_mm,
         scan_angles=FOV_GRID.angles_grid,
-        wavelengths_nm=DEFAULT_WAVELENGTHS / nm,
+        wavelengths_nm=TRACE_WAVELENGTHS / nm,
     )
     print(f"Saved run inputs + response to: {run_dir}")
 
