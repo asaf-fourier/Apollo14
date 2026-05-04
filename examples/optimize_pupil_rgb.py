@@ -331,7 +331,7 @@ def main():
                                   adam_cfg_phase1)
         params = bounds.clip(params)
         loss_history.append(float(loss))
-        print(f"step {step+1:4d}/{PHASE1_STEPS}  loss={float(loss):.5f}")
+        print(f"step {step+1:4d}/{PHASE1_STEPS}  loss={float(loss):.8f}")
 
     phase1_breakdown = breakdown_fn(params, merit_cfg_phase1)
     _print_breakdown("Phase 1 result", phase1_breakdown)
@@ -344,7 +344,7 @@ def main():
                                   adam_cfg_phase2)
         params = bounds.clip(params)
         loss_history.append(float(loss))
-        print(f"step {step+1:4d}/{PHASE2_STEPS}  loss={float(loss):.5f}")
+        print(f"step {step+1:4d}/{PHASE2_STEPS}  loss={float(loss):.8f}")
 
     final_breakdown = breakdown_fn(params, merit_cfg_phase2)
     _print_breakdown("Final merit", final_breakdown)
