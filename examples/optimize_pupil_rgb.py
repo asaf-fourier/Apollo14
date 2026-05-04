@@ -252,7 +252,12 @@ PHASE1_STEPS = 100
 PHASE2_STEPS = 200
 
 adam_cfg_phase1 = AdamConfig(peak_lr=3e-3, warmup_steps=20, num_steps=PHASE1_STEPS)
-adam_cfg_phase2 = AdamConfig(peak_lr=2e-3, warmup_steps=10, num_steps=PHASE2_STEPS)
+# Phase 2 enters with the target term already mostly satisfied, so the
+# optimizer is polishing the shape term in a flat region. Adam's
+# 1/sqrt(variance) normalization makes the effective step ~ lr·sign(grad)
+# there — at peak_lr=2e-3 the trajectory dithers instead of descending.
+# Dropping by 4× lets the same number of steps actually polish residue.
+adam_cfg_phase2 = AdamConfig(peak_lr=5e-4, warmup_steps=10, num_steps=PHASE2_STEPS)
 
 
 # ── Run ─────────────────────────────────────────────────────────────────────
