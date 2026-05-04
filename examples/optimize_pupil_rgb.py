@@ -248,8 +248,8 @@ def _mask_frozen(grad: CombinerParams) -> CombinerParams:
 
 # ── Adam optimizer ──────────────────────────────────────────────────────────
 
-PHASE1_STEPS = 100
-PHASE2_STEPS = 200
+PHASE1_STEPS = 50
+PHASE2_STEPS = 50
 
 adam_cfg_phase1 = AdamConfig(peak_lr=3e-3, warmup_steps=20, num_steps=PHASE1_STEPS)
 # Phase 2 enters with the target term already mostly satisfied, so the
