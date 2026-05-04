@@ -74,8 +74,8 @@ EYEBOX_HALF_X = 4.0 * mm         # 8 mm full width on x
 EYEBOX_HALF_Y = 5.0 * mm         # 10 mm full width on y
 EYEBOX_NX, EYEBOX_NY = 8, 10     # 80 cells, ~1.0×1.1 mm each
 
-X_FOV = 8.0 * deg
-Y_FOV = 8.0 * deg
+X_FOV = 4.0 * deg
+Y_FOV = 4.0 * deg
 
 # ── Single broadband projector (panel's calibrated white) ─────────────────
 
