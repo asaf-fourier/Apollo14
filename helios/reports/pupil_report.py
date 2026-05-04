@@ -92,9 +92,137 @@ def render_pupil_report(
             body.append(fig.to_html(full_html=False, include_plotlyjs=include_js))
             figure_index += 1
 
+    # Append the optimization's design variables when an optimization
+    # report sits next to the run files. The optimization-report file is
+    # only produced by the optimize_pupil* drivers, not by plain
+    # ``save_run`` invocations, so this block is skipped when absent.
+    opt_report_path = run_dir / "optimization_report.json"
+    if opt_report_path.exists():
+        opt_report = json.loads(opt_report_path.read_text())
+        body.append(_design_variables_html(opt_report))
+
     out = run_dir / "pupil_report.html"
     out.write_text(_html_wrap("\n".join(body)))
     return out
+
+
+# ── Design-variables section ────────────────────────────────────────────────
+
+
+def _design_variables_html(opt_report: dict) -> str:
+    """Render the optimization's final params + bounds as HTML tables.
+
+    Reads ``optimization_report.json`` (written by
+    :func:`helios.io.save_optimization_report`). All length fields in
+    that file are stored in internal units (mm), so wavelengths and
+    sigmas are converted back to nm here for display.
+    """
+    final = opt_report["final_params"]
+    initial = opt_report["initial_params"]
+    bounds = opt_report.get("param_bounds", {})
+
+    spacings_mm = final["spacings"]
+    init_spacings_mm = initial["spacings"]
+    curve = final["curve"]
+    init_curve = initial["curve"]
+    amp = curve["amplitude"]                  # (M, B)
+    sigma = curve["sigma"]                    # (M, B), mm
+    centers = curve["centers"]                # (M, B), mm
+    init_amp = init_curve["amplitude"]
+    init_sigma = init_curve["sigma"]
+
+    # Internal units: 1 mm = 1.0, 1 nm = 1e-6. Convert sigmas/centers to nm.
+    nm_to_internal = 1e-6
+    fwhm_factor = 2.0 * (2.0 * np.log(2.0)) ** 0.5  # 2·sqrt(2·ln 2) ≈ 2.355
+    centers_nm = [[c / nm_to_internal for c in row] for row in centers]
+    fwhm_nm = [[s * fwhm_factor / nm_to_internal for s in row] for row in sigma]
+    init_fwhm_nm = [[s * fwhm_factor / nm_to_internal for s in row]
+                    for row in init_sigma]
+
+    num_mirrors = len(amp)
+    num_basis = len(amp[0]) if amp else 0
+
+    blocks = ["<h2>Design variables</h2>"]
+    blocks.append(
+        "<p class='caption'>Final parameter values from the optimization "
+        "run. Each row is one mirror; columns are the basis Gaussians at "
+        "their fixed center wavelengths. Initial values are shown in "
+        "parentheses for reference. Yellow cells are pegged at a "
+        "<code>ParamBounds</code> upper limit — when many cells are "
+        "yellow the bound is the bottleneck, not the loss landscape.</p>"
+    )
+
+    # Bounds box at the top
+    if bounds:
+        blocks.append(
+            "<table class='design-vars'>"
+            f"<tr><th>amplitude bounds</th>"
+            f"<td>{bounds.get('amplitude_min', 0):.3f} – "
+            f"{bounds.get('amplitude_max', 0):.3f}</td></tr>"
+            f"<tr><th>FWHM bounds</th>"
+            f"<td>{bounds.get('fwhm_min_nm', 0):.1f} – "
+            f"{bounds.get('fwhm_max_nm', 0):.1f} nm</td></tr>"
+            f"<tr><th>spacing bounds</th>"
+            f"<td>{bounds.get('spacing_min_mm', 0):.3f} – "
+            f"{bounds.get('spacing_max_mm', 0):.3f} mm</td></tr>"
+            "</table>"
+        )
+
+    amp_max = float(bounds.get("amplitude_max", float("inf")))
+    fwhm_max = float(bounds.get("fwhm_max_nm", float("inf")))
+
+    # Spacings table
+    blocks.append("<h3>Mirror inter-spacings</h3>")
+    spacing_max_mm = float(bounds.get("spacing_max_mm", float("inf")))
+    spacing_min_mm = float(bounds.get("spacing_min_mm", float("-inf")))
+    rows = []
+    rows.append("<tr><th>gap</th>"
+                + "".join(f"<th>m{i}→m{i+1}</th>" for i in range(len(spacings_mm)))
+                + "</tr>")
+    cells = []
+    for i, (s, s_init) in enumerate(zip(spacings_mm, init_spacings_mm)):
+        pegged = (s >= spacing_max_mm - 1e-4) or (s <= spacing_min_mm + 1e-4)
+        style = " class='pegged'" if pegged else ""
+        cells.append(f"<td{style}>{s:.3f}<br>"
+                     f"<span class='init'>({s_init:.3f})</span></td>")
+    rows.append("<tr><th>mm</th>" + "".join(cells) + "</tr>")
+    blocks.append("<table class='design-vars'>" + "".join(rows) + "</table>")
+
+    # Per-mirror amplitude + FWHM tables
+    header = ("<tr><th>mirror</th>"
+              + "".join(f"<th>{centers_nm[0][b]:.0f} nm</th>"
+                        for b in range(num_basis))
+              + "</tr>")
+
+    blocks.append("<h3>Reflectance amplitudes (per Gaussian basis)</h3>")
+    rows = [header]
+    for m in range(num_mirrors):
+        cells = [f"<th>m{m}</th>"]
+        for b in range(num_basis):
+            v = float(amp[m][b])
+            v_init = float(init_amp[m][b])
+            pegged = v >= amp_max - 1e-4
+            style = " class='pegged'" if pegged else ""
+            cells.append(f"<td{style}>{v:.4f}<br>"
+                         f"<span class='init'>({v_init:.4f})</span></td>")
+        rows.append("<tr>" + "".join(cells) + "</tr>")
+    blocks.append("<table class='design-vars'>" + "".join(rows) + "</table>")
+
+    blocks.append("<h3>Reflectance FWHM (nm)</h3>")
+    rows = [header]
+    for m in range(num_mirrors):
+        cells = [f"<th>m{m}</th>"]
+        for b in range(num_basis):
+            v = float(fwhm_nm[m][b])
+            v_init = float(init_fwhm_nm[m][b])
+            pegged = v >= fwhm_max - 1e-2
+            style = " class='pegged'" if pegged else ""
+            cells.append(f"<td{style}>{v:.1f}<br>"
+                         f"<span class='init'>({v_init:.1f})</span></td>")
+        rows.append("<tr>" + "".join(cells) + "</tr>")
+    blocks.append("<table class='design-vars'>" + "".join(rows) + "</table>")
+
+    return "\n".join(blocks)
 
 
 # ── Page composers ──────────────────────────────────────────────────────────
@@ -266,6 +394,13 @@ def _html_wrap(body: str) -> str:
         ".headline-table{border-collapse:collapse;font-size:.95em;}"
         ".headline-table th{text-align:left;font-weight:600;"
         "padding:.2em .9em .2em 0;color:#444;}"
-        ".headline-table td{padding:.2em 0;font-variant-numeric:tabular-nums;}</style>"
+        ".headline-table td{padding:.2em 0;font-variant-numeric:tabular-nums;}"
+        "table.design-vars{border-collapse:collapse;margin:.5em 0 1.5em 0;"
+        "font-size:.9em;font-variant-numeric:tabular-nums;}"
+        "table.design-vars th,table.design-vars td{padding:.3em .7em;"
+        "border:1px solid #ddd;text-align:right;}"
+        "table.design-vars th{background:#f3f3f6;font-weight:600;color:#333;}"
+        "table.design-vars td.pegged{background:#fff7c4;}"
+        "table.design-vars span.init{color:#888;font-size:.85em;}</style>"
         f"</head><body>{body}</body></html>"
     )

@@ -64,9 +64,9 @@ from helios.adam import AdamConfig, adam_init, adam_step
 from helios.io import save_optimization_report, save_run, ScanConfig
 from helios.reports.pupil_report import render_pupil_report
 
-# jax.config.update("jax_compilation_cache_dir", "/home/ubuntu/.cache/jax")
-# jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
-# jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+jax.config.update("jax_compilation_cache_dir", "/home/ubuntu/.cache/jax")
+jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 
 # ── Eyebox target region (pre-defined, fixed) ───────────────────────────────
 
@@ -154,7 +154,7 @@ merit_cfg_phase2 = PupilMeritConfig(
     asymmetric_target=True,
 )
 
-bounds = ParamBounds(amplitude_max=0.25, fwhm_max_nm=60, fwhm_min_nm=10)
+bounds = ParamBounds(amplitude_max=0.20, fwhm_max_nm=120, fwhm_min_nm=10)
 
 # When False, mirror inter-spacing is held at its initial value and only
 # the Gaussian reflectance curves are tuned. Hard nearest-neighbor binning
@@ -361,6 +361,26 @@ def main():
         mirror_width = params.curves.sigma[mirror_idx]
         row = "  ".join(f"{float(w) / nm:.1f}" for w in mirror_width)
         print(f"  m{mirror_idx}: {row}")
+
+    # Bounds-pegged diagnostic — surfaces whether the optimizer is stalled
+    # because a parameter is sitting at its upper bound (the bound is
+    # binding, not a true flat region of the loss).
+    sigma_max = fwhm_to_sigma(bounds.fwhm_max_nm * nm)
+    amp_pegged = int(jnp.sum(
+        params.curves.amplitude >= bounds.amplitude_max - 1e-4))
+    sigma_pegged = int(jnp.sum(params.curves.sigma >= sigma_max - 1e-4))
+    spacing_max_mm = bounds.spacing_max_mm * mm
+    spacing_min_mm = bounds.spacing_min_mm * mm
+    spacing_pegged_hi = int(jnp.sum(params.spacings >= spacing_max_mm - 1e-4))
+    spacing_pegged_lo = int(jnp.sum(params.spacings <= spacing_min_mm + 1e-4))
+    print(f"\nParameters at upper bound:")
+    print(f"  amplitudes: {amp_pegged} / {params.curves.amplitude.size} "
+          f"(at {bounds.amplitude_max})")
+    print(f"  sigmas:     {sigma_pegged} / {params.curves.sigma.size} "
+          f"(at FWHM {bounds.fwhm_max_nm:.1f} nm)")
+    print(f"  spacings:   {spacing_pegged_lo} at lower / "
+          f"{spacing_pegged_hi} at upper "
+          f"({bounds.spacing_min_mm}–{bounds.spacing_max_mm} mm)")
 
     response = _compute_spectral_response(params)
     luminance_per_angle = jnp.sum(
