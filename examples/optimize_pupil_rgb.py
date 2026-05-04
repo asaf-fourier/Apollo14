@@ -129,22 +129,22 @@ PER_CELL_TARGET = EYEBOX_TARGET / NUM_EYEBOX_CELLS
 
 FOV_GRID = FovGrid(DEFAULT_LIGHT_DIRECTION, X_FOV, Y_FOV, num_x=ANGULAR_STEPS_X, num_y=ANGULAR_STEPS_Y)
 
-# Phase 1: drive every cell toward the target brightness; ignore shape.
-# ``asymmetric_target`` only penalizes cells *below* the brightness target —
-# cells already at or above target add zero cost. Right for a brightness-
-# bound design: no reason to drag the bright corner cells back down to match
-# the dim ones; just lift the dim ones up.
+# Phase 1: pull every cell to the brightness target *exactly* — symmetric
+# squared error, so over-target cells get pulled down and under-target cells
+# get pulled up. With a tight target this keeps the optimizer working on
+# tightening the cell-to-cell spread instead of stopping the moment all cells
+# clear the threshold. Shape term is off — color balance is phase 2's job.
 merit_cfg_phase1 = PupilMeritConfig(
     target_relative=PER_CELL_TARGET,
     d65_weights=SHAPE_TARGET,
     luminance_weights=LUMINANCE_TRACE_WEIGHTS,
     weight_target=1.0,
     weight_shape=0.0,
-    asymmetric_target=True,
+    asymmetric_target=False,
 )
 
-# Phase 2: keep cells at target while preserving the projector's spectrum
-# and FOV-flatness per cell.
+# Phase 2: hold every cell *at or above* target (asymmetric — over-target is
+# fine) while polishing spectrum-preservation across (cell, FOV, λ).
 merit_cfg_phase2 = PupilMeritConfig(
     target_relative=PER_CELL_TARGET,
     d65_weights=SHAPE_TARGET,
