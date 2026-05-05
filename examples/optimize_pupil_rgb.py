@@ -72,7 +72,7 @@ jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 
 EYEBOX_HALF_X = 4.0 * mm         # 8 mm full width on x
 EYEBOX_HALF_Y = 5.0 * mm         # 10 mm full width on y
-EYEBOX_NX, EYEBOX_NY = 8, 10     # 80 cells, ~1.0×1.1 mm each
+EYEBOX_NX, EYEBOX_NY = 9, 11   # 80 cells, ~1.0×1.1 mm each
 
 X_FOV = 4.0 * deg
 Y_FOV = 4.0 * deg
@@ -80,6 +80,7 @@ Y_FOV = 4.0 * deg
 # ── Single broadband projector (panel's calibrated white) ─────────────────
 
 PROJECTOR_NX, PROJECTOR_NY = 50, 10
+# PROJECTOR_NX, PROJECTOR_NY = 25, 5
 ANGULAR_STEPS_X, ANGULAR_STEPS_Y = 16, 16
 
 PROJECTOR = PlayNitrideLed.create_broadband(
@@ -151,7 +152,7 @@ merit_cfg_phase2 = PupilMeritConfig(
     luminance_weights=LUMINANCE_TRACE_WEIGHTS,
     weight_target=1.0,
     weight_shape=1.0,
-    asymmetric_target=True,
+    asymmetric_target=False,
 )
 
 bounds = ParamBounds(amplitude_max=0.20, fwhm_max_nm=120, fwhm_min_nm=10)
@@ -159,7 +160,7 @@ bounds = ParamBounds(amplitude_max=0.20, fwhm_max_nm=120, fwhm_min_nm=10)
 # When False, mirror inter-spacing is held at its initial value and only
 # the Gaussian reflectance curves are tuned. Hard nearest-neighbor binning
 # is then sufficient — see optimize_pupil.py for the reasoning.
-OPTIMIZE_SPACINGS = True
+OPTIMIZE_SPACINGS = False
 
 
 # ── Reference input flux (photometric, matches luminance_weights) ──────────
@@ -167,23 +168,78 @@ OPTIMIZE_SPACINGS = True
 NUM_RAYS = PROJECTOR_NX * PROJECTOR_NY
 INPUT_FLUX = float(NUM_RAYS * jnp.sum(_W_AT_TRACE * LUMINANCE_TRACE_WEIGHTS))
 
-# ── Build the pupil cell grid and mask for the target region ────────────────
+# ── Eye-pupil moving-window aggregation ───────────────────────────────────
+# Each "merit cell" represents what a real eye-pupil (~3 mm diameter) would
+# see if positioned at that point in the eyebox. Implemented as a 2-D mean
+# convolution of the fine-grid binned response with a (K × K)-cell box
+# kernel — physically meaningful, and provides spatial smoothness without
+# soft binning.
+#
+# The fine sample grid is enlarged by ``KERNEL_SIZE_CELLS // 2`` cells on
+# every side so that ``mode="valid"`` convolution outputs *exactly* the
+# original (EYEBOX_NY, EYEBOX_NX) shape — no boundary truncation, every
+# eyebox cell sees full kernel support.
+#
+# Setting ``KERNEL_SIZE_CELLS = 1`` falls back to point sampling (no
+# window).
+
+KERNEL_SIZE_CELLS = 3
+PADDING_CELLS = KERNEL_SIZE_CELLS // 2
 
 _ref_system = build_parametrized_system(
     CombinerParams.initial(), probe_wavelengths=TRACE_WAVELENGTHS)
 _pupil = next(e for e in _ref_system.elements if isinstance(e, RectangularPupil))
+
+_CELL_PITCH_X = 2 * EYEBOX_HALF_X / max(EYEBOX_NX - 1, 1)
+_CELL_PITCH_Y = 2 * EYEBOX_HALF_Y / max(EYEBOX_NY - 1, 1)
+
+SAMPLE_HALF_X = EYEBOX_HALF_X + PADDING_CELLS * _CELL_PITCH_X
+SAMPLE_HALF_Y = EYEBOX_HALF_Y + PADDING_CELLS * _CELL_PITCH_Y
+SAMPLE_NX = EYEBOX_NX + 2 * PADDING_CELLS
+SAMPLE_NY = EYEBOX_NY + 2 * PADDING_CELLS
+
+# The points the tracer bins onto live on the *sample* grid (eyebox + 1
+# padding cell on every side). After binning we convolve with the
+# (KERNEL × KERNEL) mean kernel and the result lives on the inner
+# (EYEBOX_NY, EYEBOX_NX) eyebox grid — that's what the merit consumes.
 EYEBOX_POINTS = planar_grid_points(
     _pupil.position, _pupil.normal,
-    EYEBOX_HALF_X, EYEBOX_HALF_Y, EYEBOX_NX, EYEBOX_NY,
-)   # (S, 3)
-CELL_MASK = jnp.ones(EYEBOX_POINTS.shape[0])
+    SAMPLE_HALF_X, SAMPLE_HALF_Y, SAMPLE_NX, SAMPLE_NY,
+)   # (SAMPLE_NX * SAMPLE_NY, 3)
+CELL_MASK = jnp.ones(EYEBOX_NX * EYEBOX_NY)
 
-_CELL_PITCH_X = 2 * EYEBOX_HALF_X / (EYEBOX_NX - 1)
-_CELL_PITCH_Y = 2 * EYEBOX_HALF_Y / (EYEBOX_NY - 1)
-# σ ≈ ½ the smaller cell pitch — enough overlap that a ray straddling a
-# cell boundary contributes to both neighbors (so spacing gradients flow),
-# small enough that cells stay individually addressable.
+# σ ≈ ½ the smaller fine-cell pitch — for soft binning, when used. With
+# the moving-window aggregation in place soft binning is redundant for
+# spatial smoothness, but it's still the only path to spacing gradients.
 BINNING_SIGMA = 0.5 * min(_CELL_PITCH_X, _CELL_PITCH_Y)
+
+
+def _window_mean(arr: jnp.ndarray, ny: int, nx: int,
+                 kernel_size: int) -> jnp.ndarray:
+    """Apply a (kernel × kernel) mean filter along the leading spatial axis.
+
+    Args:
+        arr: ``(ny * nx, …)`` row-major flat spatial axis. Trailing dims are
+            preserved untouched.
+        ny, nx: shape of the spatial axis before flattening.
+        kernel_size: side length of the square mean kernel, in cells.
+
+    Returns:
+        ``((ny - K + 1) * (nx - K + 1), …)`` — same trailing dims, the
+        spatial axis convolved with ``mode="valid"``.
+    """
+    if kernel_size <= 1:
+        return arr
+    other_shape = arr.shape[1:]
+    arr_2d = arr.reshape(ny, nx, *other_shape)
+    window_dims = (kernel_size, kernel_size) + (1,) * len(other_shape)
+    strides = (1, 1) + (1,) * len(other_shape)
+    summed = jax.lax.reduce_window(
+        arr_2d, 0.0, jax.lax.add, window_dims, strides, "VALID")
+    averaged = summed / (kernel_size * kernel_size)
+    out_ny = ny - kernel_size + 1
+    out_nx = nx - kernel_size + 1
+    return averaged.reshape(out_ny * out_nx, *other_shape)
 
 
 # ── Loss function ───────────────────────────────────────────────────────────
@@ -209,15 +265,22 @@ def _compute_spectral_response(params: CombinerParams) -> jnp.ndarray:
             binned = binned + trace_branch_over_fov(
                 prepared, PROJECTOR, EYEBOX_POINTS, wavelength,
                 directions,
-                sigma=BINNING_SIGMA if OPTIMIZE_SPACINGS else None)  # (A, S)
-        return None, binned.T  # (S, A)
+                sigma=BINNING_SIGMA if OPTIMIZE_SPACINGS else None)  # (A, S_sample)
+        # (S_sample, A) → moving-window mean → (S_eyebox, A). Windowing
+        # *inside* the scan body keeps the per-iteration activation tape
+        # at eyebox size rather than sample size — the convolution is
+        # cheap and the memory saving carries through ``jax.checkpoint``
+        # below.
+        windowed = _window_mean(
+            binned.T, SAMPLE_NY, SAMPLE_NX, KERNEL_SIZE_CELLS)
+        return None, windowed  # (S_eyebox, A)
 
     # ``jax.checkpoint`` rematerializes each wavelength's forward during
     # backward instead of saving the full per-(wavelength, direction, ray,
     # cell) activation tape — without it value_and_grad needs ~200 GB.
     _, all_responses = jax.lax.scan(
-        jax.checkpoint(trace_one_wavelength), None, TRACE_WAVELENGTHS)  # (N, S, A)
-    return jnp.transpose(all_responses, (1, 2, 0))  # (S, A, N)
+        jax.checkpoint(trace_one_wavelength), None, TRACE_WAVELENGTHS)  # (N, S_eyebox, A)
+    return jnp.transpose(all_responses, (1, 2, 0))  # (S_eyebox, A, N)
 
 
 def loss_fn_phase1(params: CombinerParams) -> jnp.ndarray:
@@ -248,8 +311,8 @@ def _mask_frozen(grad: CombinerParams) -> CombinerParams:
 
 # ── Adam optimizer ──────────────────────────────────────────────────────────
 
-PHASE1_STEPS = 50
-PHASE2_STEPS = 50
+PHASE1_STEPS = 100
+PHASE2_STEPS = 100
 
 adam_cfg_phase1 = AdamConfig(peak_lr=3e-3, warmup_steps=20, num_steps=PHASE1_STEPS)
 # Phase 2 enters with the target term already mostly satisfied, so the
@@ -291,6 +354,11 @@ def main():
         num_vars += params.spacings.size
     print(f"── Pupil optimization ({optimized_label}) ──")
     print(f"Variables: {num_vars}")
+    window_mm_x = KERNEL_SIZE_CELLS * float(_CELL_PITCH_X) / mm
+    window_mm_y = KERNEL_SIZE_CELLS * float(_CELL_PITCH_Y) / mm
+    print(f"Pupil window: {KERNEL_SIZE_CELLS}×{KERNEL_SIZE_CELLS} cells "
+          f"({window_mm_x:.2f}×{window_mm_y:.2f} mm) — "
+          f"sample grid {SAMPLE_NX}×{SAMPLE_NY}, eyebox grid {EYEBOX_NX}×{EYEBOX_NY}")
     print(f"Eyebox:    {2*EYEBOX_HALF_X/mm:.1f}×{2*EYEBOX_HALF_Y/mm:.1f} mm, "
           f"{EYEBOX_NX}×{EYEBOX_NY} cells")
     print(f"FOV:       ±{X_FOV/deg:.1f}° × ±{Y_FOV/deg:.1f}°, "
