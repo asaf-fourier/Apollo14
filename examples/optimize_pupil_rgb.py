@@ -146,14 +146,23 @@ merit_cfg_phase1 = PupilMeritConfig(
     asymmetric_target=False,
 )
 
-# Phase 2: hold every cell *at or above* target (asymmetric — over-target is
-# fine) while polishing spectrum-preservation across (cell, FOV, λ).
+# Phase 2: hold every cell at the brightness target while polishing
+# spectrum-preservation across (cell, FOV, λ). The two terms have very
+# different *natural magnitudes* — at the start of phase 2, ``L_target``
+# is typically O(1e-2) while ``L_shape`` sits at O(1e-5) because phase 1
+# already produced an approximately-spectrum-preserving design. With
+# equal weights the combined gradient is ~1000× dominated by target,
+# so on parameters where target and shape disagree, shape never wins.
+# A large ``weight_shape`` rebalances the gradient magnitudes so shape
+# can actually drive deviation down. Tune downward (e.g. 100, 10) if
+# ``L_target`` rises during phase 2 — that's the sign target and shape
+# are pulling in opposite directions on some parameters.
 merit_cfg_phase2 = PupilMeritConfig(
     target_relative=PER_CELL_TARGET,
     d65_weights=SHAPE_TARGET,
     luminance_weights=LUMINANCE_TRACE_WEIGHTS,
     weight_target=1.0,
-    weight_shape=1.0,
+    weight_shape=1000.0,
     asymmetric_target=False,
 )
 
