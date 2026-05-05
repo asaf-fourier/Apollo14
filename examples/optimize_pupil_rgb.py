@@ -76,8 +76,8 @@ EYEBOX_HALF_X = 4.0 * mm         # 8 mm full width on x
 EYEBOX_HALF_Y = 5.0 * mm         # 10 mm full width on y
 EYEBOX_NX, EYEBOX_NY = 8, 10   # 80 cells, exactly 1×1 mm each (cell-centered)
 
-X_FOV = 4.0 * deg
-Y_FOV = 4.0 * deg
+X_FOV = 8.0 * deg
+Y_FOV = 8.0 * deg
 
 # ── Single broadband projector (panel's calibrated white) ─────────────────
 
@@ -379,7 +379,7 @@ def main():
           f"sample grid {SAMPLE_NX}×{SAMPLE_NY}, eyebox grid {EYEBOX_NX}×{EYEBOX_NY}")
     print(f"Eyebox:    {2*EYEBOX_HALF_X/mm:.1f}×{2*EYEBOX_HALF_Y/mm:.1f} mm, "
           f"{EYEBOX_NX}×{EYEBOX_NY} cells")
-    print(f"FOV:       ±{X_FOV/deg:.1f}° × ±{Y_FOV/deg:.1f}°, "
+    print(f"FOV:       ±{X_FOV/deg/2:.1f}° × ±{Y_FOV/deg/2:.1f}°, "
           f"{FOV_GRID.num_x}×{FOV_GRID.num_y} samples")
     print(f"Spectrum:  {SPECTRAL_SAMPLES} uniform samples, "
           f"{float(_w_lo)/nm:.0f}–{float(_w_hi)/nm:.0f} nm "
