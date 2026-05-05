@@ -104,15 +104,32 @@ def compute_local_axes(normal):
     return local_x, local_y
 
 
-def planar_grid_points(center, normal, half_x, half_y, nx, ny):
+def planar_grid_points(center, normal, half_x, half_y, nx, ny,
+                       *, cell_centered: bool = False):
     """Generate a regular (nx, ny) grid of points on a plane.
 
     The grid spans ``[-half_x, half_x] × [-half_y, half_y]`` in the plane's
     local axes. Returns a flat ``(nx*ny, 3)`` array of world positions.
+
+    Args:
+        cell_centered: When ``False`` (default), uses endpoint-inclusive
+            sampling — points sit at ``-half`` and ``+half``, with pitch
+            ``2·half / (n − 1)``. When ``True``, points sit at the
+            *centers* of nx (resp. ny) equal-width cells that exactly
+            tile ``[-half, +half]`` — pitch is ``2·half / n`` and the
+            outermost points are inset half a cell from the boundary.
+            Use cell-centered when you want N cells to *fill* the
+            half-extent without overhang.
     """
     local_x, local_y = compute_local_axes(normal)
-    xs = jnp.linspace(-half_x, half_x, nx)
-    ys = jnp.linspace(-half_y, half_y, ny)
+    if cell_centered:
+        pitch_x = 2 * half_x / nx
+        pitch_y = 2 * half_y / ny
+        xs = jnp.linspace(-half_x + pitch_x / 2, half_x - pitch_x / 2, nx)
+        ys = jnp.linspace(-half_y + pitch_y / 2, half_y - pitch_y / 2, ny)
+    else:
+        xs = jnp.linspace(-half_x, half_x, nx)
+        ys = jnp.linspace(-half_y, half_y, ny)
     grid_x, grid_y = jnp.meshgrid(xs, ys)  # (ny, nx)
     positions = (center[None, None, :]
                  + grid_x[:, :, None] * local_x[None, None, :]

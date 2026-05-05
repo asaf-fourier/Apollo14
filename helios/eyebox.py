@@ -23,31 +23,42 @@ def eyebox_grid_points(center, normal, radius, nx, ny):
 # ── Response computation ────────────────────────────────────────────────────
 
 def trace_branch_over_fov(route, projector, eyebox_points, wavelength,
-                          directions, sigma=None):
-    """Trace one branch route across all FOV directions, scanned over directions.
+                          directions, sigma=None,
+                          *, vmap_directions: bool = False):
+    """Trace one branch route across all FOV directions.
 
     Returns ``(A, S)`` binned intensity at each eyebox sample for each
     FOV direction.
 
-    Uses ``lax.scan`` (not ``vmap``) to keep the compiled kernel small —
-    the per-direction binning intermediate has shape
-    ``(rays, eyebox_cells, 3)`` and vmapping the direction axis on top
-    multiplies that by ``A`` (≈1024), exhausting GPU shared memory in
-    one fused Triton kernel. The inner ray vmap inside
-    ``projector.generate_rays`` / ``trace_rays`` already saturates the
-    GPU per direction, so the scan is roughly free at runtime.
+    Iteration over directions is configurable:
+
+    * ``vmap_directions=False`` *(default)* — ``lax.scan`` over
+      directions. Keeps the compiled kernel small by processing one
+      direction at a time. Required for large ``A`` (~1024+) where the
+      per-direction ``(rays, eyebox_cells, 3)`` working set times ``A``
+      would exhaust GPU shared memory in one fused kernel. Backward
+      compat: this is what every existing caller used.
+    * ``vmap_directions=True`` — ``jax.vmap`` over directions. Fuses all
+      ``A`` directions into one kernel that runs them in parallel.
+      ~2–4× faster on the forward pass for moderate ``A``, at the cost
+      of a larger compiled kernel and a longer first-time compile.
+      Safe when ``A`` is small enough that ``A · per-direction-working-
+      set`` fits comfortably in GPU memory (rule of thumb: ``A ≲
+      256``).
     """
-    def per_direction(_, direction):
+    def per_direction(direction):
         ray = projector.generate_rays(direction=direction,
                                       wavelength=wavelength)
         traced = trace_rays(route, ray, wavelength=wavelength)
         if sigma is not None:
-            binned = bin_hits_soft(traced, eyebox_points, sigma)
-        else:
-            binned = bin_hits_to_nearest(traced, eyebox_points, stop_grad=True)
-        return None, binned
+            return bin_hits_soft(traced, eyebox_points, sigma)
+        return bin_hits_to_nearest(traced, eyebox_points, stop_grad=True)
 
-    _, binned_per_direction = jax.lax.scan(per_direction, None, directions)
+    if vmap_directions:
+        return jax.vmap(per_direction)(directions)  # (A, S)
+
+    _, binned_per_direction = jax.lax.scan(
+        lambda _, d: (None, per_direction(d)), None, directions)
     return binned_per_direction  # (A, S)
 
 

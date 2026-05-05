@@ -63,16 +63,18 @@ from helios.pupil_merit import (
 from helios.adam import AdamConfig, adam_init, adam_step
 from helios.io import save_optimization_report, save_run, ScanConfig
 from helios.reports.pupil_report import render_pupil_report
+from helios.jax_cache import enable_jax_compilation_cache
 
-jax.config.update("jax_compilation_cache_dir", "/home/ubuntu/.cache/jax")
-jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
-jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+# Persistent JIT cache survives across runs so successive optimizations
+# skip the multi-second compile. Cache dir auto-detects from
+# ``$XDG_CACHE_HOME`` or ``~/.cache``, so the script is portable.
+enable_jax_compilation_cache()
 
 # ── Eyebox target region (pre-defined, fixed) ───────────────────────────────
 
 EYEBOX_HALF_X = 4.0 * mm         # 8 mm full width on x
 EYEBOX_HALF_Y = 5.0 * mm         # 10 mm full width on y
-EYEBOX_NX, EYEBOX_NY = 9, 11   # 80 cells, ~1.0×1.1 mm each
+EYEBOX_NX, EYEBOX_NY = 8, 10   # 80 cells, exactly 1×1 mm each (cell-centered)
 
 X_FOV = 4.0 * deg
 Y_FOV = 4.0 * deg
@@ -81,7 +83,7 @@ Y_FOV = 4.0 * deg
 
 PROJECTOR_NX, PROJECTOR_NY = 50, 10
 # PROJECTOR_NX, PROJECTOR_NY = 25, 5
-ANGULAR_STEPS_X, ANGULAR_STEPS_Y = 16, 16
+ANGULAR_STEPS_X, ANGULAR_STEPS_Y = 8, 8
 
 PROJECTOR = PlayNitrideLed.create_broadband(
     position=DEFAULT_LIGHT_POSITION, direction=DEFAULT_LIGHT_DIRECTION,
@@ -190,8 +192,10 @@ _ref_system = build_parametrized_system(
     CombinerParams.initial(), probe_wavelengths=TRACE_WAVELENGTHS)
 _pupil = next(e for e in _ref_system.elements if isinstance(e, RectangularPupil))
 
-_CELL_PITCH_X = 2 * EYEBOX_HALF_X / max(EYEBOX_NX - 1, 1)
-_CELL_PITCH_Y = 2 * EYEBOX_HALF_Y / max(EYEBOX_NY - 1, 1)
+# Cell-centered convention: NX × NY cells of equal size exactly tile
+# the half-extent box without overhang. Pitch is ``2·half / N``.
+_CELL_PITCH_X = 2 * EYEBOX_HALF_X / EYEBOX_NX
+_CELL_PITCH_Y = 2 * EYEBOX_HALF_Y / EYEBOX_NY
 
 SAMPLE_HALF_X = EYEBOX_HALF_X + PADDING_CELLS * _CELL_PITCH_X
 SAMPLE_HALF_Y = EYEBOX_HALF_Y + PADDING_CELLS * _CELL_PITCH_Y
@@ -199,12 +203,16 @@ SAMPLE_NX = EYEBOX_NX + 2 * PADDING_CELLS
 SAMPLE_NY = EYEBOX_NY + 2 * PADDING_CELLS
 
 # The points the tracer bins onto live on the *sample* grid (eyebox + 1
-# padding cell on every side). After binning we convolve with the
-# (KERNEL × KERNEL) mean kernel and the result lives on the inner
-# (EYEBOX_NY, EYEBOX_NX) eyebox grid — that's what the merit consumes.
+# padding cell on every side, cell-centered). After binning we convolve
+# with the (KERNEL × KERNEL) mean kernel and the result lives on the
+# inner (EYEBOX_NY, EYEBOX_NX) eyebox grid — that's what the merit
+# consumes. ``cell_centered=True`` puts every grid point at the center
+# of a 1 × 1 mm cell, so the EYEBOX_NX × EYEBOX_NY merit grid exactly
+# tiles the nominal eyebox without ½-cell overhang at the boundary.
 EYEBOX_POINTS = planar_grid_points(
     _pupil.position, _pupil.normal,
     SAMPLE_HALF_X, SAMPLE_HALF_Y, SAMPLE_NX, SAMPLE_NY,
+    cell_centered=True,
 )   # (SAMPLE_NX * SAMPLE_NY, 3)
 CELL_MASK = jnp.ones(EYEBOX_NX * EYEBOX_NY)
 
@@ -265,7 +273,8 @@ def _compute_spectral_response(params: CombinerParams) -> jnp.ndarray:
             binned = binned + trace_branch_over_fov(
                 prepared, PROJECTOR, EYEBOX_POINTS, wavelength,
                 directions,
-                sigma=BINNING_SIGMA if OPTIMIZE_SPACINGS else None)  # (A, S_sample)
+                sigma=BINNING_SIGMA if OPTIMIZE_SPACINGS else None,
+                vmap_directions=True)  # (A, S_sample); A=64 fits comfortably
         # (S_sample, A) → moving-window mean → (S_eyebox, A). Windowing
         # *inside* the scan body keeps the per-iteration activation tape
         # at eyebox size rather than sample size — the convolution is
@@ -512,8 +521,19 @@ def main():
     )
     print(f"\nSaved optimization report: {report_path}")
 
-    pupil_x_mm = jnp.linspace(-EYEBOX_HALF_X, EYEBOX_HALF_X, EYEBOX_NX)
-    pupil_y_mm = jnp.linspace(-EYEBOX_HALF_Y, EYEBOX_HALF_Y, EYEBOX_NY)
+    # Cell-centered axes — match the merit's grid convention so the
+    # report's heatmap renders cells of (EYEBOX_NX × EYEBOX_NY) tiling
+    # exactly the [-EYEBOX_HALF, +EYEBOX_HALF] eyebox.
+    pupil_x_mm = jnp.linspace(
+        -EYEBOX_HALF_X + _CELL_PITCH_X / 2,
+        EYEBOX_HALF_X - _CELL_PITCH_X / 2,
+        EYEBOX_NX,
+    )
+    pupil_y_mm = jnp.linspace(
+        -EYEBOX_HALF_Y + _CELL_PITCH_Y / 2,
+        EYEBOX_HALF_Y - _CELL_PITCH_Y / 2,
+        EYEBOX_NY,
+    )
     scan_cfg = ScanConfig(
         base_direction=DEFAULT_LIGHT_DIRECTION,
         x_fov=float(X_FOV), y_fov=float(Y_FOV),
