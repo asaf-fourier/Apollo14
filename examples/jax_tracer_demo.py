@@ -18,9 +18,11 @@ import jax.numpy as jnp
 import numpy as np
 
 from apollo14.combiner import (
-    build_default_system,
     DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
 )
+from apollo14.binning import bin_hits_to_nearest
+from apollo14.elements.pupil import RectangularPupil
+from apollo14.geometry import compute_local_axes, planar_grid_points
 from apollo14.route import build_route, branch_path, absorb
 from apollo14.trace import prepare_route, trace_rays
 
@@ -29,13 +31,29 @@ from apollo14.trace import prepare_route, trace_rays
 # compile per route is reused across the full wavelength scan.
 _trace_rays_jit = jax.jit(trace_rays)
 from apollo14.projector import PlayNitrideLed, scan_directions
-from apollo14.visualizer import plot_system, plot_pupil_fill
+from apollo14.visualizer import (
+    eyebox_overlay_traces, plot_pupil_fill, plot_system,
+)
 from apollo14.units import mm, nm, deg
+
+from helios.combiner_params import (
+    CHASSIS_CENTER, CombinerParams, NUM_MIRRORS, PUPIL_OFFSET_X,
+    PUPIL_OFFSET_Y, build_parametrized_system,
+)
 
 
 # ── Build system + routes ──────────────────────────────────────────────────
+# Use the same parametrized system the optimizer (``optimize_pupil_rgb.py``)
+# operates on, so this demo's geometry matches the optimization target
+# exactly. Only the *initial* params are used for the visual / centroid
+# probe — they're a reasonable design (10 % amp, 35 nm FWHM Gaussians at
+# the LED peaks) representative of what the system looks like before
+# optimization. The centroid found here is geometric — it depends on the
+# chassis/mirror layout, not on the specific reflectance values.
 
-system = build_default_system()
+PROBE_WAVELENGTHS = jnp.linspace(420 * nm, 660 * nm, 100)
+system = build_parametrized_system(
+    CombinerParams.initial(), probe_wavelengths=PROBE_WAVELENGTHS)
 
 # Explicit main path — plain strings for top-level elements, (block, face)
 # tuples for addressable sub-elements.
@@ -153,6 +171,68 @@ print(f"Projector: {projectors['R'].nx}x{projectors['R'].ny} rays, "
       f"{projectors['R'].beam_height/mm:.0f} mm")
 
 
+# ── Optimal-eyebox-center probe ────────────────────────────────────────────
+# Trace the projector at every FOV direction × every mirror branch, sum
+# the binned light landings on a fine grid covering the pupil plane, and
+# compute the spatially-weighted centroid. That centroid is "where light
+# naturally lands when integrated over all gaze directions" — and so the
+# right place to center the eyebox.
+
+def find_optimal_eyebox_center(system, projector, scan_dirs, wavelength,
+                               *, sample_half_x_mm=6.0, sample_half_y_mm=8.0,
+                               sample_nx=24, sample_ny=32):
+    """Return (offset_x_local, offset_y_local, global_center_xyz).
+
+    Offsets are measured along the pupil plane's local x/y axes, so they
+    can be plugged straight into ``EYEBOX_CENTER_OFFSET_X / _Y`` in the
+    optimizer. The global center is the same point in world coordinates,
+    convenient for placing markers/visualizations.
+    """
+    pupil = next(e for e in system.elements if isinstance(e, RectangularPupil))
+    sample_points = planar_grid_points(
+        pupil.position, pupil.normal,
+        sample_half_x_mm * mm, sample_half_y_mm * mm,
+        sample_nx, sample_ny, cell_centered=True)
+
+    centroid_main_path = [
+        "aperture", ("chassis", "back"),
+        *[f"mirror_{i}" for i in range(NUM_MIRRORS)],
+        ("chassis", "front"),
+    ]
+    centroid_branch_tail = [("chassis", "top"), absorb("pupil")]
+    centroid_branches = [
+        build_route(
+            system,
+            branch_path(centroid_main_path, at=f"mirror_{i}",
+                        tail=centroid_branch_tail),
+        )
+        for i in range(NUM_MIRRORS)
+    ]
+    prepared_branches = [prepare_route(r, wavelength)
+                         for r in centroid_branches]
+
+    total = jnp.zeros(sample_points.shape[0])
+    for d_idx in range(scan_dirs.shape[0]):
+        ray = projector.generate_rays(
+            direction=scan_dirs[d_idx], wavelength=wavelength)
+        for prepared_branch in prepared_branches:
+            traced = _trace_rays_jit(
+                prepared_branch, ray, wavelength=wavelength)
+            total = total + bin_hits_to_nearest(
+                traced, sample_points, stop_grad=True)
+
+    local_x, local_y = compute_local_axes(pupil.normal)
+    rel = sample_points - pupil.position[None, :]
+    x_local = jnp.dot(rel, local_x)
+    y_local = jnp.dot(rel, local_y)
+
+    weights_sum = total.sum() + 1e-12
+    offset_x = (total * x_local).sum() / weights_sum
+    offset_y = (total * y_local).sum() / weights_sum
+    global_center = pupil.position + offset_x * local_x + offset_y * local_y
+    return float(offset_x), float(offset_y), np.asarray(global_center)
+
+
 # ── Vmapped trace kernel: (wavelength × angle × ray) per branch ───────────
 #
 # One JIT-compiled function per (color, branch_route_shape) pair. Closes
@@ -236,6 +316,41 @@ for c, ci in RGB_COLOR_IDX.items():
 print(f"\nTrace step elapsed: {trace_elapsed:.2f} s "
       f"({1e3*trace_elapsed/A:.1f} ms/angle, {A} angles)")
 
+# ── Optimal eyebox center (centroid probe) ───────────────────────────────
+
+print("\n── Probing optimal eyebox center (averaged over FOV) ──")
+centroid_t0 = time.perf_counter()
+offset_x, offset_y, global_center = find_optimal_eyebox_center(
+    system, projectors["G"], flat_dirs, peak_wavelengths["G"],
+)
+centroid_elapsed = time.perf_counter() - centroid_t0
+print(f"Centroid probe elapsed: {centroid_elapsed:.2f} s")
+
+print("\nLight centroid at the pupil plane (averaged over FOV):")
+print("  Global position (mm):")
+print(f"    [{global_center[0] / mm:.3f}, "
+      f"{global_center[1] / mm:.3f}, "
+      f"{global_center[2] / mm:.3f}]")
+
+# Translate the global centroid back into the chassis-relative
+# ``PUPIL_OFFSET_X / Y`` constants so the user can paste them straight
+# into ``helios/combiner_params.py``. The third coord (z = eye relief +
+# chassis depth) is fixed by the design and isn't probed here.
+new_pupil_offset_x = float(global_center[0] - CHASSIS_CENTER[0])
+new_pupil_offset_y = float(global_center[1] - CHASSIS_CENTER[1])
+print("\nRecommended pupil offsets — paste into helios/combiner_params.py:")
+print(f"    PUPIL_OFFSET_X = {new_pupil_offset_x / mm:+.3f} * mm    "
+      f"(current: {PUPIL_OFFSET_X / mm:+.3f} * mm, "
+      f"Δ = {(new_pupil_offset_x - PUPIL_OFFSET_X) / mm:+.3f} mm)")
+print(f"    PUPIL_OFFSET_Y = {new_pupil_offset_y / mm:+.3f} * mm    "
+      f"(current: {PUPIL_OFFSET_Y / mm:+.3f} * mm, "
+      f"Δ = {(new_pupil_offset_y - PUPIL_OFFSET_Y) / mm:+.3f} mm)")
+
+# Eyebox dimensions for the visualization overlay — match
+# ``optimize_pupil_rgb.py``'s 8 × 10 mm eyebox.
+EYEBOX_HALF_X_MM = 4.0
+EYEBOX_HALF_Y_MM = 5.0
+
 # ── Visualisation traces (green peak only, single wavelength path) ────────
 
 viz_traces = []
@@ -280,6 +395,22 @@ print("\n── Rendering 3D view (green channel) ──")
 fig = plot_system(system, trace_results=viz_traces,
                   scan_angles=np.asarray(scan_angles),
                   projector=projectors["G"], show=False)
+
+# Eyebox bounding box (cyan rectangle) at the recommended center, plus a
+# yellow diamond marker on the centroid itself. Both live in the pupil
+# plane in world coordinates.
+_pupil_for_overlay = next(
+    e for e in system.elements if isinstance(e, RectangularPupil))
+for overlay in eyebox_overlay_traces(
+        global_center,
+        EYEBOX_HALF_X_MM * mm,
+        EYEBOX_HALF_Y_MM * mm,
+        _pupil_for_overlay.normal,
+        box_label="eyebox (centered on light)",
+        marker_label="light centroid",
+):
+    fig.add_trace(overlay)
+
 fig.show()
 fig.write_html("examples/reports/jax_tracer_demo.html")
 print("Saved: jax_tracer_demo.html")

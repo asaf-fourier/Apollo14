@@ -81,6 +81,15 @@ MIRROR_ANGLE = 48.0 * deg
 EYE_RELIEF = 15.0 * mm
 FIRST_MIRROR_OFFSET_Y = 5.0 * mm
 
+# Pupil center, expressed as offsets from the chassis center.
+# ``PUPIL_OFFSET_Y`` was originally hand-tuned at -2 mm to roughly center
+# the pupil under where light lands after the chassis-skew shift; the
+# precise value is best refined by running ``examples/jax_tracer_demo.py``,
+# which probes the FOV-averaged light centroid at the pupil plane and
+# prints the recommended PUPIL_OFFSET_X / Y to paste here.
+PUPIL_OFFSET_X = 0.0 * mm
+PUPIL_OFFSET_Y = -3.0 * mm
+
 _NORMAL_ANGLE = math.pi / 2 - MIRROR_ANGLE
 _MIRROR_NORMAL = jnp.array([
     0.0,
@@ -283,17 +292,21 @@ def build_parametrized_system(
             curve=mirror_curve,
         ))
 
-    # Pupil — fixed
+    # Pupil — sized 14×18 mm (vs eyebox 8×10 mm) so there's slack for the
+    # ``PUPIL_OFFSET_X / Y`` recentering without clipping rays at the
+    # aperture. Center is at ``CHASSIS_CENTER`` shifted by the offsets;
+    # update the offsets in this module after running
+    # ``examples/jax_tracer_demo.py``'s centroid probe.
     system.add(RectangularPupil(
         name="pupil",
         position=jnp.array([
-            CHASSIS_CENTER[0],
-            CHASSIS_CENTER[1] - 2 * mm,
+            CHASSIS_CENTER[0] + PUPIL_OFFSET_X,
+            CHASSIS_CENTER[1] + PUPIL_OFFSET_Y,
             EYE_RELIEF + CHASSIS_Z,
         ]),
         normal=jnp.array([0.0, 0.0, -1.0]),
-        width=10.0 * mm,
-        height=14.0 * mm,
+        width=14.0 * mm,
+        height=18.0 * mm,
     ))
 
     return system

@@ -242,6 +242,56 @@ def plot_pupil_fill(trace_results_per_angle, scan_angles, pupil_element,
     return fig
 
 
+def eyebox_overlay_traces(global_center, half_x, half_y, normal,
+                          *,
+                          box_color: str = "cyan",
+                          marker_color: str = "yellow",
+                          box_label: str = "eyebox",
+                          marker_label: str = "eyebox center"):
+    """Two ``go.Scatter3d`` traces overlaying an eyebox onto a 3D system view.
+
+    Returns a list ``[box_trace, marker_trace]`` ready to ``fig.add_trace``
+    onto the figure produced by :func:`plot_system`. The bounding box is
+    rendered as a wireframe rectangle of size ``2·half_x × 2·half_y``,
+    centered at ``global_center`` and lying in the plane defined by
+    ``normal``. The marker is a single diamond at ``global_center``.
+
+    Args:
+        global_center: ``(3,)`` world-frame center of the eyebox.
+        half_x, half_y: half-extents along the plane's local axes.
+        normal: ``(3,)`` plane normal — the local axes are derived via
+            :func:`compute_local_axes`.
+        box_color, marker_color: plotly colors.
+        box_label, marker_label: legend names.
+    """
+    local_x, local_y = compute_local_axes(np.asarray(normal))
+    local_x = np.asarray(local_x)
+    local_y = np.asarray(local_y)
+    center = np.asarray(global_center)
+    corners = [
+        center - half_x * local_x - half_y * local_y,
+        center + half_x * local_x - half_y * local_y,
+        center + half_x * local_x + half_y * local_y,
+        center - half_x * local_x + half_y * local_y,
+        center - half_x * local_x - half_y * local_y,
+    ]
+    box = go.Scatter3d(
+        x=[float(c[0]) for c in corners],
+        y=[float(c[1]) for c in corners],
+        z=[float(c[2]) for c in corners],
+        mode="lines",
+        line=dict(color=box_color, width=6),
+        name=box_label,
+    )
+    marker = go.Scatter3d(
+        x=[float(center[0])], y=[float(center[1])], z=[float(center[2])],
+        mode="markers",
+        marker=dict(color=marker_color, size=8, symbol="diamond"),
+        name=marker_label,
+    )
+    return [box, marker]
+
+
 # ── element renderers ────────────────────────────────────────────────────────
 
 def _add_glass_block(traces, block: GlassBlock):
