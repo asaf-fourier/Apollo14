@@ -73,7 +73,7 @@ enable_jax_compilation_cache()
 # ── Eyebox target region (pre-defined, fixed) ───────────────────────────────
 
 EYEBOX_HALF_X = 4.0 * mm         # 8 mm full width on x
-EYEBOX_HALF_Y = 5.0 * mm         # 10 mm full width on y
+EYEBOX_HALF_Y = 4.0 * mm         # 10 mm full width on y
 EYEBOX_NX, EYEBOX_NY = 8, 10   # 80 cells, exactly 1×1 mm each (cell-centered)
 
 X_FOV = 8.0 * deg
