@@ -88,7 +88,7 @@ FIRST_MIRROR_OFFSET_Y = 5.0 * mm
 # which probes the FOV-averaged light centroid at the pupil plane and
 # prints the recommended PUPIL_OFFSET_X / Y to paste here.
 PUPIL_OFFSET_X = 0.0 * mm
-PUPIL_OFFSET_Y = -2.7 * mm
+PUPIL_OFFSET_Y = -3 * mm
 
 _NORMAL_ANGLE = math.pi / 2 - MIRROR_ANGLE
 _MIRROR_NORMAL = jnp.array([
