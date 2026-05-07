@@ -74,15 +74,15 @@ enable_jax_compilation_cache()
 
 EYEBOX_HALF_X = 4.0 * mm         # 8 mm full width on x
 EYEBOX_HALF_Y = 5.0 * mm         # 10 mm full width on y
-EYEBOX_NX, EYEBOX_NY = 6, 15     # 80 cells, exactly 1×1 mm each (cell-centered)
+EYEBOX_NX, EYEBOX_NY = 8, 10     # 80 cells, exactly 1×1 mm each (cell-centered)
 
 X_FOV = 8.0 * deg
 Y_FOV = 8.0 * deg
 
 # ── Single broadband projector (panel's calibrated white) ─────────────────
 
-PROJECTOR_NX, PROJECTOR_NY = 50, 10
-# PROJECTOR_NX, PROJECTOR_NY = 25, 5
+# PROJECTOR_NX, PROJECTOR_NY = 50, 10
+PROJECTOR_NX, PROJECTOR_NY = 25, 5
 ANGULAR_STEPS_X, ANGULAR_STEPS_Y = 8, 8
 
 PROJECTOR = PlayNitrideLed.create_broadband(
@@ -124,7 +124,7 @@ LUMINANCE_TRACE_WEIGHTS = photopic_luminance_weights(TRACE_WAVELENGTHS)
 # ── Per-cell brightness target ─────────────────────────────────────────────
 
 NUM_EYEBOX_CELLS = EYEBOX_NX * EYEBOX_NY
-EYEBOX_TARGET = 0.06
+EYEBOX_TARGET = 0.07
 PER_CELL_TARGET = EYEBOX_TARGET / NUM_EYEBOX_CELLS
 
 
@@ -143,7 +143,7 @@ merit_cfg_phase1 = PupilMeritConfig(
     luminance_weights=LUMINANCE_TRACE_WEIGHTS,
     weight_target=1.0,
     weight_shape=0.0,
-    asymmetric_target=True,
+    asymmetric_target=False,
 )
 
 # Phase 2: hold every cell at the brightness target while polishing
@@ -162,7 +162,7 @@ merit_cfg_phase2 = PupilMeritConfig(
     d65_weights=SHAPE_TARGET,
     luminance_weights=LUMINANCE_TRACE_WEIGHTS,
     weight_target=1.0,
-    weight_shape=1000.0,
+    weight_shape=10000.0,
     asymmetric_target=False,
 )
 
@@ -223,7 +223,17 @@ EYEBOX_POINTS = planar_grid_points(
     SAMPLE_HALF_X, SAMPLE_HALF_Y, SAMPLE_NX, SAMPLE_NY,
     cell_centered=True,
 )   # (SAMPLE_NX * SAMPLE_NY, 3)
-CELL_MASK = jnp.ones(EYEBOX_NX * EYEBOX_NY)
+# Exclude the 4 corner cells from the merit — geometric coverage at the
+# extreme corners drops below what the optimizer can equalize, so weighting
+# them in pulls the whole design down toward a worse compromise.
+_cell_mask_2d = jnp.ones((EYEBOX_NY, EYEBOX_NX))
+_cell_mask_2d = _cell_mask_2d.at[0, 0].set(0.0)
+_cell_mask_2d = _cell_mask_2d.at[0, -1].set(0.0)
+_cell_mask_2d = _cell_mask_2d.at[-1, 0].set(0.0)
+_cell_mask_2d = _cell_mask_2d.at[-1, -1].set(0.0)
+CELL_MASK = _cell_mask_2d.reshape(-1)
+
+#CELL_MASK = jnp.ones(EYEBOX_NX * EYEBOX_NY)
 
 # σ ≈ ½ the smaller fine-cell pitch — for soft binning, when used. With
 # the moving-window aggregation in place soft binning is redundant for
@@ -330,7 +340,7 @@ def _mask_frozen(grad: CombinerParams) -> CombinerParams:
 # ── Adam optimizer ──────────────────────────────────────────────────────────
 
 PHASE1_STEPS = 200
-PHASE2_STEPS = 200
+PHASE2_STEPS = 300
 
 adam_cfg_phase1 = AdamConfig(peak_lr=3e-3, warmup_steps=20, num_steps=PHASE1_STEPS)
 # Phase 2 enters with the target term already mostly satisfied, so the
@@ -361,7 +371,7 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Run directory: {run_dir}")
 
-    initial_params = CombinerParams.initial(amplitude=0.10, width_nm=15)
+    initial_params = CombinerParams.initial(amplitude=0.10, width_nm=15, spacing_mm=1.3)
     params = initial_params
     state = adam_init(params)
 
