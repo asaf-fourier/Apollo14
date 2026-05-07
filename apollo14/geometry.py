@@ -92,15 +92,22 @@ def ray_intersect_planar_seg(ray, seg):
 
 
 def compute_local_axes(normal):
-    """Compute two orthogonal axes on the plane defined by normal."""
+    """Compute two orthogonal axes on the plane defined by normal.
+
+    ``local_y`` is chosen as close to +world_Y as possible, then
+    ``local_x = local_y × normal``. This makes plot-up = world-up for
+    surfaces whose normal is along ±Z (notably the eye pupil), so
+    heatmap orientations match the wearer's frame. When ``normal`` is
+    too close to the world Y axis, we fall back to projecting +world_Z
+    instead.
+    """
     unit_normal = normalize(normal)
-    # Try global X, fall back to global Y if aligned with the plane normal.
-    candidate = jnp.where(jnp.abs(unit_normal[0]) < 0.9,
-                          jnp.array([1.0, 0.0, 0.0]),
-                          jnp.array([0.0, 1.0, 0.0]))
-    local_x = candidate - jnp.dot(candidate, unit_normal) * unit_normal
-    local_x = normalize(local_x)
-    local_y = jnp.cross(unit_normal, local_x)
+    candidate = jnp.where(jnp.abs(unit_normal[1]) < 0.9,
+                          jnp.array([0.0, 1.0, 0.0]),
+                          jnp.array([0.0, 0.0, 1.0]))
+    local_y = candidate - jnp.dot(candidate, unit_normal) * unit_normal
+    local_y = normalize(local_y)
+    local_x = jnp.cross(local_y, unit_normal)
     return local_x, local_y
 
 

@@ -157,3 +157,94 @@ def _build_title(label, *, mean_lum, lum_unit, mean_rad, cv, worst_lum) -> str:
     if worst_lum is not None:
         parts.append(f"worst-FOV: {worst_lum:.1f} {lum_unit}")
     return "  •  ".join(parts)
+
+
+def per_cell_intensity_fov_figure(
+    response: np.ndarray,
+    scan_angles: np.ndarray,
+    pupil_x_mm: np.ndarray,
+    pupil_y_mm: np.ndarray,
+    wavelengths_nm: np.ndarray | None = None,
+) -> go.Figure:
+    """Per-cell intensity over (deg_x, deg_y); slider steps through pupil cells.
+
+    Inverts ``fov_global_figures``' worst-cell view: instead of the
+    minimum across the whole pupil at each FOV angle, this shows the
+    full FOV intensity map *for one pupil cell at a time*. Use the
+    slider to scan across pupil cells and see which gaze directions
+    each eye position underdelivers.
+
+    Photopic (nits) when ``wavelengths_nm`` is provided; falls back to
+    summed radiance otherwise. The color scale is shared across cells
+    so brightness is directly comparable while sliding.
+    """
+    n_fov_y, n_fov_x = scan_angles.shape[:2]
+    ax_deg = np.degrees(scan_angles[0, :, 0])
+    ay_deg = np.degrees(scan_angles[:, 0, 1])
+    ny, nx = len(pupil_y_mm), len(pupil_x_mm)
+
+    weights = luminance_weights_for_response(wavelengths_nm)
+    if weights is not None:
+        per_angle = luminance_per_cell_per_angle(
+            response, pupil_x_mm, pupil_y_mm, weights)
+        unit = "cd/m² (nits)"
+        metric_label = "luminance"
+    else:
+        per_angle = radiance_per_cell_per_angle(
+            response, pupil_x_mm, pupil_y_mm)
+        unit = "summed radiance"
+        metric_label = "radiance"
+
+    fov_intensity = per_angle.reshape(ny, nx, n_fov_y, n_fov_x)
+    intensity_max = float(fov_intensity.max()) or 1.0
+
+    fig = go.Figure()
+    n_cells = ny * nx
+    steps = []
+    cell_idx = 0
+    for iy in range(ny):
+        for ix in range(nx):
+            panel = fov_intensity[iy, ix]
+            fig.add_trace(go.Heatmap(
+                z=panel,
+                x=ax_deg, y=ay_deg,
+                colorscale="Viridis",
+                zmin=0.0, zmax=intensity_max,
+                visible=(cell_idx == 0),
+                colorbar=dict(title=unit),
+            ))
+            visibility = [False] * n_cells
+            visibility[cell_idx] = True
+
+            cell_min = float(panel.min())
+            cell_mean = float(panel.mean())
+            cell_max = float(panel.max())
+            cv = cell_mean and float(panel.std() / cell_mean) or 0.0
+            label = f"cell ({pupil_x_mm[ix]:+.1f}, {pupil_y_mm[iy]:+.1f}) mm"
+            title = (
+                f"<b>{label}</b>  •  "
+                f"min: {cell_min:.3g} {unit}  •  "
+                f"mean: {cell_mean:.3g} {unit}  •  "
+                f"max: {cell_max:.3g} {unit}  •  "
+                f"FOV CV: {cv * 100:.1f}%"
+            )
+            steps.append(dict(
+                method="update",
+                label=f"({pupil_x_mm[ix]:+.1f}, {pupil_y_mm[iy]:+.1f})",
+                args=[{"visible": visibility}, {"title": title}],
+            ))
+            cell_idx += 1
+
+    initial_title = (steps[0]["args"][1]["title"] if steps
+                     else f"Per-cell FOV — {metric_label}")
+    fig.update_layout(
+        title=initial_title,
+        xaxis_title="FOV x (deg)",
+        yaxis_title="FOV y (deg)",
+        yaxis_scaleanchor="x",
+        width=560, height=560,
+        margin=dict(l=50, r=20, t=80, b=90),
+        sliders=[dict(active=0, pad={"t": 40}, steps=steps,
+                      currentvalue=dict(prefix="cell: "))],
+    )
+    return fig

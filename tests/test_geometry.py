@@ -71,6 +71,18 @@ def test_compute_local_axes_orthogonal():
     assert jnp.allclose(jnp.dot(lx, ly), 0.0, atol=1e-6)
 
 
+def test_compute_local_axes_y_aligns_with_world_up():
+    """For a Z-facing surface (e.g. the eye pupil), local_y must point
+    toward +world_Y so heatmap "up" matches world "up"."""
+    _, ly = compute_local_axes(jnp.array([0.0, 0.0, -1.0]))
+    assert ly[1] > 0.99
+    _, ly = compute_local_axes(jnp.array([0.0, 0.0, 1.0]))
+    assert ly[1] > 0.99
+    # Tilted mirror — local_y should still have a positive Y component.
+    _, ly = compute_local_axes(jnp.array([0.0, 0.669, 0.743]))
+    assert ly[1] > 0.0
+
+
 def test_point_in_rect():
     assert point_in_rect(0.0, 0.0, 1.0, 1.0)
     assert not point_in_rect(1.5, 0.0, 1.0, 1.0)

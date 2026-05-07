@@ -153,8 +153,8 @@ viz_branch_routes = {
 
 x_fov = 8.0 * deg
 y_fov = 8.0 * deg
-num_x = 16
-num_y = 16
+num_x = 8
+num_y = 8
 
 scan_dirs, scan_angles = scan_directions(
     DEFAULT_LIGHT_DIRECTION, x_fov, y_fov, num_x, num_y,
@@ -442,7 +442,6 @@ from helios.eyebox import (
 )
 from helios.merit import build_combiner_pupil_routes
 from helios.io import save_run, ScanConfig
-from helios.reports.run_report import render_report
 
 pupil = next(e for e in system.elements if isinstance(e, RectangularPupil))
 eb_nx, eb_ny = 5, 5
@@ -476,7 +475,5 @@ run_dir = save_run(
     scan_angles=eb_fov_grid.angles_grid,
     wavelengths_nm=wl_rgb / nm,
 )
-report_path = render_report(run_dir)
-print(f"Saved: {report_path}")
 
 print("\nDone.")

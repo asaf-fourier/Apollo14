@@ -34,7 +34,10 @@ from helios.reports.figures.overview import (
     pupil_brightness_figure,
     pupil_d65_distance_figure,
 )
-from helios.reports.figures.per_cell import per_cell_d65_fov_figure
+from helios.reports.figures.per_cell import (
+    per_cell_d65_fov_figure,
+    per_cell_intensity_fov_figure,
+)
 from helios.reports.figures.projector import (
     mirror_input_spectrum_figure,
     projector_spectrum_figure,
@@ -224,6 +227,23 @@ class TestPerCell:
         fig = per_cell_d65_fov_figure(response, sa, x, y, wls)
         # 4 cells × (heatmap + contour) = 8 traces
         assert len(fig.data) == 8
+
+    def test_intensity_fov_figure_has_slider_with_n_steps(self):
+        wls = np.array([446.0, 545.0, 627.0])
+        response = _synthetic_response(ny=3, nx=3, n_fov_y=2, n_fov_x=2)
+        x, y = _pupil_axes(3, 3)
+        sa = _scan_angles(2, 2)
+        fig = per_cell_intensity_fov_figure(response, sa, x, y, wls)
+        slider = fig.layout.sliders[0]
+        assert len(slider.steps) == 9    # 3×3 cells
+        assert len(fig.data) == 9        # one heatmap per cell
+
+    def test_intensity_fov_figure_falls_back_without_wavelengths(self):
+        response = _synthetic_response(ny=2, nx=2, n_fov_y=2, n_fov_x=2)
+        x, y = _pupil_axes(2, 2)
+        sa = _scan_angles(2, 2)
+        fig = per_cell_intensity_fov_figure(response, sa, x, y, None)
+        assert len(fig.data) == 4
 
     def test_visible_color_image_per_cell(self):
         wls = np.array([446.0, 545.0, 627.0])

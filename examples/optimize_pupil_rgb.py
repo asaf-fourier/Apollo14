@@ -73,8 +73,8 @@ enable_jax_compilation_cache()
 # ── Eyebox target region (pre-defined, fixed) ───────────────────────────────
 
 EYEBOX_HALF_X = 4.0 * mm         # 8 mm full width on x
-EYEBOX_HALF_Y = 4.0 * mm         # 10 mm full width on y
-EYEBOX_NX, EYEBOX_NY = 8, 10   # 80 cells, exactly 1×1 mm each (cell-centered)
+EYEBOX_HALF_Y = 5.0 * mm         # 10 mm full width on y
+EYEBOX_NX, EYEBOX_NY = 6, 15     # 80 cells, exactly 1×1 mm each (cell-centered)
 
 X_FOV = 8.0 * deg
 Y_FOV = 8.0 * deg
@@ -124,7 +124,7 @@ LUMINANCE_TRACE_WEIGHTS = photopic_luminance_weights(TRACE_WAVELENGTHS)
 # ── Per-cell brightness target ─────────────────────────────────────────────
 
 NUM_EYEBOX_CELLS = EYEBOX_NX * EYEBOX_NY
-EYEBOX_TARGET = 0.08
+EYEBOX_TARGET = 0.06
 PER_CELL_TARGET = EYEBOX_TARGET / NUM_EYEBOX_CELLS
 
 
@@ -143,7 +143,7 @@ merit_cfg_phase1 = PupilMeritConfig(
     luminance_weights=LUMINANCE_TRACE_WEIGHTS,
     weight_target=1.0,
     weight_shape=0.0,
-    asymmetric_target=False,
+    asymmetric_target=True,
 )
 
 # Phase 2: hold every cell at the brightness target while polishing
@@ -171,7 +171,7 @@ bounds = ParamBounds(amplitude_max=0.20, fwhm_max_nm=120, fwhm_min_nm=10)
 # When False, mirror inter-spacing is held at its initial value and only
 # the Gaussian reflectance curves are tuned. Hard nearest-neighbor binning
 # is then sufficient — see optimize_pupil.py for the reasoning.
-OPTIMIZE_SPACINGS = False
+OPTIMIZE_SPACINGS = True
 
 
 # ── Reference input flux (photometric, matches luminance_weights) ──────────

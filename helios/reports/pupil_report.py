@@ -25,7 +25,10 @@ from helios.reports.figures.overview import (
     pupil_brightness_figure,
     pupil_d65_distance_figure,
 )
-from helios.reports.figures.per_cell import per_cell_d65_fov_figure
+from helios.reports.figures.per_cell import (
+    per_cell_d65_fov_figure,
+    per_cell_intensity_fov_figure,
+)
 from helios.reports.figures.projector import (
     mirror_input_spectrum_figure,
     projector_spectrum_figure,
@@ -284,6 +287,14 @@ def _drill_down_page(response, scan_angles, pupil_x_mm, pupil_y_mm,
         "FOV-averaged overview hides — a cell that's white on average but "
         "pink at one corner shows up here."
     )
+    intensity_fov_caption = (
+        "For one pupil cell at a time (use the slider), the heatmap shows "
+        "intensity across all FOV angles. Inverts the FOV worst-cell view: "
+        "instead of the dimmest cell at each angle, this shows the full "
+        "FOV intensity map for the selected eye position. Color scale is "
+        "shared across cells so brightness is directly comparable while "
+        "sliding — bright cells light up, dim cells stay dark."
+    )
     visible_color_caption = (
         "What a viewer with their eye at this pupil cell would actually "
         "see across the FOV, rendered in sRGB from the cell's spectral "
@@ -294,6 +305,11 @@ def _drill_down_page(response, scan_angles, pupil_x_mm, pupil_y_mm,
     blocks = [
         ("Per-cell color drift across FOV", d65_fov_caption,
          per_cell_d65_fov_figure(
+             response, scan_angles, pupil_x_mm, pupil_y_mm,
+             wavelengths_nm=wavelengths_nm,
+         )),
+        ("Per-cell intensity across FOV", intensity_fov_caption,
+         per_cell_intensity_fov_figure(
              response, scan_angles, pupil_x_mm, pupil_y_mm,
              wavelengths_nm=wavelengths_nm,
          )),
