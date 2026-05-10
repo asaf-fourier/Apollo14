@@ -373,9 +373,15 @@ class TestHeadlineNumbers:
 
     def _full_manifest(self, mirror_reflectances, nx=4, ny=4):
         wls_internal = [4.46e-4, 5.45e-4, 6.27e-4]   # apollo14 internal units
+        # Production manifests always carry position + normal per mirror
+        # (helios/io.py:save_run); the headline reads them via
+        # _mirror_spacings_mm. Stub them with a fixed normal and y-shifted
+        # positions 1.47 mm apart along the chassis y-axis.
         elements = [
             {"type": "GaussianMirror", "name": f"mirror_{i}",
-             "wavelengths": wls_internal, "reflectance": list(refl)}
+             "wavelengths": wls_internal, "reflectance": list(refl),
+             "position": [0.0, i * 1.47e-3, 0.0],
+             "normal": [0.0, 0.669, 0.743]}
             for i, refl in enumerate(mirror_reflectances)
         ]
         return {

@@ -81,7 +81,6 @@ Y_FOV = 8.0 * deg
 
 # ── Single broadband projector (panel's calibrated white) ─────────────────
 
-# PROJECTOR_NX, PROJECTOR_NY = 50, 10
 PROJECTOR_NX, PROJECTOR_NY = 25, 5
 ANGULAR_STEPS_X, ANGULAR_STEPS_Y = 8, 8
 
@@ -168,9 +167,11 @@ merit_cfg_phase2 = PupilMeritConfig(
 
 bounds = ParamBounds(amplitude_max=0.20, fwhm_max_nm=120, fwhm_min_nm=10)
 
-# When False, mirror inter-spacing is held at its initial value and only
-# the Gaussian reflectance curves are tuned. Hard nearest-neighbor binning
-# is then sufficient — see optimize_pupil.py for the reasoning.
+# True: mirror inter-spacing is a design variable. The tracer switches to
+# soft Gaussian binning so position gradients flow through the chain
+# ``params.spacings → mirror.position → ray hit position → cell``. False:
+# spacings are frozen at their initial value, only Gaussian reflectance
+# curves are tuned, and hard nearest-neighbor binning is sufficient.
 OPTIMIZE_SPACINGS = True
 
 
@@ -232,8 +233,6 @@ _cell_mask_2d = _cell_mask_2d.at[0, -1].set(0.0)
 _cell_mask_2d = _cell_mask_2d.at[-1, 0].set(0.0)
 _cell_mask_2d = _cell_mask_2d.at[-1, -1].set(0.0)
 CELL_MASK = _cell_mask_2d.reshape(-1)
-
-#CELL_MASK = jnp.ones(EYEBOX_NX * EYEBOX_NY)
 
 # σ ≈ ½ the smaller fine-cell pitch — for soft binning, when used. With
 # the moving-window aggregation in place soft binning is redundant for

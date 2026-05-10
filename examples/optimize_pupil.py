@@ -46,10 +46,9 @@ from helios.pupil_merit import (
 from helios.adam import AdamConfig, adam_init, adam_step
 from helios.io import save_optimization_report, save_run, ScanConfig
 from helios.reports.pupil_report import render_pupil_report
+from helios.jax_cache import enable_jax_compilation_cache
 
-jax.config.update("jax_compilation_cache_dir", "/home/ubuntu/.cache/jax")
-jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
-jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+enable_jax_compilation_cache()
 
 # ── Eyebox target region (pre-defined, fixed) ───────────────────────────────
 

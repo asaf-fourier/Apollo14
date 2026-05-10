@@ -81,6 +81,36 @@ class TestTargetTerm:
         assert float(large) > 5.0 * float(small)
 
 
+# ── Asymmetric target ──────────────────────────────────────────────────────
+
+
+class TestAsymmetricTarget:
+
+    def test_under_target_penalized_same_as_symmetric(self):
+        cfg_sym = _cfg(weight_target=1.0, target_relative=0.05,
+                       asymmetric_target=False)
+        cfg_asym = _cfg(weight_target=1.0, target_relative=0.05,
+                        asymmetric_target=True)
+        response = _ideal_response(brightness=0.02)   # below target
+        sym = float(pupil_merit(response, 1.0, cfg_sym))
+        asym = float(pupil_merit(response, 1.0, cfg_asym))
+        assert abs(sym - asym) < 1e-8
+
+    def test_over_target_zeroed_when_asymmetric(self):
+        cfg_asym = _cfg(weight_target=1.0, target_relative=0.05,
+                        asymmetric_target=True)
+        response = _ideal_response(brightness=0.20)   # well above target
+        loss = float(pupil_merit(response, 1.0, cfg_asym))
+        assert loss < 1e-8
+
+    def test_over_target_penalized_when_symmetric(self):
+        cfg_sym = _cfg(weight_target=1.0, target_relative=0.05,
+                       asymmetric_target=False)
+        response = _ideal_response(brightness=0.20)   # well above target
+        loss = float(pupil_merit(response, 1.0, cfg_sym))
+        assert loss > 1e-3
+
+
 # ── Combined merit ──────────────────────────────────────────────────────────
 
 

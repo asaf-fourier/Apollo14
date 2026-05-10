@@ -1,10 +1,17 @@
-"""Per-cell drill-down chart — ΔD65 over FOV with brightness contours.
+"""Per-cell drill-down charts — pick one pupil cell, see its FOV behavior.
 
-The user-requested view: pick a pupil cell, see its ΔD65 across the FOV
-as a heatmap, with brightness contours overlaid so color drift and
-brightness mountains are visible together. The title lists per-cell
-metrics: nits (luminance), summed radiance, FOV brightness CV
-(uniformity), and worst-FOV nits.
+Two figures, both sliding through pupil cells:
+
+- :func:`per_cell_d65_fov_figure` — ΔD65 across the FOV as a heatmap with
+  brightness contours overlaid, so color drift and brightness mountains
+  are visible together. Title lists per-cell luminance (nits), summed
+  radiance, FOV brightness CV (uniformity), and worst-FOV nits.
+
+- :func:`per_cell_intensity_fov_figure` — intensity (luminance or
+  radiance fallback) across the FOV. Inverts the FOV worst-cell view:
+  instead of the dimmest cell at each angle, this shows the full FOV
+  intensity map for the selected eye position. Color scale is shared
+  across cells so brightness is directly comparable while sliding.
 """
 
 from __future__ import annotations
