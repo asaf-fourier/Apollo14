@@ -43,6 +43,7 @@ import jax.numpy as jnp
 from apollo14.units import mm, nm, deg
 from apollo14.combiner import (
     DEFAULT_LIGHT_POSITION, DEFAULT_LIGHT_DIRECTION,
+     compensated_reflectances,
 )
 from apollo14.elements.pupil import RectangularPupil
 from apollo14.geometry import planar_grid_points
@@ -161,11 +162,11 @@ merit_cfg_phase2 = PupilMeritConfig(
     d65_weights=SHAPE_TARGET,
     luminance_weights=LUMINANCE_TRACE_WEIGHTS,
     weight_target=1.0,
-    weight_shape=10000.0,
+    weight_shape=100000.0,
     asymmetric_target=False,
 )
 
-bounds = ParamBounds(amplitude_max=0.20, fwhm_max_nm=120, fwhm_min_nm=10)
+bounds = ParamBounds(amplitude_max=0.20, fwhm_max_nm=200, fwhm_min_nm=10)
 
 # True: mirror inter-spacing is a design variable. The tracer switches to
 # soft Gaussian binning so position gradients flow through the chain
@@ -370,7 +371,37 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Run directory: {run_dir}")
 
-    initial_params = CombinerParams.initial(amplitude=0.10, width_nm=15, spacing_mm=1.3)
+    # 5-band reflectance basis. R/G/B (446, 545, 627 nm) plus two
+    # intermediate centers at 490 and 590 nm so the per-mirror curve can
+    # be near-wavelength-flat with FWHM ~ 80 nm — without the middle
+    # bases, a single G-band Gaussian had to widen past the 200 nm cap
+    # to bridge the 180 nm gap between R and B. Centers are fixed
+    # (jax.lax.stop_gradient inside SumOfGaussiansCurve.sample); the
+    # optimizer tunes amplitudes and sigmas around them.
+    _CENTERS_5BAND = jnp.array([446.0, 490.0, 545.0, 590.0, 627.0]) * nm
+
+    # Warm-start with the Talos cascade compensation: each mirror's peak
+    # amplitude is scaled by ``ratio / (1 − i·ratio)`` so the absolute
+    # reflected fraction of the *original* beam is equal across mirrors.
+    # Without this, phase 1 wastes ~30 iterations re-discovering that
+    # downstream mirrors need higher local reflectance to compensate for
+    # upstream transmission losses.
+    _base_ratio = 0.05
+    _compensated_amps = compensated_reflectances(
+        _base_ratio, NUM_MIRRORS, num_samples=1).reshape(-1)  # (M,)
+    _seed = CombinerParams.initial(
+        amplitude=_base_ratio, width_nm=80,
+        spacing_mm=1.3, centers=_CENTERS_5BAND,
+    )
+    initial_params = _seed._replace(
+        curves=SumOfGaussiansCurve(
+            amplitude=jnp.broadcast_to(
+                _compensated_amps[:, None],
+                _seed.curves.amplitude.shape).astype(jnp.float32),
+            sigma=_seed.curves.sigma,
+            centers=_seed.curves.centers,
+        )
+    )
     params = initial_params
     state = adam_init(params)
 

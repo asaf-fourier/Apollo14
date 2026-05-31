@@ -19,7 +19,10 @@ import plotly.graph_objects as go
 import pytest
 
 from helios.merit import D65_WEIGHTS
+from helios.photometry import D65_WHITE_POINT_XY
 from helios.reports.composer import (
+    chromaticity_distance_per_cell_per_angle,
+    chromaticity_per_cell_per_angle,
     coefficient_of_variation_over_angles,
     d65_distance_per_cell_per_angle,
     luminance_per_cell_per_angle,
@@ -32,10 +35,10 @@ from helios.reports.figures.global_fov import fov_global_figures
 from helios.reports.figures.mirrors import mirror_reflectance_figure
 from helios.reports.figures.overview import (
     pupil_brightness_figure,
-    pupil_d65_distance_figure,
+    pupil_chromaticity_distance_figure,
 )
 from helios.reports.figures.per_cell import (
-    per_cell_d65_fov_figure,
+    per_cell_chromaticity_fov_figure,
     per_cell_intensity_fov_figure,
 )
 from helios.reports.figures.projector import (
@@ -138,6 +141,38 @@ class TestComposer:
         cv = coefficient_of_variation_over_angles(per_angle)
         assert float(cv[0, 0]) > 0.1
 
+    def test_chromaticity_xy_shape(self):
+        wls = np.array([446.0, 545.0, 627.0])
+        response = _synthetic_response(ny=2, nx=3, n_fov_y=2, n_fov_x=2)
+        x, y = _pupil_axes(2, 3)
+        xy = chromaticity_per_cell_per_angle(response, x, y, wls)
+        assert xy.shape == (2, 3, 4, 2)
+        # All cells share the same uniform spectrum here → same (x, y).
+        assert np.allclose(xy - xy[0, 0, 0], 0.0, atol=1e-6)
+
+    def test_chromaticity_distance_zero_at_target(self):
+        """When the response's chromaticity exactly equals target_xy,
+        the per-cell distance is zero."""
+        wls = np.array([446.0, 545.0, 627.0])
+        response = _synthetic_response(ny=2, nx=2)
+        x, y = _pupil_axes(2, 2)
+        # Pick the actual chromaticity of this synthetic response as the
+        # target, then distance must be 0 everywhere.
+        target = tuple(chromaticity_per_cell_per_angle(
+            response, x, y, wls)[0, 0, 0].tolist())
+        d = chromaticity_distance_per_cell_per_angle(
+            response, x, y, wls, target_xy=target)
+        assert float(d.max()) < 1e-6
+
+    def test_chromaticity_distance_positive_off_target(self):
+        wls = np.array([446.0, 545.0, 627.0])
+        response = _synthetic_response(ny=2, nx=2)
+        x, y = _pupil_axes(2, 2)
+        # Target far from the response's chromaticity → positive distance.
+        d = chromaticity_distance_per_cell_per_angle(
+            response, x, y, wls, target_xy=(0.0, 0.0))
+        assert float(d.min()) > 0.0
+
 
 # ── Overview figures ────────────────────────────────────────────────────────
 
@@ -161,12 +196,12 @@ class TestOverview:
         assert "radiance" in fig.layout.title.text.lower() or \
                "intensity" in fig.layout.title.text.lower()
 
-    def test_d65_figure_with_tolerance_adds_contour(self):
+    def test_chromaticity_figure_with_tolerance_adds_contour(self):
         response = _synthetic_response()
         x, y = _pupil_axes()
-        fig = pupil_d65_distance_figure(response, x, y,
-                                        np.array([446.0, 545.0, 627.0]),
-                                        tolerance=0.05)
+        fig = pupil_chromaticity_distance_figure(
+            response, x, y, np.array([446.0, 545.0, 627.0]),
+            tolerance=0.01)
         assert len(fig.data) == 2  # heatmap + contour
 
 
@@ -175,20 +210,20 @@ class TestOverview:
 
 class TestEyeboxCdf:
 
-    def test_two_curves_when_d65_tolerance_set(self):
+    def test_two_curves_when_chromaticity_tolerance_set(self):
         wls = np.array([446.0, 545.0, 627.0])
         response = _synthetic_response()
         x, y = _pupil_axes()
         fig = eyebox_quality_cdf_figure(response, x, y, wls,
-                                        d65_tolerance=0.05)
+                                        chromaticity_tolerance=0.05)
         assert len(fig.data) == 2
 
-    def test_one_curve_without_d65_tolerance(self):
+    def test_one_curve_without_chromaticity_tolerance(self):
         wls = np.array([446.0, 545.0, 627.0])
         response = _synthetic_response()
         x, y = _pupil_axes()
         fig = eyebox_quality_cdf_figure(response, x, y, wls,
-                                        d65_tolerance=None)
+                                        chromaticity_tolerance=None)
         assert len(fig.data) == 1
 
     def test_uniform_response_drops_at_threshold(self):
@@ -198,7 +233,7 @@ class TestEyeboxCdf:
         response = _synthetic_response(brightness=2.0)
         x, y = _pupil_axes()
         fig = eyebox_quality_cdf_figure(response, x, y, wls,
-                                        d65_tolerance=None)
+                                        chromaticity_tolerance=None)
         fractions = np.asarray(fig.data[0].y)
         # Below the cell brightness all cells qualify; above, none.
         assert fractions[0] == 1.0
@@ -210,21 +245,21 @@ class TestEyeboxCdf:
 
 class TestPerCell:
 
-    def test_d65_fov_figure_has_slider_with_n_steps(self):
+    def test_chromaticity_fov_figure_has_slider_with_n_steps(self):
         wls = np.array([446.0, 545.0, 627.0])
         response = _synthetic_response(ny=3, nx=3, n_fov_y=2, n_fov_x=2)
         x, y = _pupil_axes(3, 3)
         sa = _scan_angles(2, 2)
-        fig = per_cell_d65_fov_figure(response, sa, x, y, wls)
+        fig = per_cell_chromaticity_fov_figure(response, sa, x, y, wls)
         slider = fig.layout.sliders[0]
         assert len(slider.steps) == 9   # 3×3 cells
 
-    def test_d65_fov_figure_two_traces_per_cell(self):
+    def test_chromaticity_fov_figure_two_traces_per_cell(self):
         wls = np.array([446.0, 545.0, 627.0])
         response = _synthetic_response(ny=2, nx=2, n_fov_y=2, n_fov_x=2)
         x, y = _pupil_axes(2, 2)
         sa = _scan_angles(2, 2)
-        fig = per_cell_d65_fov_figure(response, sa, x, y, wls)
+        fig = per_cell_chromaticity_fov_figure(response, sa, x, y, wls)
         # 4 cells × (heatmap + contour) = 8 traces
         assert len(fig.data) == 8
 
@@ -530,7 +565,7 @@ class TestRenderPupilReport:
         out = render_pupil_report(
             tmp_path,
             eyebox_threshold_nits=10.0,
-            d65_tolerance=0.05,
+            chromaticity_tolerance=0.01,
         )
         assert out.exists()
         text = out.read_text()

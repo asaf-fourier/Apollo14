@@ -3,12 +3,18 @@
 Reads ``manifest.json`` + ``response.npz`` from a run directory and writes
 ``pupil_report.html`` containing three pages:
 
-  1. **Summary** — pupil overview (luminance + ΔD65 with eyebox contour),
-     eyebox-quality CDF, and headline numbers.
-  2. **Per-cell drill-down** — ΔD65 over FOV per pupil cell with
+  1. **Summary** — pupil overview (luminance + Δxy from D65 with eyebox
+     contour), eyebox-quality CDF, and headline numbers.
+  2. **Per-cell drill-down** — Δxy over FOV per pupil cell with
      brightness contours, plus the visible-color rendering.
   3. **Design diagnostics** — mirror reflectance curves and FOV-global
      views.
+
+Color quality is reported as **CIE 1931 Δxy from the D65 white point**
+— the perceptual distance the eye actually sees. The merit function uses
+a different (and merit-specific) "preserve W shape" target; the report
+metric reflects what a viewer perceives, which for a 3-band micro-LED
+projector can differ substantially from the spectral-shape target.
 """
 
 from __future__ import annotations
@@ -23,10 +29,10 @@ from helios.reports.figures.global_fov import fov_global_figures
 from helios.reports.figures.mirrors import mirror_reflectance_figure
 from helios.reports.figures.overview import (
     pupil_brightness_figure,
-    pupil_d65_distance_figure,
+    pupil_chromaticity_distance_figure,
 )
 from helios.reports.figures.per_cell import (
-    per_cell_d65_fov_figure,
+    per_cell_chromaticity_fov_figure,
     per_cell_intensity_fov_figure,
 )
 from helios.reports.figures.projector import (
@@ -44,7 +50,7 @@ def render_pupil_report(
     run_dir: Path | str,
     *,
     eyebox_threshold_nits: float | None = None,
-    d65_tolerance: float | None = 0.05,
+    chromaticity_tolerance: float | None = 0.01,
 ) -> Path:
     """Read ``run_dir`` and write ``run_dir/pupil_report.html``.
 
@@ -53,8 +59,10 @@ def render_pupil_report(
             containing ``manifest.json`` and ``response.npz``.
         eyebox_threshold_nits: optional luminance contour threshold for
             the pupil overview brightness map. ``None`` skips the contour.
-        d65_tolerance: ΔD65 contour threshold for the overview color map
-            and the second curve in the eyebox-quality CDF.
+        chromaticity_tolerance: Δxy contour threshold for the overview
+            color map and the second curve in the eyebox-quality CDF.
+            Default ``0.01`` ≈ "imperceptible to acceptable" boundary
+            in CIE 1931 xy space.
 
     Returns:
         Path to the written ``pupil_report.html``.
@@ -72,7 +80,7 @@ def render_pupil_report(
     pages = [
         ("Summary", _summary_page(
             response, pupil_x_mm, pupil_y_mm, wavelengths_nm,
-            eyebox_threshold_nits, d65_tolerance,
+            eyebox_threshold_nits, chromaticity_tolerance,
         )),
         ("Per-cell drill-down", _drill_down_page(
             response, scan_angles, pupil_x_mm, pupil_y_mm, wavelengths_nm,
@@ -232,7 +240,7 @@ def _design_variables_html(opt_report: dict) -> str:
 
 
 def _summary_page(response, pupil_x_mm, pupil_y_mm, wavelengths_nm,
-                  eyebox_threshold_nits, d65_tolerance):
+                  eyebox_threshold_nits, chromaticity_tolerance):
     luminance_caption = (
         "Average brightness each pupil cell delivers to the eye, weighted "
         "by the photopic V(λ) curve so values reflect what a viewer "
@@ -240,20 +248,21 @@ def _summary_page(response, pupil_x_mm, pupil_y_mm, wavelengths_nm,
         "bright? The dashed contour, when present, marks the eyebox "
         "acceptance threshold — cells inside it clear the brightness target."
     )
-    d65_caption = (
-        "Per-cell distance from the D65 white point in normalized-channel "
-        "space, averaged over the FOV. 0 means the cell looks neutral white; "
-        "values near √2 mean it's pathologically tinted toward one color. "
-        "The dashed contour marks the ΔD65 tolerance — cells inside it pass "
-        "the white-balance check."
+    chromaticity_caption = (
+        "Per-cell CIE 1931 Δxy distance from the D65 white point "
+        "(0.3127, 0.3290), averaged over the FOV. This is what the eye "
+        "actually perceives: each cell's spectrum is integrated through "
+        "the CIE 2° observer to get (x, y), then compared against D65. "
+        "Reference: Δxy < 0.005 imperceptible, < 0.02 acceptable, > 0.05 "
+        "obvious tint. The dashed contour marks the acceptance tolerance."
     )
     cdf_caption = (
         "How big is the usable eyebox at each brightness threshold? Each "
         "curve gives the fraction of pupil cells clearing a moving "
         "threshold T. The blue curve uses brightness alone; the red curve "
-        "additionally requires the cell to be white-balanced (ΔD65 below "
-        "tolerance). Read the y-coordinate at your acceptance threshold "
-        "to size the usable eyebox."
+        "additionally requires the cell's chromaticity to be within Δxy "
+        "tolerance of D65. Read the y-coordinate at your acceptance "
+        "threshold to size the usable eyebox."
     )
     return [
         ("Pupil luminance map", luminance_caption,
@@ -262,30 +271,30 @@ def _summary_page(response, pupil_x_mm, pupil_y_mm, wavelengths_nm,
              wavelengths_nm=wavelengths_nm,
              threshold_nits=eyebox_threshold_nits,
          )),
-        ("Pupil color drift (ΔD65)", d65_caption,
-         pupil_d65_distance_figure(
+        ("Pupil chromaticity drift (Δxy from D65)", chromaticity_caption,
+         pupil_chromaticity_distance_figure(
              response, pupil_x_mm, pupil_y_mm,
              wavelengths_nm=wavelengths_nm,
-             tolerance=d65_tolerance,
+             tolerance=chromaticity_tolerance,
          )),
         ("Eyebox quality CDF", cdf_caption,
          eyebox_quality_cdf_figure(
              response, pupil_x_mm, pupil_y_mm,
              wavelengths_nm=wavelengths_nm,
-             d65_tolerance=d65_tolerance,
+             chromaticity_tolerance=chromaticity_tolerance,
          )),
     ]
 
 
 def _drill_down_page(response, scan_angles, pupil_x_mm, pupil_y_mm,
                      wavelengths_nm):
-    d65_fov_caption = (
+    chromaticity_fov_caption = (
         "For one pupil cell at a time (use the slider), the heatmap shows "
-        "color drift across all FOV angles, and the cyan dashed contours "
-        "show where that same cell is brighter or dimmer than its FOV mean "
-        "(at 50%, 75%, 100%, 125%, 150%). Surfaces per-cell defects the "
-        "FOV-averaged overview hides — a cell that's white on average but "
-        "pink at one corner shows up here."
+        "CIE 1931 Δxy from D65 across all FOV angles, and the cyan dashed "
+        "contours show where that same cell is brighter or dimmer than "
+        "its FOV mean (at 50%, 75%, 100%, 125%, 150%). Surfaces per-cell "
+        "defects the FOV-averaged overview hides — a cell that's neutral "
+        "on average but pink at one corner shows up here."
     )
     intensity_fov_caption = (
         "For one pupil cell at a time (use the slider), the heatmap shows "
@@ -303,8 +312,8 @@ def _drill_down_page(response, scan_angles, pupil_x_mm, pupil_y_mm,
         "cells (same hue ⇒ same chromaticity) but not absolute brightness."
     )
     blocks = [
-        ("Per-cell color drift across FOV", d65_fov_caption,
-         per_cell_d65_fov_figure(
+        ("Per-cell chromaticity drift across FOV", chromaticity_fov_caption,
+         per_cell_chromaticity_fov_figure(
              response, scan_angles, pupil_x_mm, pupil_y_mm,
              wavelengths_nm=wavelengths_nm,
          )),

@@ -1,7 +1,7 @@
 """Pupil-overview figures — at-a-glance brightness and color quality.
 
 Two heatmaps over the pupil grid, each optionally overlaid with the
-"acceptance" contour (the eyebox boundary in nits or ΔD65 space).
+"acceptance" contour (the eyebox boundary in nits or Δxy space).
 """
 
 from __future__ import annotations
@@ -9,8 +9,9 @@ from __future__ import annotations
 import numpy as np
 import plotly.graph_objects as go
 
+from helios.photometry import D65_WHITE_POINT_XY
 from helios.reports.composer import (
-    d65_distance_per_cell_per_angle,
+    chromaticity_distance_per_cell_per_angle,
     luminance_per_cell_per_angle,
     luminance_weights_for_response,
     mean_over_angles,
@@ -56,27 +57,32 @@ def pupil_brightness_figure(
     )
 
 
-def pupil_d65_distance_figure(
+def pupil_chromaticity_distance_figure(
     response: np.ndarray,
     pupil_x_mm: np.ndarray,
     pupil_y_mm: np.ndarray,
-    wavelengths_nm: np.ndarray | None = None,
+    wavelengths_nm: np.ndarray,
     tolerance: float | None = None,
+    target_xy: tuple[float, float] = D65_WHITE_POINT_XY,
 ) -> go.Figure:
-    """Per-cell distance from the D65 simplex (FOV-averaged).
+    """Per-cell CIE 1931 Δxy from the D65 white point (FOV-averaged).
 
-    ``tolerance`` overlays a dashed contour marking the maximum
-    acceptable color drift — cells inside the contour are "white".
+    Integrates each cell's spectrum through the CIE 1931 2° observer to
+    get chromaticity ``(x, y)``, then plots the Euclidean distance to
+    ``target_xy`` (default: D65 = (0.3127, 0.3290)). ``tolerance``
+    overlays a dashed contour at that Δxy level — perceptual reference:
+    < 0.005 imperceptible, < 0.02 acceptable, > 0.05 obvious tint.
     """
-    per_angle = d65_distance_per_cell_per_angle(
-        response, pupil_x_mm, pupil_y_mm, wavelengths_nm)
+    per_angle = chromaticity_distance_per_cell_per_angle(
+        response, pupil_x_mm, pupil_y_mm, wavelengths_nm,
+        target_xy=target_xy)
     grid = mean_over_angles(per_angle)
 
     return pupil_heatmap_figure(
         pupil_x_mm, pupil_y_mm, grid,
-        title="Pupil — ΔD65 (FOV-averaged simplex distance)",
+        title="Pupil — Δxy from D65 (CIE 1931, FOV-averaged)",
         colorscale="Hot",
-        colorbar_title="ΔD65",
+        colorbar_title="Δxy",
         threshold=tolerance,
-        threshold_label="ΔD65 tolerance",
+        threshold_label="Δxy tolerance",
     )

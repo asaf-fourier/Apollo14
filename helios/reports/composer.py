@@ -10,7 +10,11 @@ import numpy as np
 
 from apollo14.units import nm
 from helios.merit import D65_WEIGHTS, d65_weights_at
-from helios.photometry import luminance_weights_np
+from helios.photometry import (
+    D65_WHITE_POINT_XY,
+    chromaticity_xy_np,
+    luminance_weights_np,
+)
 
 # ── Reshape ─────────────────────────────────────────────────────────────────
 
@@ -103,6 +107,14 @@ def d65_distance_per_cell_per_angle(
     (summing to 1) and compared against the D65 simplex via L2 distance.
     Result is dimensionless; 0 = perfect D65, ≈ √2 = pathologically
     one-channel response.
+
+    .. note:: This is a *spectral-shape* distance, not a perceptual
+       color distance. For a 3-band micro-LED whose SPD looks nothing
+       like a continuous D65 reference, this metric has a positive
+       floor regardless of mirror design. The report uses
+       :func:`chromaticity_distance_per_cell_per_angle` instead, which
+       integrates through the CIE 1931 observer to give a perceptual
+       Δxy in the chromaticity plane.
     """
     d65 = d65_ratios(wavelengths_nm)
     ny, nx = len(pupil_y_mm), len(pupil_x_mm)
@@ -110,6 +122,48 @@ def d65_distance_per_cell_per_angle(
     total = grid.sum(axis=-1, keepdims=True) + 1e-12
     ratios = grid / total                             # (ny, nx, A, K)
     return np.linalg.norm(ratios - d65[None, None, None, :], axis=-1)
+
+
+def chromaticity_per_cell_per_angle(
+    response: np.ndarray,
+    pupil_x_mm: np.ndarray,
+    pupil_y_mm: np.ndarray,
+    wavelengths_nm: np.ndarray,
+) -> np.ndarray:
+    """``(ny, nx, A, 2)`` CIE 1931 chromaticity ``(x, y)`` per (cell, angle).
+
+    Integrates each (cell, angle) spectrum through the CIE 1931 2°
+    observer to get tristimulus XYZ, then normalizes to chromaticity
+    coordinates ``x = X/(X+Y+Z), y = Y/(X+Y+Z)``. Wavelengths are
+    required — chromaticity needs continuous spectral integration, not
+    R/G/B channel sums.
+    """
+    ny, nx = len(pupil_y_mm), len(pupil_x_mm)
+    grid = reshape_pupil(response, ny, nx)            # (ny, nx, A, K)
+    return chromaticity_xy_np(grid, wavelengths_nm)   # (ny, nx, A, 2)
+
+
+def chromaticity_distance_per_cell_per_angle(
+    response: np.ndarray,
+    pupil_x_mm: np.ndarray,
+    pupil_y_mm: np.ndarray,
+    wavelengths_nm: np.ndarray,
+    target_xy: tuple[float, float] = D65_WHITE_POINT_XY,
+) -> np.ndarray:
+    """``(ny, nx, A)`` perceptual Δxy distance from a target white point.
+
+    For each (cell, angle), computes the CIE 1931 ``(x, y)`` chromaticity
+    of the response spectrum and returns the Euclidean distance to
+    ``target_xy`` (default: canonical D65 = ``(0.31271, 0.32902)``).
+
+    Perceptual reference thresholds in xy-space (CIE 1931): Δxy < 0.005
+    is imperceptible to most viewers, < 0.02 is generally acceptable,
+    > 0.05 is an obvious tint.
+    """
+    xy = chromaticity_per_cell_per_angle(
+        response, pupil_x_mm, pupil_y_mm, wavelengths_nm)
+    target = np.asarray(target_xy, dtype=xy.dtype)
+    return np.linalg.norm(xy - target, axis=-1)
 
 
 # ── Reductions across FOV angles ────────────────────────────────────────────

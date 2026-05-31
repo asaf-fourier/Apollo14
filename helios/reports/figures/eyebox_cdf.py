@@ -12,7 +12,7 @@ import numpy as np
 import plotly.graph_objects as go
 
 from helios.reports.composer import (
-    d65_distance_per_cell_per_angle,
+    chromaticity_distance_per_cell_per_angle,
     luminance_per_cell_per_angle,
     luminance_weights_for_response,
     mean_over_angles,
@@ -25,7 +25,7 @@ def eyebox_quality_cdf_figure(
     pupil_x_mm: np.ndarray,
     pupil_y_mm: np.ndarray,
     wavelengths_nm: np.ndarray | None = None,
-    d65_tolerance: float | None = 0.05,
+    chromaticity_tolerance: float | None = 0.01,
     num_threshold_steps: int = 80,
 ) -> go.Figure:
     """Cumulative fraction of pupil cells clearing a brightness threshold.
@@ -34,10 +34,10 @@ def eyebox_quality_cdf_figure(
 
     1. **Brightness only** — fraction of cells whose mean brightness is
        at least ``T``. As ``T`` rises from 0, the fraction drops from 1.
-    2. **Brightness + ΔD65** (when ``d65_tolerance`` is set) — same as
-       above, but additionally requires the cell's mean ΔD65 to be below
-       ``d65_tolerance``. Tells you how much of the bright eyebox is
-       *also* white-balanced.
+    2. **Brightness + Δxy** (when ``chromaticity_tolerance`` is set, and
+       ``wavelengths_nm`` is provided) — same as above, but additionally
+       requires the cell's mean Δxy from D65 to be below the tolerance.
+       Tells you how much of the bright eyebox is *also* white-balanced.
 
     The X axis is in **nits** when wavelengths are available, otherwise
     in summed-radiance units. The two curves visually answer "what's my
@@ -71,11 +71,11 @@ def eyebox_quality_cdf_figure(
         )
     ]
 
-    if d65_tolerance is not None:
-        d65_per_angle = d65_distance_per_cell_per_angle(
+    if chromaticity_tolerance is not None and wavelengths_nm is not None:
+        xy_per_angle = chromaticity_distance_per_cell_per_angle(
             response, pupil_x_mm, pupil_y_mm, wavelengths_nm)
-        cell_d65 = mean_over_angles(d65_per_angle).ravel()
-        white_mask = cell_d65 <= d65_tolerance
+        cell_xy = mean_over_angles(xy_per_angle).ravel()
+        white_mask = cell_xy <= chromaticity_tolerance
         fraction_white_and_bright = np.array([
             float(((cell_brightness >= t) & white_mask).mean())
             for t in thresholds
@@ -83,7 +83,7 @@ def eyebox_quality_cdf_figure(
         traces.append(go.Scatter(
             x=thresholds, y=fraction_white_and_bright,
             mode="lines",
-            name=f"brightness ≥ T  AND  ΔD65 ≤ {d65_tolerance}",
+            name=f"brightness ≥ T  AND  Δxy ≤ {chromaticity_tolerance}",
             line=dict(color="firebrick", width=2),
         ))
 

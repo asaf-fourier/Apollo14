@@ -138,3 +138,99 @@ def luminance_weights_np(wavelengths_nm: np.ndarray,
                 "Cannot infer Δλ from a single wavelength — pass delta_nm.")
         delta_nm = float(np.mean(np.diff(wavelengths_nm)))
     return K_M * photopic_v_np(wavelengths_nm) * delta_nm
+
+
+# ── CIE 1931 2° standard observer x̄/ȳ/z̄, 380–780 nm at 5 nm spacing ──────
+#
+# Source: CIE 015:2004 reproduction of the 1931 2° observer. ȳ(λ) is
+# numerically identical to ``_V_TABLE`` above (peak 1.0 at 555 nm) — we
+# share the same array. Used by the report's chromaticity metric, which
+# integrates per-cell spectra through these CMFs to produce CIE (x, y)
+# coordinates — the right "color quality" target for a 3-band micro-LED
+# whose raw spectral SPD looks nothing like a continuous D65 reference.
+
+_X_BAR_TABLE = jnp.array([
+    0.001368, 0.002236, 0.004243, 0.007650, 0.014310, 0.023190, 0.043510,
+    0.077630, 0.134380, 0.214770, 0.283900, 0.328500, 0.348280, 0.348060,
+    0.336200, 0.318700, 0.290800, 0.251100, 0.195360, 0.142100, 0.095640,
+    0.057950, 0.032010, 0.014700, 0.004900, 0.002400, 0.009300, 0.029100,
+    0.063270, 0.109600, 0.165500, 0.225750, 0.290400, 0.359700, 0.433450,
+    0.512050, 0.594500, 0.678400, 0.762100, 0.842500, 0.916300, 0.978600,
+    1.026300, 1.056700, 1.062200, 1.045600, 1.002600, 0.938400, 0.854450,
+    0.751400, 0.642400, 0.541900, 0.447900, 0.360800, 0.283500, 0.218700,
+    0.164900, 0.121200, 0.087400, 0.063600, 0.046770, 0.032900, 0.022700,
+    0.015840, 0.011359, 0.008111, 0.005790, 0.004109, 0.002899, 0.002049,
+    0.001440, 0.001000, 0.000690, 0.000476, 0.000332, 0.000235, 0.000166,
+    0.000117, 0.000083, 0.000059, 0.000042,
+])
+_Y_BAR_TABLE = _V_TABLE  # ȳ(λ) ≡ V(λ) for CIE 1931 2°
+_Z_BAR_TABLE = jnp.array([
+    0.006450, 0.010550, 0.020050, 0.036210, 0.067850, 0.110200, 0.207400,
+    0.371300, 0.645600, 1.039050, 1.385600, 1.622960, 1.747060, 1.782600,
+    1.772110, 1.744100, 1.669200, 1.528100, 1.287640, 1.041900, 0.812950,
+    0.616200, 0.465180, 0.353300, 0.272000, 0.212300, 0.158200, 0.111700,
+    0.078250, 0.057250, 0.042160, 0.029840, 0.020300, 0.013400, 0.008750,
+    0.005750, 0.003900, 0.002750, 0.002100, 0.001800, 0.001650, 0.001400,
+    0.001100, 0.001000, 0.000800, 0.000600, 0.000340, 0.000240, 0.000190,
+    0.000100, 0.000050, 0.000030, 0.000020, 0.000010, 0.000000, 0.000000,
+    0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000,
+    0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000,
+    0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000,
+    0.000000, 0.000000, 0.000000, 0.000000,
+])
+
+# Canonical CIE D65 illuminant white point (CIE 1931 2° observer).
+D65_WHITE_POINT_XY = (0.31271, 0.32902)
+
+
+def cie1931_xyz_np(spectrum: np.ndarray,
+                   wavelengths_nm: np.ndarray) -> np.ndarray:
+    """Integrate a spectrum through the CIE 1931 2° observer to get XYZ.
+
+    Args:
+        spectrum: ``(..., K)`` per-wavelength radiance/intensity. Trailing
+            axis matches ``wavelengths_nm``.
+        wavelengths_nm: ``(K,)`` sample wavelengths in nanometers.
+
+    Returns:
+        ``(..., 3)`` tristimulus values ``(X, Y, Z)``. For uniformly
+        sampled wavelengths the constant Δλ cancels when normalizing to
+        chromaticity (x = X/(X+Y+Z)), so we omit it here.
+    """
+    wavelengths_nm = np.asarray(wavelengths_nm, dtype=float)
+    x_bar = np.interp(wavelengths_nm, np.asarray(_V_TABLE_NM),
+                      np.asarray(_X_BAR_TABLE))
+    y_bar = np.interp(wavelengths_nm, np.asarray(_V_TABLE_NM),
+                      np.asarray(_Y_BAR_TABLE))
+    z_bar = np.interp(wavelengths_nm, np.asarray(_V_TABLE_NM),
+                      np.asarray(_Z_BAR_TABLE))
+    X = np.sum(spectrum * x_bar, axis=-1)
+    Y = np.sum(spectrum * y_bar, axis=-1)
+    Z = np.sum(spectrum * z_bar, axis=-1)
+    return np.stack([X, Y, Z], axis=-1)
+
+
+def chromaticity_xy_np(spectrum: np.ndarray,
+                       wavelengths_nm: np.ndarray) -> np.ndarray:
+    """CIE 1931 chromaticity coordinates ``(x, y)`` from a sampled spectrum.
+
+    Args:
+        spectrum: ``(..., K)`` per-wavelength radiance/intensity. Negative
+            values are clamped to 0 (the eye can't see negative light).
+        wavelengths_nm: ``(K,)`` sample wavelengths in nanometers.
+
+    Returns:
+        ``(..., 2)`` chromaticity coordinates ``(x, y)``. For a fully-zero
+        spectrum, returns the D65 white point — there's no perceived hue
+        and reporting it as "deep blue" or any other corner would be
+        misleading.
+    """
+    xyz = cie1931_xyz_np(np.maximum(spectrum, 0.0), wavelengths_nm)
+    total = xyz.sum(axis=-1, keepdims=True)
+    # Guard zero spectra: total == 0 ⇒ return the D65 white point so a
+    # dark cell shows as "neutral" rather than landing at (0, 0) which is
+    # well outside the visible gamut.
+    safe = total > 1e-30
+    xy = np.where(safe, xyz[..., :2] / np.maximum(total, 1e-30),
+                  np.array(D65_WHITE_POINT_XY))
+    return xy

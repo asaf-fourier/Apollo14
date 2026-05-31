@@ -2,10 +2,11 @@
 
 Two figures, both sliding through pupil cells:
 
-- :func:`per_cell_d65_fov_figure` — ΔD65 across the FOV as a heatmap with
-  brightness contours overlaid, so color drift and brightness mountains
-  are visible together. Title lists per-cell luminance (nits), summed
-  radiance, FOV brightness CV (uniformity), and worst-FOV nits.
+- :func:`per_cell_chromaticity_fov_figure` — Δxy from D65 across the FOV
+  as a heatmap with brightness contours overlaid, so chromaticity drift
+  and brightness mountains are visible together. Title lists per-cell
+  luminance (nits), summed radiance, FOV brightness CV (uniformity),
+  and worst-FOV nits.
 
 - :func:`per_cell_intensity_fov_figure` — intensity (luminance or
   radiance fallback) across the FOV. Inverts the FOV worst-cell view:
@@ -19,9 +20,10 @@ from __future__ import annotations
 import numpy as np
 import plotly.graph_objects as go
 
+from helios.photometry import D65_WHITE_POINT_XY
 from helios.reports.composer import (
+    chromaticity_distance_per_cell_per_angle,
     coefficient_of_variation_over_angles,
-    d65_distance_per_cell_per_angle,
     luminance_per_cell_per_angle,
     luminance_weights_for_response,
     mean_over_angles,
@@ -30,14 +32,15 @@ from helios.reports.composer import (
 )
 
 
-def per_cell_d65_fov_figure(
+def per_cell_chromaticity_fov_figure(
     response: np.ndarray,
     scan_angles: np.ndarray,
     pupil_x_mm: np.ndarray,
     pupil_y_mm: np.ndarray,
-    wavelengths_nm: np.ndarray | None = None,
+    wavelengths_nm: np.ndarray,
+    target_xy: tuple[float, float] = D65_WHITE_POINT_XY,
 ) -> go.Figure:
-    """Per-cell ΔD65 over (deg_x, deg_y), with brightness contours overlaid.
+    """Per-cell Δxy from D65 over (deg_x, deg_y), with brightness contours.
 
     Slider steps through pupil cells. For each cell, the title reports:
 
@@ -51,9 +54,10 @@ def per_cell_d65_fov_figure(
     ay_deg = np.degrees(scan_angles[:, 0, 1])
     ny, nx = len(pupil_y_mm), len(pupil_x_mm)
 
-    # Per (cell, angle) D65 distance and brightness — both reshaped (ny, nx, A)
-    d65_per_angle = d65_distance_per_cell_per_angle(
-        response, pupil_x_mm, pupil_y_mm, wavelengths_nm)
+    # Per (cell, angle) Δxy and brightness — both reshaped (ny, nx, A)
+    xy_dist_per_angle = chromaticity_distance_per_cell_per_angle(
+        response, pupil_x_mm, pupil_y_mm, wavelengths_nm,
+        target_xy=target_xy)
     weights = luminance_weights_for_response(wavelengths_nm)
     if weights is not None:
         lum_per_angle = luminance_per_cell_per_angle(
@@ -67,7 +71,7 @@ def per_cell_d65_fov_figure(
 
     # Reshape to per-FOV-grid for plotting
     fov_rad = rad_per_angle.reshape(ny, nx, n_fov_y, n_fov_x)
-    fov_d65 = d65_per_angle.reshape(ny, nx, n_fov_y, n_fov_x)
+    fov_xy = xy_dist_per_angle.reshape(ny, nx, n_fov_y, n_fov_x)
 
     # Per-cell scalar reductions for the title
     mean_lum = (mean_over_angles(lum_per_angle).reshape(ny, nx)
@@ -78,7 +82,7 @@ def per_cell_d65_fov_figure(
                  if lum_per_angle is not None else None)
 
     # Color scale shared across cells so heatmaps are comparable
-    d65_max = float(fov_d65.max()) or 1.0
+    xy_max = float(fov_xy.max()) or 1.0
 
     fig = go.Figure()
     n_cells = ny * nx
@@ -86,17 +90,17 @@ def per_cell_d65_fov_figure(
     cell_idx = 0
     for iy in range(ny):
         for ix in range(nx):
-            # Two traces per cell: D65 heatmap + brightness contour.
-            d65_panel = fov_d65[iy, ix]
+            # Two traces per cell: Δxy heatmap + brightness contour.
+            xy_panel = fov_xy[iy, ix]
             rad_panel = fov_rad[iy, ix]
 
             fig.add_trace(go.Heatmap(
-                z=d65_panel,
+                z=xy_panel,
                 x=ax_deg, y=ay_deg,
                 colorscale="Hot",
-                zmin=0.0, zmax=d65_max,
+                zmin=0.0, zmax=xy_max,
                 visible=(cell_idx == 0),
-                colorbar=dict(title="ΔD65"),
+                colorbar=dict(title="Δxy"),
             ))
             # Brightness contours — show 50%, 75%, 100% of cell mean
             cell_mean = float(rad_panel.mean()) or 1e-12
@@ -141,7 +145,7 @@ def per_cell_d65_fov_figure(
             cell_idx += 1
 
     initial_title = (steps[0]["args"][1]["title"] if steps
-                     else "Per-cell FOV — ΔD65 + brightness contours")
+                     else "Per-cell FOV — Δxy + brightness contours")
     fig.update_layout(
         title=initial_title,
         xaxis_title="FOV x (deg)",
