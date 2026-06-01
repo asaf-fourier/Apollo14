@@ -36,7 +36,13 @@ def snell_refract(direction, normal, n1, n2):
     sin_t2 = ratio ** 2 * (1.0 - cos_i ** 2)
     is_tir = sin_t2 > 1.0
 
-    cos_t = jnp.sqrt(jnp.maximum(1.0 - sin_t2, 0.0))
+    # Safe-sqrt: in the TIR region (sin_t2 >= 1) the refracted branch is
+    # discarded (``out_dir`` selects ``reflected``), but
+    # ``sqrt(maximum(1 - sin_t2, 0))`` evaluates ``sqrt(0)`` there, whose
+    # derivative is infinite — the ``0 * inf`` poisons the gradient with NaN
+    # through ``jnp.where`` even though the value is unused. Feeding a safe
+    # positive argument where TIR holds keeps both value and gradient finite.
+    cos_t = jnp.sqrt(jnp.where(sin_t2 < 1.0, 1.0 - sin_t2, 1.0))
     refracted = ratio * direction + (ratio * cos_i - cos_t) * normal
     refracted = normalize(refracted)
 
@@ -64,7 +70,16 @@ def ray_rect_intersect(origin, direction, position, normal, local_x, local_y, ha
         in_bounds: bool, whether the hit is within the rectangle and t > 0.
     """
     denom = jnp.dot(direction, normal)
-    t = jnp.dot(position - origin, normal) / (denom + 1e-30)
+    # Guard near-parallel rays with the same EPSILON test as
+    # ``ray_plane_intersection`` rather than the inert ``denom + 1e-30``
+    # divisor: a near-zero denominator otherwise produces a spuriously large
+    # ``t`` instead of "no intersection". An infinite ``t`` pushes ``hit``
+    # outside the rectangle, so ``in_bounds`` below correctly evaluates False.
+    t = jnp.where(
+        jnp.abs(denom) < EPSILON,
+        jnp.inf,
+        jnp.dot(position - origin, normal) / denom,
+    )
     hit = origin + jnp.maximum(t, 0.0) * direction
 
     delta = hit - position

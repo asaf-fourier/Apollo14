@@ -124,8 +124,15 @@ LUMINANCE_TRACE_WEIGHTS = photopic_luminance_weights(TRACE_WAVELENGTHS)
 # ── Per-cell brightness target ─────────────────────────────────────────────
 
 NUM_EYEBOX_CELLS = EYEBOX_NX * EYEBOX_NY
+# The merit excludes the 4 corner cells (see ``CELL_MASK`` below), so only
+# ``NUM_ACTIVE_EYEBOX_CELLS`` are actually pulled to ``PER_CELL_TARGET``.
+# Dividing the eyebox budget by the *active* count keeps the achieved eyebox
+# total at ``EYEBOX_TARGET``; dividing by the full cell count makes every
+# active cell aim ~5% low (76/80) so the eyebox systematically undershoots.
+NUM_EXCLUDED_CORNER_CELLS = 4
+NUM_ACTIVE_EYEBOX_CELLS = NUM_EYEBOX_CELLS - NUM_EXCLUDED_CORNER_CELLS
 EYEBOX_TARGET = 0.07
-PER_CELL_TARGET = EYEBOX_TARGET / NUM_EYEBOX_CELLS
+PER_CELL_TARGET = EYEBOX_TARGET / NUM_ACTIVE_EYEBOX_CELLS
 
 
 # ── Merit & tracer configuration ────────────────────────────────────────────
