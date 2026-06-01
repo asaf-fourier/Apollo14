@@ -181,3 +181,22 @@ class TestGradient:
         grads = jax.grad(lambda r: pupil_merit(r, 1.0, cfg))(response)
         assert grads.shape == response.shape
         assert jnp.any(grads != 0.0)
+
+    def test_grad_matches_finite_difference(self):
+        # Centered finite difference vs autodiff on the (smooth, quadratic)
+        # target term — guards the differentiability the optimizer rests on.
+        # A NaN-leaking gradient anywhere upstream would diverge from FD here.
+        cfg = PupilMeritConfig(target_relative=0.05,
+                               weight_target=1.0, weight_shape=0.0)
+        response = _ideal_response(brightness=0.03)   # below target, smooth
+
+        def loss(r):
+            return pupil_merit(r, 1.0, cfg)
+
+        analytic = jax.grad(loss)(response)
+        step = 1e-3
+        idx = (0, 0, 1)
+        up = float(loss(response.at[idx].add(step)))
+        down = float(loss(response.at[idx].add(-step)))
+        finite_difference = (up - down) / (2 * step)
+        assert abs(float(analytic[idx]) - finite_difference) < 5e-3

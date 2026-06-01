@@ -8,7 +8,13 @@ and gradient flow back to params via the curve's reflectance samples.
 import jax
 import jax.numpy as jnp
 
-from apollo14.elements.aperture import RectangularAperture
+from apollo14.combiner import (
+    DEFAULT_LIGHT_DIRECTION,
+    DEFAULT_LIGHT_POSITION,
+    build_default_system,
+)
+from apollo14.elements.aperture import RectangularAperture, aperture_interact
+from apollo14.ray import Ray
 from apollo14.elements.glass_block import GlassBlock
 from apollo14.elements.partial_mirror import PartialMirror
 from apollo14.elements.pupil import RectangularPupil
@@ -306,3 +312,78 @@ class TestGradient:
         grads = jax.grad(first_to_last_mirror_distance)(params)
         assert grads.spacings.shape == params.spacings.shape
         assert jnp.all(grads.spacings != 0.0)
+
+
+# ── Aperture (beam-defining stop) ────────────────────────────────────────────
+
+
+def _aperture(system):
+    return next(e for e in system.elements
+                if isinstance(e, RectangularAperture))
+
+
+def _aperture_passes_ray(aperture, x_mm, z_mm):
+    """Aim a ray straight at the aperture plane, offset (x, z) in-plane."""
+    offset = jnp.array([x_mm * mm, 0.0, z_mm * mm])
+    origin = aperture.position + offset - jnp.asarray(DEFAULT_LIGHT_DIRECTION) * 5.0 * mm
+    ray = Ray(pos=origin, dir=jnp.asarray(DEFAULT_LIGHT_DIRECTION),
+              intensity=jnp.asarray(1.0))
+    seg, _ = aperture.build_segment(None, None)
+    _, _, valid = aperture_interact(seg, ray, 550.0 * nm)
+    return bool(valid)
+
+
+class TestAperture:
+
+    def test_hole_not_wider_than_frame(self):
+        # The hole must fit inside the opaque frame, else the stop can never
+        # block in that axis (the original bug: inner 10 mm > outer 6 mm).
+        for system in (build_default_system(),
+                       build_parametrized_system(CombinerParams.initial())):
+            aperture = _aperture(system)
+            assert aperture.inner_width <= aperture.width
+            assert aperture.inner_height <= aperture.height
+
+    def test_apertures_match_between_systems(self):
+        # combiner_params lifts fixed geometry from combiner, so the aperture
+        # must be identical — designs won't transfer otherwise.
+        default = _aperture(build_default_system())
+        param = _aperture(build_parametrized_system(CombinerParams.initial()))
+        assert (float(default.width), float(default.height),
+                float(default.inner_width), float(default.inner_height)) == \
+               (float(param.width), float(param.height),
+                float(param.inner_width), float(param.inner_height))
+
+    def test_passes_ray_through_hole(self):
+        aperture = _aperture(build_default_system())
+        assert _aperture_passes_ray(aperture, x_mm=0.0, z_mm=0.0)
+
+    def test_blocks_stray_in_frame_outside_hole(self):
+        # x=6 mm is inside the 14 mm frame but outside the 10 mm hole, so it
+        # must be absorbed. On the pre-fix 6 mm frame this point fell outside
+        # the frame and leaked straight through — this pins the stop fix.
+        aperture = _aperture(build_default_system())
+        assert not _aperture_passes_ray(aperture, x_mm=6.0, z_mm=0.0)
+
+
+# ── Parametrized ⇄ fixed equivalence ─────────────────────────────────────────
+
+
+class TestEquivalence:
+
+    def test_shared_fixed_geometry_matches_default(self):
+        # build_parametrized_system holds chassis / aperture / mirror tilt
+        # fixed, lifted from build_default_system. The pupil is intentionally
+        # divergent (recentering slack), so it is excluded here.
+        default = build_default_system()
+        param = build_parametrized_system(CombinerParams.initial())
+
+        default_mirror = next(e for e in default.elements
+                              if isinstance(e, PartialMirror))
+        param_mirror = next(e for e in param.elements
+                            if isinstance(e, PartialMirror))
+        # Mirror tilt (normal) and footprint match between the two builds.
+        assert jnp.allclose(default_mirror.normal, param_mirror.normal,
+                            atol=1e-6)
+        assert jnp.allclose(default_mirror.half_extents,
+                            param_mirror.half_extents, atol=1e-5)

@@ -7,6 +7,7 @@ from apollo14.geometry import (
     point_in_circle,
     point_in_rect,
     ray_plane_intersection,
+    ray_rect_intersect,
     reflect,
     snell_refract,
 )
@@ -102,3 +103,64 @@ def test_reflect_is_differentiable():
 
     g = grad(loss)(jnp.float32(0.5))
     assert jnp.isfinite(g)
+
+
+def test_snell_refract_tir_returns_reflected():
+    # Past the critical angle the output direction is the reflected ray.
+    direction = normalize(jnp.array([0.9, -0.1, 0.0]))
+    normal = jnp.array([0.0, 1.0, 0.0])
+    out_dir, is_tir = snell_refract(direction, normal, 1.5, 1.0)
+    assert is_tir
+    assert jnp.allclose(out_dir, reflect(direction, normal), atol=1e-6)
+
+
+def test_snell_refract_tir_gradient_is_finite():
+    # At TIR the refracted branch evaluates sqrt(0); a naive
+    # ``sqrt(maximum(1 - sin_t2, 0))`` leaks a NaN gradient through the
+    # downstream ``jnp.where`` even though the refracted value is discarded.
+    normal = jnp.array([0.0, 0.0, -1.0])
+
+    def out_sum(direction):
+        out_dir, _ = snell_refract(direction, normal, 1.6, 1.0)
+        return jnp.sum(out_dir)
+
+    steep = normalize(jnp.array([jnp.sin(jnp.deg2rad(70.0)), 0.0,
+                                 jnp.cos(jnp.deg2rad(70.0))]))
+    _, is_tir = snell_refract(steep, normal, 1.6, 1.0)
+    assert is_tir
+    assert jnp.all(jnp.isfinite(grad(out_sum)(steep)))
+
+
+def _rect():
+    """A 4×4 rectangle on the z=5 plane, normal +Z, world-aligned axes."""
+    return dict(
+        position=jnp.array([0.0, 0.0, 5.0]),
+        normal=jnp.array([0.0, 0.0, 1.0]),
+        local_x=jnp.array([1.0, 0.0, 0.0]),
+        local_y=jnp.array([0.0, 1.0, 0.0]),
+        half_extents=jnp.array([2.0, 2.0]),
+    )
+
+
+def test_ray_rect_intersect_hits_within_bounds():
+    hit, t, in_bounds = ray_rect_intersect(
+        jnp.array([0.0, 0.0, 0.0]), jnp.array([0.0, 0.0, 1.0]), **_rect())
+    assert bool(in_bounds)
+    assert jnp.allclose(t, 5.0)
+    assert jnp.allclose(hit, jnp.array([0.0, 0.0, 5.0]))
+
+
+def test_ray_rect_intersect_outside_bounds():
+    # Crosses the plane at x=10, well outside the ±2 rectangle.
+    _, _, in_bounds = ray_rect_intersect(
+        jnp.array([10.0, 0.0, 0.0]), jnp.array([0.0, 0.0, 1.0]), **_rect())
+    assert not bool(in_bounds)
+
+
+def test_ray_rect_intersect_near_parallel_returns_inf():
+    # A ray parallel to the plane must report no intersection (t = inf), not
+    # a spuriously large finite distance from dividing by a tiny epsilon.
+    _, t, in_bounds = ray_rect_intersect(
+        jnp.array([0.0, 0.0, 0.0]), jnp.array([1.0, 0.0, 0.0]), **_rect())
+    assert not bool(in_bounds)
+    assert jnp.isinf(t)
