@@ -259,15 +259,20 @@ def build_parametrized_system(
     ).translate(CHASSIS_CENTER)
     system.add(chassis)
 
-    # Aperture — fixed
+    # Aperture — fixed, must match ``apollo14.combiner.build_default_system``
+    # (fixed geometry is lifted from the reference build). Beam-defining stop:
+    # opaque 14×6 mm frame (larger than the 10×2 mm beam) with a 10×2 mm
+    # clear-aperture hole matching the beam — it passes the full beam and
+    # absorbs only stray outside it. The previous 6×3 mm frame was *smaller*
+    # than the beam, so wing rays at |x|>3 leaked past instead of being clipped.
     system.add(RectangularAperture(
         name="aperture",
         position=DEFAULT_LIGHT_POSITION - jnp.array([0.0, 0.5 * mm, 0.0]),
         normal=DEFAULT_LIGHT_DIRECTION,
-        width=6.0 * mm,
-        height=3.0 * mm,
-        inner_width=4.0 * mm,
-        inner_height=1.0 * mm,
+        width=14.0 * mm,
+        height=6.0 * mm,
+        inner_width=10.0 * mm,
+        inner_height=2.0 * mm,
     ))
 
     # Mirrors — positions from cumulative spacings, reflectance from the curve.

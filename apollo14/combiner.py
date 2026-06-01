@@ -82,12 +82,17 @@ def build_default_system() -> OpticalSystem:
     system.add(chassis)
 
     # ── Aperture ─────────────────────────────────────────────────────────
+    # Beam-defining stop: an opaque frame larger than the beam (so no ray can
+    # sneak past its outer edges) with a 10×2 mm clear-aperture hole. The hole
+    # matches the projector beam, so it passes the full beam and absorbs only
+    # stray light outside it. Frame and hole are kept identical in
+    # ``helios.combiner_params.build_parametrized_system`` (fixed geometry).
     system.add(RectangularAperture(
         name="aperture",
         position=DEFAULT_LIGHT_POSITION - jnp.array([0.0, 0.5 * mm, 0.0]),
         normal=DEFAULT_LIGHT_DIRECTION,
-        width=6.0 * mm,
-        height=3.0 * mm,
+        width=14.0 * mm,
+        height=6.0 * mm,
         inner_width=10.0 * mm,
         inner_height=2.0 * mm,
     ))
