@@ -5,6 +5,8 @@ build (positions + reflectance), ``ParamBounds.clip`` clamping/rescaling,
 and gradient flow back to params via the curve's reflectance samples.
 """
 
+import math
+
 import jax
 import jax.numpy as jnp
 
@@ -21,6 +23,9 @@ from apollo14.elements.pupil import RectangularPupil
 from apollo14.spectral import SumOfGaussiansCurve
 from apollo14.units import mm, nm
 from helios.combiner_params import (
+    CHASSIS_Z,
+    EYE_RELIEF,
+    MIRROR_ANGLE,
     CombinerParams,
     ParamBounds,
     build_parametrized_system,
@@ -175,6 +180,51 @@ class TestSystemBuild:
         # Wider σ ⇒ much higher reflectance at the inter-peak midpoint.
         assert float(m_wide.reflectance[i_mid]) > 5 * float(
             m_narrow.reflectance[i_mid])
+
+
+class TestChassisThickness:
+    """``chassis_z`` rebuilds every thickness-dependent piece of geometry."""
+
+    @staticmethod
+    def _mirror0(system):
+        return next(e for e in system.elements if isinstance(e, PartialMirror))
+
+    @staticmethod
+    def _pupil(system):
+        return next(e for e in system.elements
+                    if isinstance(e, RectangularPupil))
+
+    def test_default_matches_explicit_default(self):
+        params = CombinerParams.initial()
+        default = build_parametrized_system(params)
+        explicit = build_parametrized_system(params, chassis_z=CHASSIS_Z)
+        # Same thickness ⇒ identical mirror footprint and pupil plane.
+        assert jnp.allclose(self._mirror0(default).half_extents,
+                            self._mirror0(explicit).half_extents)
+        assert jnp.allclose(self._pupil(default).position,
+                            self._pupil(explicit).position)
+
+    def test_mirror_height_scales_with_thickness(self):
+        params = CombinerParams.initial()
+        thin = build_parametrized_system(params, chassis_z=0.8 * mm)
+        # Mirror height (half_extents[1]) = (chassis_z / cos θ) / 2.
+        expected_half_height = (0.8 * mm / math.cos(MIRROR_ANGLE)) / 2
+        assert abs(float(self._mirror0(thin).half_extents[1])
+                   - expected_half_height) < 1e-6
+        # Thinner glass ⇒ shorter mirrors than the default build.
+        default = build_parametrized_system(params)
+        assert float(self._mirror0(thin).half_extents[1]) < float(
+            self._mirror0(default).half_extents[1])
+        # x-extent is thickness-independent — unchanged.
+        assert jnp.allclose(self._mirror0(thin).half_extents[0],
+                            self._mirror0(default).half_extents[0])
+
+    def test_pupil_keeps_constant_eye_relief(self):
+        params = CombinerParams.initial()
+        thin = build_parametrized_system(params, chassis_z=0.8 * mm)
+        # Pupil sits EYE_RELIEF beyond the front face at z = chassis_z.
+        assert abs(float(self._pupil(thin).position[2])
+                   - float(EYE_RELIEF + 0.8 * mm)) < 1e-6
 
 
 # ── ParamBounds ─────────────────────────────────────────────────────────────

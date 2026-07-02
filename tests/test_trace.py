@@ -11,11 +11,19 @@ from apollo14.combiner import (
 )
 from apollo14.elements.aperture import ApertureSeg
 from apollo14.elements.glass_block import FaceSeg
-from apollo14.elements.partial_mirror import MirrorStackSeg
+from apollo14.elements.partial_mirror import MirrorStackSeg, PartialMirror
 from apollo14.elements.pupil import PupilSeg
+from apollo14.materials import air
 from apollo14.ray import Ray
-from apollo14.route import Route, build_route, combiner_main_path
+from apollo14.route import (
+    TRANSMIT,
+    Route,
+    _group_mirror_runs,
+    build_route,
+    combiner_main_path,
+)
 from apollo14.trace import prepare_route, trace, trace_rays
+from apollo14.units import nm
 
 
 def _mirror_stack(route):
@@ -147,6 +155,41 @@ class TestTraceRay:
         grads = jax.grad(loss)(stack.reflectance)
         assert grads.shape == stack.reflectance.shape
         assert jnp.any(grads != 0.0)
+
+
+class TestTransmitMissSurvives:
+
+    def test_miss_survives_to_next_mirror(self):
+        """A ray that geometrically misses mirror_0 but hits mirror_1 is
+        attenuated only by mirror_1 — the upstream miss does not kill it."""
+        # Two +Y mirrors on parallel planes. mirror_0 is offset in x so the
+        # straight-down ray crosses its plane outside the rectangle; mirror_1
+        # is centered on the ray, so the ray hits it.
+        wavelengths = jnp.array([400.0, 550.0, 700.0]) * nm
+        mirror_0 = PartialMirror(
+            name="m0", position=jnp.array([5.0, 0.0, 0.0]),
+            normal=jnp.array([0.0, 1.0, 0.0]), width=2.0, height=10.0,
+            reflectance=0.5, wavelengths=wavelengths)
+        mirror_1 = PartialMirror(
+            name="m1", position=jnp.array([0.0, -1.0, 0.0]),
+            normal=jnp.array([0.0, 1.0, 0.0]), width=2.0, height=10.0,
+            reflectance=0.3, wavelengths=wavelengths)
+
+        seg0, _ = mirror_0.build_segment(air, TRANSMIT)
+        seg1, _ = mirror_1.build_segment(air, TRANSMIT)
+        (stack,) = _group_mirror_runs([seg0, seg1])
+        route = Route(segments=(stack,))
+
+        ray = Ray(pos=jnp.array([0.0, 10.0, 0.0]),
+                  dir=jnp.array([0.0, -1.0, 0.0]),
+                  intensity=jnp.asarray(1.0))
+        result = trace(route, ray, wavelength=550.0 * nm)
+
+        # Only mirror_1 attenuates: 1 * (1 - 0.3) = 0.7. Not killed (0.0), and
+        # not also hit by mirror_0 (which would give 0.5 * 0.7 = 0.35).
+        assert abs(float(result.final_intensity) - 0.7) < 1e-5
+        assert not bool(result.valids[0])   # mirror_0 missed
+        assert bool(result.valids[1])       # mirror_1 hit
 
 
 class TestTraceRays:

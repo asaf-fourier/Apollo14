@@ -93,3 +93,39 @@ def test_transmit_preserves_direction():
                                             550.0 * nm)
     # A thin coating in one medium doesn't bend the transmitted ray.
     assert jnp.allclose(transmitted.dir, _incident_ray().dir, atol=1e-6)
+
+
+def _missing_ray(intensity=1.0):
+    """Ray parallel to the incident one but offset far outside the 10×10
+    mirror, so it crosses the mirror plane well beyond the rectangle."""
+    return Ray(
+        pos=jnp.array([-5.0, 5.0, 100.0]),
+        dir=normalize(jnp.array([1.0, -1.0, 0.0])),
+        intensity=jnp.asarray(intensity),
+    )
+
+
+def test_transmit_miss_passes_through_unchanged():
+    """A live ray that misses the rectangle is NOT terminated — it keeps its
+    intensity and direction and continues (only its interaction is skipped)."""
+    mirror = _mirror(reflectance=0.3)
+    transmit_seg, _ = mirror.build_segment(air, TRANSMIT)
+    ray = _missing_ray(intensity=0.8)
+
+    transmitted, _, valid = mirror_transmit_one(transmit_seg, ray, 550.0 * nm)
+
+    assert not bool(valid)                                    # no interaction
+    assert abs(float(transmitted.intensity) - 0.8) < 1e-6     # intensity kept
+    assert jnp.allclose(transmitted.dir, ray.dir, atol=1e-6)  # direction kept
+
+
+def test_transmit_dead_ray_stays_dead():
+    """A ray that already died upstream (intensity 0) is never resurrected."""
+    mirror = _mirror(reflectance=0.3)
+    transmit_seg, _ = mirror.build_segment(air, TRANSMIT)
+    ray = _incident_ray(intensity=0.0)  # hits the rectangle, but is a corpse
+
+    transmitted, _, valid = mirror_transmit_one(transmit_seg, ray, 550.0 * nm)
+
+    assert not bool(valid)
+    assert float(transmitted.intensity) == 0.0

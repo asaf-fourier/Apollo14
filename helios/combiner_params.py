@@ -74,8 +74,7 @@ from helios.merit import DEFAULT_WAVELENGTHS
 NUM_MIRRORS = 6
 CHASSIS_X = 14.0 * mm
 CHASSIS_Y = 20.0 * mm
-CHASSIS_Z = 1.7 * mm
-CHASSIS_CENTER = jnp.array([CHASSIS_X / 2, CHASSIS_Y, CHASSIS_Z / 2])
+CHASSIS_Z = 1.7 * mm              # default glass thickness (z); per-build override
 SKEW_ANGLE = 6.0 * deg
 MIRROR_ANGLE = 48.0 * deg
 EYE_RELIEF = 15.0 * mm
@@ -96,18 +95,52 @@ _MIRROR_NORMAL = jnp.array([
     math.sin(_NORMAL_ANGLE),
     math.cos(_NORMAL_ANGLE),
 ])
-_MIRROR_X_WIDTH = CHASSIS_X
-_MIRROR_Y_WIDTH = CHASSIS_Z / math.cos(MIRROR_ANGLE)
-_MIRROR_EDGE_TO_CENTER_Y = 0.5 * math.sqrt(
-    _MIRROR_Y_WIDTH ** 2 - CHASSIS_Z ** 2
-)
+_MIRROR_X_WIDTH = CHASSIS_X                              # z-independent
 _UNIT_OFFSET = jnp.array([0.0, 1.0 / math.sin(_NORMAL_ANGLE), 0.0])
-_Z_SKEW = CHASSIS_Z * math.tan(SKEW_ANGLE)
 
-_FIRST_MIRROR_CENTER = CHASSIS_CENTER + jnp.array([0.0, FIRST_MIRROR_OFFSET_Y, 0.0])
-_FIRST_MIRROR_POS = _FIRST_MIRROR_CENTER - jnp.array(
-    [0.0, _MIRROR_EDGE_TO_CENTER_Y, 0.0]
-)
+
+class _ChassisGeometry(NamedTuple):
+    """Geometry that scales with the chassis thickness ``chassis_z``."""
+    chassis_center: jnp.ndarray    # (3,) chassis center; z = chassis_z / 2
+    mirror_y_width: float          # mirror height = chassis_z / cos(tilt)
+    z_skew: float                  # chassis z-skew shear
+    first_mirror_pos: jnp.ndarray  # (3,) position of mirror_0
+
+
+def _derive_chassis_geometry(chassis_z: float) -> _ChassisGeometry:
+    """Derive all chassis-thickness-dependent geometry from ``chassis_z``.
+
+    The mirror height (``chassis_z / cos θ``), the chassis z-skew, the
+    chassis center, and the first mirror's position all scale with the
+    glass thickness. Collecting them here lets a caller rebuild the
+    combiner at any thickness — e.g. to make it as thin as possible — by
+    threading a single number through ``build_parametrized_system``.
+    """
+    chassis_center = jnp.array([CHASSIS_X / 2, CHASSIS_Y, chassis_z / 2])
+    mirror_y_width = chassis_z / math.cos(MIRROR_ANGLE)
+    mirror_edge_to_center_y = 0.5 * math.sqrt(
+        mirror_y_width ** 2 - chassis_z ** 2
+    )
+    z_skew = chassis_z * math.tan(SKEW_ANGLE)
+    first_mirror_center = chassis_center + jnp.array(
+        [0.0, FIRST_MIRROR_OFFSET_Y, 0.0]
+    )
+    first_mirror_pos = first_mirror_center - jnp.array(
+        [0.0, mirror_edge_to_center_y, 0.0]
+    )
+    return _ChassisGeometry(
+        chassis_center=chassis_center,
+        mirror_y_width=mirror_y_width,
+        z_skew=z_skew,
+        first_mirror_pos=first_mirror_pos,
+    )
+
+
+# Default-thickness geometry. ``CHASSIS_CENTER`` stays a module constant
+# because ``examples/jax_tracer_demo.py`` imports it (its x/y recenter the
+# pupil — both z-independent).
+_DEFAULT_GEOMETRY = _derive_chassis_geometry(CHASSIS_Z)
+CHASSIS_CENTER = _DEFAULT_GEOMETRY.chassis_center
 
 
 # ── Design variables ────────────────────────────────────────────────────────
@@ -218,6 +251,7 @@ class ParamBounds:
 def build_parametrized_system(
     params: CombinerParams,
     probe_wavelengths: jnp.ndarray | None = None,
+    chassis_z: float | None = None,
 ) -> OpticalSystem:
     """Build the Talos combiner using ``params`` as the design variables.
 
@@ -236,6 +270,12 @@ def build_parametrized_system(
             an effectively-exact curve. Defaults to the curve's
             ``centers`` (B points — back-compat; gives a piecewise-
             linear curve through the basis peaks).
+        chassis_z: Glass thickness (z) in internal length units. All
+            thickness-dependent geometry — mirror height, chassis
+            z-skew, chassis center, first-mirror position, and the pupil
+            plane (kept at a constant ``EYE_RELIEF`` from the front
+            face) — is rederived from it. Defaults to :data:`CHASSIS_Z`.
+            Pass a smaller value to make the combiner thinner.
 
     Returns:
         :class:`OpticalSystem` with chassis, aperture, mirrors, pupil.
@@ -248,15 +288,21 @@ def build_parametrized_system(
         probe_wavelengths = jax.lax.stop_gradient(params.curves.centers[0])
     probe_wavelengths = jnp.asarray(probe_wavelengths)
 
+    if chassis_z is None:
+        chassis_z = CHASSIS_Z
+    geometry = _derive_chassis_geometry(chassis_z)
+    chassis_center = geometry.chassis_center
+
     system = OpticalSystem(env_material=air)
 
-    # Chassis — fixed geometry (all dimensions are plain floats, JIT-safe)
+    # Chassis — geometry scales with the chosen thickness (all dimensions
+    # are plain floats, JIT-safe).
     chassis = GlassBlock.create_chassis(
         name="chassis",
-        x=CHASSIS_X, y=CHASSIS_Y, z=CHASSIS_Z,
+        x=CHASSIS_X, y=CHASSIS_Y, z=chassis_z,
         material=agc_m074,
-        z_skew=_Z_SKEW,
-    ).translate(CHASSIS_CENTER)
+        z_skew=geometry.z_skew,
+    ).translate(chassis_center)
     system.add(chassis)
 
     # Aperture — fixed, must match ``apollo14.combiner.build_default_system``
@@ -280,7 +326,7 @@ def build_parametrized_system(
         [jnp.zeros(1), jnp.cumsum(params.spacings)]
     )  # (M,)
     mirror_positions = (
-        _FIRST_MIRROR_POS[None, :]
+        geometry.first_mirror_pos[None, :]
         - cumulative_offset[:, None] * _UNIT_OFFSET[None, :]
     )  # (M, 3)
 
@@ -292,7 +338,7 @@ def build_parametrized_system(
             position=mirror_positions[mirror_idx],
             normal=_MIRROR_NORMAL.copy(),
             width=_MIRROR_X_WIDTH,
-            height=_MIRROR_Y_WIDTH,
+            height=geometry.mirror_y_width,
             wavelengths=probe_wavelengths,
             curve=mirror_curve,
         ))
@@ -305,9 +351,9 @@ def build_parametrized_system(
     system.add(RectangularPupil(
         name="pupil",
         position=jnp.array([
-            CHASSIS_CENTER[0] + PUPIL_OFFSET_X,
-            CHASSIS_CENTER[1] + PUPIL_OFFSET_Y,
-            EYE_RELIEF + CHASSIS_Z,
+            chassis_center[0] + PUPIL_OFFSET_X,
+            chassis_center[1] + PUPIL_OFFSET_Y,
+            EYE_RELIEF + chassis_z,
         ]),
         normal=jnp.array([0.0, 0.0, -1.0]),
         width=14.0 * mm,

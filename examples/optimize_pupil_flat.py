@@ -76,6 +76,14 @@ NUM_MIRRORS = 8
 FIXED_SPACING_MM = 1.3
 BASE_RATIO = 0.05  # nominal per-mirror reflected fraction of the original beam
 
+# Chassis glass thickness (z). Thinner glass shrinks the mirror height
+# (∝ chassis_z / cos θ) and the whole combiner cross-section — sweep this to
+# see how thin the combiner can get while still hitting the eyebox target.
+# Threaded into every ``build_parametrized_system`` call below; the pupil stays
+# at a constant eye relief from the (moving) front face. Default 1.7 mm matches
+# ``helios.combiner_params.CHASSIS_Z``.
+CHASSIS_Z_MM = 1.7
+
 # ── Eyebox target region (pre-defined, fixed) ───────────────────────────────
 
 EYEBOX_HALF_X = 4.0 * mm         # 8 mm full width on x
@@ -187,6 +195,7 @@ _ref_system = build_parametrized_system(
                                      num_mirrors=NUM_MIRRORS),
     ),
     probe_wavelengths=TRACE_WAVELENGTHS,
+    chassis_z=CHASSIS_Z_MM * mm,
 )
 _pupil = next(e for e in _ref_system.elements if isinstance(e, RectangularPupil))
 
@@ -260,7 +269,8 @@ def _compute_spectral_response(params: CombinerParams) -> jnp.ndarray:
     nearest-neighbor binning is used (no soft binning).
     """
     system = build_parametrized_system(
-        params, probe_wavelengths=TRACE_WAVELENGTHS)
+        params, probe_wavelengths=TRACE_WAVELENGTHS,
+        chassis_z=CHASSIS_Z_MM * mm)
     branch_routes = build_combiner_branch_routes(
         system, num_mirrors=NUM_MIRRORS,
     )
@@ -321,7 +331,7 @@ def _clip(params: CombinerParams) -> CombinerParams:
 
 # ── Adam optimizer ──────────────────────────────────────────────────────────
 
-NUM_STEPS = 300
+NUM_STEPS = 150
 adam_cfg = AdamConfig(peak_lr=3e-3, warmup_steps=20, num_steps=NUM_STEPS)
 
 
@@ -447,7 +457,8 @@ def main():
           f"std={float(relative_brightness.std()):.5f}")
 
     final_system = build_parametrized_system(
-        params, probe_wavelengths=TRACE_WAVELENGTHS)
+        params, probe_wavelengths=TRACE_WAVELENGTHS,
+        chassis_z=CHASSIS_Z_MM * mm)
     report_path = save_optimization_report(
         run_dir,
         system=final_system,

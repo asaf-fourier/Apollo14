@@ -136,6 +136,15 @@ def mirror_transmit_one(mirror_params, ray: Ray, wavelength):
 
     The mirror coating is a thin layer inside a single medium, so the
     transmitted direction is unchanged — only the intensity attenuates.
+
+    A live ray that misses the mirror rectangle is **not** terminated: it
+    passes through with zero interaction (intensity, direction, and origin
+    unchanged) so it stays eligible to hit later mirrors. Only rays that
+    actually cross the rectangle are attenuated. Termination is the
+    aperture's job — a ray blocked there arrives already dead
+    (``intensity == 0``) and stays dead here. Ray-plane intersection is
+    origin-invariant along the ray, so keeping ``ray.pos`` on a miss leaves
+    the next mirror's intersection unchanged.
     """
     alive_in = ray.intensity > 0
 
@@ -143,12 +152,15 @@ def mirror_transmit_one(mirror_params, ray: Ray, wavelength):
 
     r = _interp_reflectance(
         mirror_params.wavelengths, mirror_params.reflectance, wavelength)
-    new_intensity = ray.intensity * (1.0 - r)
+    attenuated = ray.intensity * (1.0 - r)
 
-    valid = in_bounds & alive_in
-    out_intensity = jnp.where(valid, new_intensity, 0.0)
-    out_pos = jnp.where(valid, hit, ray.pos)
-    return Ray(pos=out_pos, dir=ray.dir, intensity=out_intensity), hit, valid
+    # Attenuate only where a live ray crosses the rectangle; otherwise the
+    # ray passes through unchanged (a live miss keeps its intensity; a dead
+    # ray keeps its zero).
+    interacted = in_bounds & alive_in
+    out_intensity = jnp.where(interacted, attenuated, ray.intensity)
+    out_pos = jnp.where(interacted, hit, ray.pos)
+    return Ray(pos=out_pos, dir=ray.dir, intensity=out_intensity), hit, interacted
 
 
 def mirror_reflect_one(seg: ReflectMirrorSeg, ray: Ray, wavelength):
