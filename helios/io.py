@@ -99,6 +99,13 @@ def _serialize_curve(curve) -> dict:
             "sigma": _to_list(curve.sigma),
             "centers": _to_list(curve.centers),
         }
+    if cls == "ConstantCurve":
+        # Wavelength-flat reflectance — a single scalar per mirror, no
+        # width or center to record.
+        return {
+            "type": cls,
+            "amplitude": _to_list(curve.amplitude),
+        }
     raise ValueError(f"No serializer for curve type {cls!r}")
 
 

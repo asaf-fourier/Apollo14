@@ -74,7 +74,7 @@ from helios.merit import DEFAULT_WAVELENGTHS
 NUM_MIRRORS = 6
 CHASSIS_X = 14.0 * mm
 CHASSIS_Y = 20.0 * mm
-CHASSIS_Z = 2.0 * mm
+CHASSIS_Z = 1.7 * mm
 CHASSIS_CENTER = jnp.array([CHASSIS_X / 2, CHASSIS_Y, CHASSIS_Z / 2])
 SKEW_ANGLE = 6.0 * deg
 MIRROR_ANGLE = 48.0 * deg

@@ -3,6 +3,7 @@ import json
 import jax.numpy as jnp
 
 from apollo14.projector import FovGrid, Projector
+from apollo14.spectral import ConstantCurve
 from apollo14.units import mm, nm
 from helios.combiner_params import CombinerParams, build_parametrized_system
 from helios.io import (
@@ -97,6 +98,23 @@ def test_serialize_all_element_types():
         serialized = _serialize_element(element)
         assert "type" in serialized
         assert "name" in serialized
+
+
+def test_serialize_constant_curve_params():
+    # A flat (wavelength-uniform) reflectance combiner serializes with a
+    # ConstantCurve sub-block carrying only per-mirror amplitudes — no
+    # sigma/centers (the fields a Gaussian curve would write).
+    params = CombinerParams(
+        spacings=jnp.full((9,), 1.3 * mm),
+        curves=ConstantCurve.uniform(amplitude=0.05, num_mirrors=10),
+    )
+    serialized = _serialize_combiner_params(params)
+    assert serialized["curve"]["type"] == "ConstantCurve"
+    assert len(serialized["curve"]["amplitude"]) == 10
+    assert "sigma" not in serialized["curve"]
+    assert "centers" not in serialized["curve"]
+    # Round-trips through JSON like every other serialized block.
+    json.dumps(serialized)
 
 
 # ── serialize_system ───────────────────────────────────────────────────────

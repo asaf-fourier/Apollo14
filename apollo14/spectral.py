@@ -92,3 +92,57 @@ class SumOfGaussiansCurve(NamedTuple):
             sigma=self.sigma[idx],
             centers=self.centers[idx],
         )
+
+
+class ConstantCurve(NamedTuple):
+    """Wavelength-flat reflectance::
+
+        r(λ) = amplitude        (constant across the whole spectrum)
+
+    The only optimization variable is ``amplitude`` — a single scalar
+    per mirror, with no spectral shape. Unlike :class:`SumOfGaussiansCurve`
+    there is no width or center: a flat partial reflector applies the
+    same reflectance at every wavelength, so it preserves the
+    projector's spectral shape up to a scalar (no color shift) and there
+    is nothing per-color to tune.
+
+    Shapes broadcast over leading batch dims: ``amplitude`` can be a
+    scalar ``()`` (one curve) or ``(M,)`` (a stack of M curves), and
+    :meth:`sample` returns ``(K,)`` or ``(M, K)`` accordingly — matching
+    the :class:`SumOfGaussiansCurve` protocol so it drops into
+    ``build_parametrized_system`` and ``PartialMirror`` unchanged.
+    """
+    amplitude: jnp.ndarray   # (...,) — design variable, one scalar per curve
+
+    def sample(self, wavelengths: jnp.ndarray) -> jnp.ndarray:
+        """Evaluate the flat curve at the given ``(K,)`` wavelength grid.
+
+        Returns shape ``(..., K)`` — the leading batch dims of
+        ``amplitude`` with ``K`` appended, every value equal to the
+        corresponding ``amplitude``. Differentiable w.r.t. ``amplitude``.
+        """
+        wavelengths = jnp.asarray(wavelengths)
+        amplitude = jnp.asarray(self.amplitude)
+        # Broadcast amplitude (...,) across the K wavelengths → (..., K).
+        return amplitude[..., None] * jnp.ones_like(wavelengths)
+
+    @classmethod
+    def uniform(
+        cls,
+        amplitude: float = 0.05,
+        num_mirrors: int | None = None,
+    ) -> "ConstantCurve":
+        """Construct a flat curve with the same reflectance everywhere.
+
+        If ``num_mirrors`` is given, the result is batched to shape
+        ``(num_mirrors,)`` — one flat curve per mirror, all initialized
+        to ``amplitude``.
+        """
+        if num_mirrors is None:
+            return cls(amplitude=jnp.asarray(amplitude, dtype=jnp.float32))
+        return cls(amplitude=jnp.full((num_mirrors,), amplitude,
+                                       dtype=jnp.float32))
+
+    def at(self, idx) -> "ConstantCurve":
+        """Index a single flat curve out of an ``(M,)`` batched curve."""
+        return ConstantCurve(amplitude=self.amplitude[idx])

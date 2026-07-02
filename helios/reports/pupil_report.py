@@ -120,13 +120,57 @@ def render_pupil_report(
 # ── Design-variables section ────────────────────────────────────────────────
 
 
+def _spacings_table_html(spacings_mm, init_spacings_mm, bounds: dict) -> str:
+    """Render the mirror inter-spacings table (shared across curve types)."""
+    spacing_max_mm = float(bounds.get("spacing_max_mm", float("inf")))
+    spacing_min_mm = float(bounds.get("spacing_min_mm", float("-inf")))
+    rows = ["<h3>Mirror inter-spacings</h3>"]
+    header = ("<tr><th>gap</th>"
+              + "".join(f"<th>m{i}→m{i+1}</th>" for i in range(len(spacings_mm)))
+              + "</tr>")
+    cells = []
+    for s, s_init in zip(spacings_mm, init_spacings_mm):
+        pegged = (s >= spacing_max_mm - 1e-4) or (s <= spacing_min_mm + 1e-4)
+        style = " class='pegged'" if pegged else ""
+        cells.append(f"<td{style}>{s:.3f}<br>"
+                     f"<span class='init'>({s_init:.3f})</span></td>")
+    body = "<tr><th>mm</th>" + "".join(cells) + "</tr>"
+    return (rows[0]
+            + "<table class='design-vars'>" + header + body + "</table>")
+
+
+def _flat_reflectance_table_html(curve: dict, init_curve: dict,
+                                 bounds: dict) -> str:
+    """Render the per-mirror flat (wavelength-uniform) reflectance table.
+
+    A :class:`apollo14.spectral.ConstantCurve` has one scalar reflectance
+    per mirror — no per-basis amplitudes, sigmas, or centers — so it gets
+    a single column instead of the per-Gaussian-basis grid.
+    """
+    amp = curve["amplitude"]              # (M,)
+    init_amp = init_curve["amplitude"]    # (M,)
+    amp_max = float(bounds.get("amplitude_max", float("inf")))
+    rows = ["<tr><th>mirror</th><th>reflectance</th></tr>"]
+    for mirror_idx, (value, value_init) in enumerate(zip(amp, init_amp)):
+        pegged = float(value) >= amp_max - 1e-4
+        style = " class='pegged'" if pegged else ""
+        rows.append(f"<tr><th>m{mirror_idx}</th>"
+                    f"<td{style}>{float(value):.4f}<br>"
+                    f"<span class='init'>({float(value_init):.4f})</span>"
+                    f"</td></tr>")
+    return ("<h3>Reflectance (wavelength-flat, per mirror)</h3>"
+            "<table class='design-vars'>" + "".join(rows) + "</table>")
+
+
 def _design_variables_html(opt_report: dict) -> str:
     """Render the optimization's final params + bounds as HTML tables.
 
     Reads ``optimization_report.json`` (written by
     :func:`helios.io.save_optimization_report`). All length fields in
     that file are stored in internal units (mm), so wavelengths and
-    sigmas are converted back to nm here for display.
+    sigmas are converted back to nm here for display. Dispatches on the
+    curve type so a flat :class:`ConstantCurve` (no sigma/centers) renders
+    a single per-mirror reflectance column instead of the per-basis grid.
     """
     final = opt_report["final_params"]
     initial = opt_report["initial_params"]
@@ -136,6 +180,33 @@ def _design_variables_html(opt_report: dict) -> str:
     init_spacings_mm = initial["spacings"]
     curve = final["curve"]
     init_curve = initial["curve"]
+
+    # ── Flat (wavelength-uniform) reflectance ───────────────────────────
+    if curve.get("type") == "ConstantCurve":
+        blocks = ["<h2>Design variables</h2>"]
+        blocks.append(
+            "<p class='caption'>Final parameter values from the "
+            "optimization run. Each mirror has a single wavelength-flat "
+            "reflectance (no spectral shape). Initial values are shown in "
+            "parentheses. Yellow cells are pegged at a "
+            "<code>ParamBounds</code> limit.</p>"
+        )
+        if bounds:
+            blocks.append(
+                "<table class='design-vars'>"
+                f"<tr><th>amplitude bounds</th>"
+                f"<td>{bounds.get('amplitude_min', 0):.3f} – "
+                f"{bounds.get('amplitude_max', 0):.3f}</td></tr>"
+                f"<tr><th>spacing bounds</th>"
+                f"<td>{bounds.get('spacing_min_mm', 0):.3f} – "
+                f"{bounds.get('spacing_max_mm', 0):.3f} mm</td></tr>"
+                "</table>"
+            )
+        blocks.append(_spacings_table_html(spacings_mm, init_spacings_mm, bounds))
+        blocks.append(_flat_reflectance_table_html(curve, init_curve, bounds))
+        return "\n".join(blocks)
+
+    # ── Sum-of-Gaussians (per-basis amplitude + FWHM) ───────────────────
     amp = curve["amplitude"]                  # (M, B)
     sigma = curve["sigma"]                    # (M, B), mm
     centers = curve["centers"]                # (M, B), mm
@@ -182,22 +253,7 @@ def _design_variables_html(opt_report: dict) -> str:
     amp_max = float(bounds.get("amplitude_max", float("inf")))
     fwhm_max = float(bounds.get("fwhm_max_nm", float("inf")))
 
-    # Spacings table
-    blocks.append("<h3>Mirror inter-spacings</h3>")
-    spacing_max_mm = float(bounds.get("spacing_max_mm", float("inf")))
-    spacing_min_mm = float(bounds.get("spacing_min_mm", float("-inf")))
-    rows = []
-    rows.append("<tr><th>gap</th>"
-                + "".join(f"<th>m{i}→m{i+1}</th>" for i in range(len(spacings_mm)))
-                + "</tr>")
-    cells = []
-    for i, (s, s_init) in enumerate(zip(spacings_mm, init_spacings_mm)):
-        pegged = (s >= spacing_max_mm - 1e-4) or (s <= spacing_min_mm + 1e-4)
-        style = " class='pegged'" if pegged else ""
-        cells.append(f"<td{style}>{s:.3f}<br>"
-                     f"<span class='init'>({s_init:.3f})</span></td>")
-    rows.append("<tr><th>mm</th>" + "".join(cells) + "</tr>")
-    blocks.append("<table class='design-vars'>" + "".join(rows) + "</table>")
+    blocks.append(_spacings_table_html(spacings_mm, init_spacings_mm, bounds))
 
     # Per-mirror amplitude + FWHM tables
     header = ("<tr><th>mirror</th>"
