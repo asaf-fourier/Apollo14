@@ -21,12 +21,18 @@ LED_RED = 627.0 * nm
 LED_GREEN = 545.0 * nm
 LED_BLUE = 446.0 * nm
 
-DEFAULT_WAVELENGTHS = jnp.array([LED_RED, LED_GREEN, LED_BLUE])
+# Ascending (blue→red) is REQUIRED, not cosmetic: this array is consumed
+# directly as a ``jnp.interp`` sample grid for mirror reflectance and as the
+# Δλ grid for luminance weighting — both assume ascending wavelengths and
+# silently produce wrong results on a descending grid. It also fixes the
+# color-axis order of the traced response, so ``D65_WEIGHTS`` below is kept
+# index-paired to it.
+DEFAULT_WAVELENGTHS = jnp.array([LED_BLUE, LED_GREEN, LED_RED])
 
 # D65 relative power at those wavelengths (from CIE D65 standard illuminant).
 # These are the ratios the projector must produce for white appearance.
-# Normalized so they sum to 1.
-_D65_RAW = jnp.array([81.8, 101.0, 104.0])  # D65 at 627/545/446 nm
+# Index-paired to DEFAULT_WAVELENGTHS (446/545/627 nm). Normalized to sum 1.
+_D65_RAW = jnp.array([104.0, 101.0, 81.8])  # D65 at 446/545/627 nm
 D65_WEIGHTS = _D65_RAW / _D65_RAW.sum()
 
 

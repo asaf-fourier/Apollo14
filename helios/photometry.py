@@ -93,7 +93,10 @@ def luminance_weights(wavelengths: jnp.ndarray,
             raise ValueError(
                 "Cannot infer Δλ from a single wavelength — pass delta_nm.")
         diffs_nm = jnp.diff(wavelengths) / nm
-        delta_nm = float(jnp.mean(diffs_nm))
+        # abs(): Δλ is a spacing *magnitude* for the Riemann sum. Without it a
+        # descending wavelength grid gives a negative Δλ and silently negates
+        # every weight — turning luminance negative with no error.
+        delta_nm = abs(float(jnp.mean(diffs_nm)))
     return K_M * photopic_v(wavelengths) * delta_nm
 
 
@@ -136,7 +139,8 @@ def luminance_weights_np(wavelengths_nm: np.ndarray,
         if wavelengths_nm.shape[0] < 2:
             raise ValueError(
                 "Cannot infer Δλ from a single wavelength — pass delta_nm.")
-        delta_nm = float(np.mean(np.diff(wavelengths_nm)))
+        # abs(): see luminance_weights — a descending grid must not flip sign.
+        delta_nm = abs(float(np.mean(np.diff(wavelengths_nm))))
     return K_M * photopic_v_np(wavelengths_nm) * delta_nm
 
 

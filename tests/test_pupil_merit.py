@@ -71,7 +71,10 @@ class TestTargetTerm:
         cfg = _cfg(weight_target=1.0, target_relative=0.05)
         below = pupil_merit(_ideal_response(brightness=0.04), 1.0, cfg)
         above = pupil_merit(_ideal_response(brightness=0.06), 1.0, cfg)
-        assert abs(float(below) - float(above)) < 1e-8
+        # Symmetric in exact arithmetic; the residual is float32 rounding of
+        # sum(D65_WEIGHTS) ≠ 1, amplified ~400× by the /target² (0.05²)
+        # normalization — a few ×1e-8, so 1e-6 is still a strong symmetry check.
+        assert abs(float(below) - float(above)) < 1e-6
 
     def test_grows_quadratically_with_deviation(self):
         cfg = _cfg(weight_target=1.0, target_relative=0.05)
