@@ -145,6 +145,23 @@ def _derive_chassis_geometry(chassis_z: float) -> _ChassisGeometry:
 _DEFAULT_GEOMETRY = _derive_chassis_geometry(CHASSIS_Z)
 CHASSIS_CENTER = _DEFAULT_GEOMETRY.chassis_center
 
+# Largest y-footprint the mirror stack may span while every mirror stays fully
+# inside the chassis: the drop from mirror_0's center down to the chassis
+# bottom face, less one mirror half-height so the last mirror's lower edge
+# doesn't poke through. ``mirror_half_height_y`` is recovered from the default
+# geometry (mirror_0 center sits one half-height below its top corner at
+# CHASSIS_CENTER_Y + FIRST_MIRROR_OFFSET_Y). Evaluated at the default
+# thickness — a thinner chassis has shorter mirrors (more room), so this is a
+# safe, never-too-loose budget for any thickness ≤ CHASSIS_Z. A *thicker*
+# chassis would need a smaller budget: override ParamBounds.chassis_usable_mm.
+_MIRROR_HALF_HEIGHT_Y = float(
+    CHASSIS_CENTER[1] + FIRST_MIRROR_OFFSET_Y
+    - _DEFAULT_GEOMETRY.first_mirror_pos[1])
+USABLE_STACK_Y_MM = (
+    float(_DEFAULT_GEOMETRY.first_mirror_pos[1])
+    - (float(CHASSIS_CENTER[1]) - CHASSIS_Y / 2.0)
+    - _MIRROR_HALF_HEIGHT_Y) / mm
+
 
 # ── Design variables ────────────────────────────────────────────────────────
 
@@ -213,8 +230,9 @@ class ParamBounds:
     """Hard bounds for post-step clipping.
 
     Not a reparametrization — the optimizer sees raw values and we clip
-    after each Adam step to keep the design physical. The chassis is
-    ``chassis_y = 20 mm``; the sum of spacings must fit inside it.
+    after each Adam step to keep the design physical. ``chassis_usable_mm``
+    caps the mirror stack's *y-footprint* (see :data:`USABLE_STACK_Y_MM`)
+    so the last mirror stays inside the chassis.
 
     Width bounds are given as FWHM (nm); ``params.curves.sigma`` stores σ.
     Bounds are specific to :class:`SumOfGaussiansCurve`; a different
@@ -226,16 +244,22 @@ class ParamBounds:
     amplitude_max: float = 0.20
     fwhm_min_nm: float = 20.0
     fwhm_max_nm: float = 50.0
-    chassis_usable_mm: float = 18.0  # margin below 20 mm
+    chassis_usable_mm: float = USABLE_STACK_Y_MM  # mirror-stack y-footprint cap
 
     def clip(self, params: CombinerParams) -> CombinerParams:
         clipped_spacings = jnp.clip(params.spacings,
                                     self.spacing_min_mm * mm,
                                     self.spacing_max_mm * mm)
-        total_spacing = jnp.sum(clipped_spacings)
+        # ``spacings`` are perpendicular mirror-plane gaps; each projects onto
+        # the chassis y-axis by 1/sin(_NORMAL_ANGLE), so the stack's real
+        # y-footprint is sum(spacings)/sin(_NORMAL_ANGLE). Bound *that* against
+        # the usable y-budget — bounding the raw sum (as before) undercounts
+        # the footprint by 1/sin ≈ 1.5× and lets the last mirror slide out the
+        # bottom of the chassis.
+        stack_y_extent = jnp.sum(clipped_spacings) / math.sin(_NORMAL_ANGLE)
         usable_length = self.chassis_usable_mm * mm
-        rescale = jnp.where(total_spacing > usable_length,
-                            usable_length / total_spacing, 1.0)
+        rescale = jnp.where(stack_y_extent > usable_length,
+                            usable_length / stack_y_extent, 1.0)
         clipped_spacings = clipped_spacings * rescale
         sigma_min = fwhm_to_sigma(self.fwhm_min_nm * nm)
         sigma_max = fwhm_to_sigma(self.fwhm_max_nm * nm)

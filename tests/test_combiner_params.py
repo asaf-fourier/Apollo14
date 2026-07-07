@@ -291,9 +291,12 @@ class TestParamBounds:
         assert float(jnp.max(clipped.spacings)) <= bounds.spacing_max_mm * mm + eps_mm
 
     def test_total_spacing_rescaled_when_too_long(self):
-        """5 spacings × 3 mm = 15 mm fits, but 5 × 4 mm = 20 mm exceeds the
-        18 mm usable length. After per-element clip both cases hit 3 mm,
-        and only the second triggers the rescale."""
+        """5 × 4 mm = 20 mm of perpendicular spacing projects to a ~29.9 mm
+        y-footprint, well past the 18 mm usable budget, so the rescale kicks
+        in. The enforced invariant is on the *y-footprint* (sum / sin θ), not
+        the raw perpendicular sum — that's the frame the clip now uses."""
+        import math
+        from helios.combiner_params import _NORMAL_ANGLE
         bounds = ParamBounds(chassis_usable_mm=18.0,
                              spacing_min_mm=0.5, spacing_max_mm=4.0)
         too_long = CombinerParams(
@@ -301,7 +304,8 @@ class TestParamBounds:
             curves=_curves_with(amplitude=0.05, sigma=20.0 * nm),
         )
         clipped = bounds.clip(too_long)
-        assert float(jnp.sum(clipped.spacings)) <= bounds.chassis_usable_mm * mm + 1e-6
+        y_footprint = float(jnp.sum(clipped.spacings)) / math.sin(_NORMAL_ANGLE)
+        assert y_footprint <= bounds.chassis_usable_mm * mm + 1e-6
 
     def test_no_rescale_when_total_within_budget(self):
         bounds = ParamBounds(chassis_usable_mm=18.0)

@@ -1,17 +1,17 @@
 """Lock the configuration of the flat-reflectance pupil optimizer driver."""
 
 
-def test_ten_flat_mirrors_at_fixed_spacing():
+def test_eight_flat_mirrors_at_fixed_spacing():
     # Importing the example builds a small reference system at module load,
     # so do it lazily — it shouldn't slow collection of the rest of the suite.
     import examples.optimize_pupil_flat as ex
     from apollo14.elements.partial_mirror import PartialMirror
 
-    # 10 mirrors, flat (wavelength-uniform) reflectance.
-    assert ex.NUM_MIRRORS == 10
+    # 8 mirrors, flat (wavelength-uniform) reflectance.
+    assert ex.NUM_MIRRORS == 8
     mirrors = [e for e in ex._ref_system.elements
                if isinstance(e, PartialMirror)]
-    assert len(mirrors) == 10
+    assert len(mirrors) == 8
 
     # Every mirror's sampled reflectance is constant across the spectrum —
     # the defining property of the flat curve (no per-wavelength shape).
