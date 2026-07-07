@@ -80,6 +80,12 @@ EYEBOX_NX, EYEBOX_NY = 8, 10     # 80 cells, exactly 1×1 mm each (cell-centered
 X_FOV = 8.0 * deg
 Y_FOV = 8.0 * deg
 
+# Glass thickness for this run. The library default is the canonical Talos
+# 2.0 mm (helios.combiner_params.CHASSIS_Z); this example targets a thinner
+# 1.7 mm combiner, so it overrides it explicitly on every build below. The
+# shared PUPIL_OFFSET_Y in combiner_params is tuned for this thickness.
+CHASSIS_Z_MM = 1.7
+
 # ── Single broadband projector (panel's calibrated white) ─────────────────
 
 PROJECTOR_NX, PROJECTOR_NY = 25, 5
@@ -207,7 +213,8 @@ KERNEL_SIZE_CELLS = 3
 PADDING_CELLS = KERNEL_SIZE_CELLS // 2
 
 _ref_system = build_parametrized_system(
-    CombinerParams.initial(), probe_wavelengths=TRACE_WAVELENGTHS)
+    CombinerParams.initial(), probe_wavelengths=TRACE_WAVELENGTHS,
+    chassis_z=CHASSIS_Z_MM * mm)
 _pupil = next(e for e in _ref_system.elements if isinstance(e, RectangularPupil))
 
 # Cell-centered convention: NX × NY cells of equal size exactly tile
@@ -286,7 +293,8 @@ def _compute_spectral_response(params: CombinerParams) -> jnp.ndarray:
     and the report both expect.
     """
     system = build_parametrized_system(
-        params, probe_wavelengths=TRACE_WAVELENGTHS)
+        params, probe_wavelengths=TRACE_WAVELENGTHS,
+        chassis_z=CHASSIS_Z_MM * mm)
     branch_routes = build_combiner_branch_routes(
         system, num_mirrors=NUM_MIRRORS,
     )
@@ -535,7 +543,8 @@ def main():
           f"std={float(relative_brightness.std()):.5f}")
 
     final_system = build_parametrized_system(
-        params, probe_wavelengths=TRACE_WAVELENGTHS)
+        params, probe_wavelengths=TRACE_WAVELENGTHS,
+        chassis_z=CHASSIS_Z_MM * mm)
     report_path = save_optimization_report(
         run_dir,
         system=final_system,

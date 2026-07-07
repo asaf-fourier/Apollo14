@@ -74,7 +74,10 @@ from helios.merit import DEFAULT_WAVELENGTHS
 NUM_MIRRORS = 6
 CHASSIS_X = 14.0 * mm
 CHASSIS_Y = 20.0 * mm
-CHASSIS_Z = 1.7 * mm              # default glass thickness (z); per-build override
+CHASSIS_Z = 2.0 * mm              # canonical Talos glass thickness (z); matches
+                                 # apollo14.combiner.build_default_system. Pass
+                                 # ``chassis_z=`` to build_parametrized_system to
+                                 # override per build (e.g. a thinner combiner).
 SKEW_ANGLE = 6.0 * deg
 MIRROR_ANGLE = 48.0 * deg
 EYE_RELIEF = 15.0 * mm
