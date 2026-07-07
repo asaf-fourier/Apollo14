@@ -238,3 +238,56 @@ def chromaticity_xy_np(spectrum: np.ndarray,
     xy = np.where(safe, xyz[..., :2] / np.maximum(total, 1e-30),
                   np.array(D65_WHITE_POINT_XY))
     return xy
+
+
+def d65_primary_ratios(wavelengths: np.ndarray,
+                       white_point_xy: tuple = D65_WHITE_POINT_XY) -> np.ndarray:
+    """Radiance ratios of N=3 narrow primaries that mix to a target white.
+
+    For a *few-primary* display (a set of narrow R/G/B lines) the correct
+    white-balance target is **not** the reference SPD's power at each primary
+    wavelength — that's unrelated to how the primaries mix. What produces the
+    target white is the set of per-primary *radiances* whose additive
+    tristimulus sum has the target chromaticity::
+
+        Σ_i  w_i · [x̄(λ_i), ȳ(λ_i), z̄(λ_i)]  ∝  XYZ_white
+
+    This solves that 3×3 system for ``w`` and returns it normalized to sum 1
+    (a radiance simplex), so it drops straight into the merit's ``d65_weights``
+    (which are radiance-space channel fractions).
+
+    Args:
+        wavelengths: ``(3,)`` primary wavelengths in internal length units
+            (so ``446 * nm`` is deep blue). Exactly three are required — the
+            tristimulus matrix must be square/invertible. For a *dense* grid
+            reproducing the reference SPD shape is already correct; use
+            :func:`helios.merit.d65_weights_at` there instead.
+        white_point_xy: target chromaticity ``(x, y)``; defaults to D65.
+
+    Returns:
+        ``(3,)`` non-negative radiance weights summing to 1, index-paired to
+        ``wavelengths``.
+
+    Raises:
+        ValueError: if not exactly three primaries are given, or if the target
+            white lies outside their gamut (a solved weight comes out negative
+            — that white is physically unreachable with these primaries).
+    """
+    wavelengths_nm = np.asarray(wavelengths, dtype=float) / nm
+    if wavelengths_nm.shape != (3,):
+        raise ValueError(
+            f"Need exactly 3 primaries to solve the tristimulus system, got "
+            f"{wavelengths_nm.shape}. Use d65_weights_at for a dense grid.")
+    # Column i = the tristimulus of a unit-radiance primary at λ_i. Feeding an
+    # identity "spectrum" through the CMFs yields each primary's (X, Y, Z).
+    primary_xyz = cie1931_xyz_np(np.eye(3), wavelengths_nm)   # (3, 3), row = primary
+    tristimulus_matrix = primary_xyz.T                        # (3, 3), col = primary
+    x, y = white_point_xy
+    white_xyz = np.array([x / y, 1.0, (1.0 - x - y) / y])
+    weights = np.linalg.solve(tristimulus_matrix, white_xyz)
+    if np.any(weights < 0):
+        raise ValueError(
+            f"Target white {white_point_xy} is outside the gamut of primaries "
+            f"{list(np.asarray(wavelengths) / nm)} nm (negative weight "
+            f"{weights}); it cannot be reproduced by an additive mix.")
+    return weights / weights.sum()

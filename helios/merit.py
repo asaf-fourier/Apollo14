@@ -14,6 +14,7 @@ from apollo14.route import Route, absorb, branch_path, build_route
 from apollo14.system import OpticalSystem
 from apollo14.trace import prepare_route
 from apollo14.units import nm
+from helios.photometry import d65_primary_ratios
 
 # ── PlayNitride microLED peak wavelengths ─────────────────────────────────────
 
@@ -29,11 +30,14 @@ LED_BLUE = 446.0 * nm
 # index-paired to it.
 DEFAULT_WAVELENGTHS = jnp.array([LED_BLUE, LED_GREEN, LED_RED])
 
-# D65 relative power at those wavelengths (from CIE D65 standard illuminant).
-# These are the ratios the projector must produce for white appearance.
-# Index-paired to DEFAULT_WAVELENGTHS (446/545/627 nm). Normalized to sum 1.
-_D65_RAW = jnp.array([104.0, 101.0, 81.8])  # D65 at 446/545/627 nm
-D65_WEIGHTS = _D65_RAW / _D65_RAW.sum()
+# D65 white-balance target: the per-primary *radiance* ratios whose additive
+# mix lands on the D65 white point, from the CMF tristimulus solution (see
+# helios.photometry.d65_primary_ratios). This is the colorimetrically correct
+# target for a 3-primary display — NOT the D65 SPD's power sampled at each
+# primary (the old ``[104, 101, 81.8]``), which is unrelated to how the
+# primaries mix. Index-paired to DEFAULT_WAVELENGTHS; a radiance simplex
+# (sums to 1), which is exactly what the merit's ``d65_weights`` expects.
+D65_WEIGHTS = jnp.asarray(d65_primary_ratios(DEFAULT_WAVELENGTHS))
 
 
 # ── CIE D65 standard illuminant (5 nm intervals, 400–700 nm) ────────────────

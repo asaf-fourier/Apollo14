@@ -31,8 +31,12 @@ class TestShapeTerm:
         assert float(pupil_merit(response, 1.0, cfg)) < 1e-6
 
     def test_positive_when_channels_not_d65(self):
+        # A pure single-channel (all-blue) response is maximally far from any
+        # D65 radiance split, so the shape term is unambiguously positive.
+        # Robust to the exact D65 ratios — unlike a channel reversal, which is
+        # near-identity when blue/red happen to carry similar weight.
         ideal = _ideal_response(brightness=0.2)
-        broken = ideal[..., [2, 1, 0]]
+        broken = jnp.zeros_like(ideal).at[..., 0].set(0.2)
         cfg = _cfg(weight_shape=1.0)
         assert float(pupil_merit(broken, 1.0, cfg)) > 1e-3
 
