@@ -84,11 +84,10 @@ EYE_RELIEF = 15.0 * mm
 FIRST_MIRROR_OFFSET_Y = 5.0 * mm
 
 # Pupil center, expressed as offsets from the chassis center.
-# ``PUPIL_OFFSET_Y`` was originally hand-tuned at -2 mm to roughly center
-# the pupil under where light lands after the chassis-skew shift; the
-# precise value is best refined by running ``examples/jax_tracer_demo.py``,
-# which probes the FOV-averaged light centroid at the pupil plane and
-# prints the recommended PUPIL_OFFSET_X / Y to paste here.
+# ``PUPIL_OFFSET_Y`` is hand-tuned to roughly center the pupil under where
+# light lands after the chassis-skew shift. To refine it, trace the design
+# and compute the FOV-averaged light centroid at the pupil plane, then set
+# the offsets so the pupil sits on that centroid.
 PUPIL_OFFSET_X = 0.0 * mm
 PUPIL_OFFSET_Y = -2.38 * mm
 
@@ -139,9 +138,9 @@ def _derive_chassis_geometry(chassis_z: float) -> _ChassisGeometry:
     )
 
 
-# Default-thickness geometry. ``CHASSIS_CENTER`` stays a module constant
-# because ``examples/jax_tracer_demo.py`` imports it (its x/y recenter the
-# pupil — both z-independent).
+# Default-thickness geometry. ``CHASSIS_CENTER`` is a module constant reused
+# below for the usable-stack-height budget and the pupil placement (its x/y
+# are z-independent).
 _DEFAULT_GEOMETRY = _derive_chassis_geometry(CHASSIS_Z)
 CHASSIS_CENTER = _DEFAULT_GEOMETRY.chassis_center
 
@@ -372,9 +371,8 @@ def build_parametrized_system(
 
     # Pupil — sized 14×18 mm (vs eyebox 8×10 mm) so there's slack for the
     # ``PUPIL_OFFSET_X / Y`` recentering without clipping rays at the
-    # aperture. Center is at ``CHASSIS_CENTER`` shifted by the offsets;
-    # update the offsets in this module after running
-    # ``examples/jax_tracer_demo.py``'s centroid probe.
+    # aperture. Center is at ``CHASSIS_CENTER`` shifted by the offsets
+    # (defined at the top of this module).
     system.add(RectangularPupil(
         name="pupil",
         position=jnp.array([

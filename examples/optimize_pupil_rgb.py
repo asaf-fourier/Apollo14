@@ -1,15 +1,14 @@
 """Pupil optimization driver — single broadband W projector with a
 threshold-based wavelength sampling and a spectrum-preserving merit.
 
-How this differs from :mod:`examples.optimize_pupil`
-----------------------------------------------------
-The original broadband driver compared the per-wavelength response to a
-*continuous D65 reference SPD*. That target is unsatisfiable for a 3-band
-micro-LED whose W spectrum has deep valleys between R/G/B peaks: the merit
-penalizes the design for not emitting at wavelengths the projector itself
-can't supply, and phase 2 plateaus at ~0.5.
+Shape target: preserve the spectrum, don't chase continuous D65
+---------------------------------------------------------------
+Comparing the per-wavelength response to a *continuous D65 reference SPD*
+is unsatisfiable for a 3-band micro-LED whose W spectrum has deep valleys
+between R/G/B peaks: the merit penalizes the design for not emitting at
+wavelengths the projector itself can't supply, and the shape term plateaus.
 
-This driver fixes that by changing the merit's shape target. Instead of
+This driver avoids that by changing the merit's shape target. Instead of
 "deliver D65", it asks the design to "preserve the projector's spectrum"
 — i.e. ``response(s, a, λ) ∝ W(λ)`` at every (cell, FOV). Since the
 panel's W column **is** the manufacturer's calibrated D65 white, matching
