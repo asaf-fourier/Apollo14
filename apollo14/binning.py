@@ -78,6 +78,93 @@ def bin_hits_soft(trace_result: TraceResult, grid_points, sigma):
     return jnp.sum(weighted, axis=0)                           # (S,)
 
 
+class SampleLattice(NamedTuple):
+    """A regular, cell-centered 2-D sample grid on a plane.
+
+    Unlike a flat ``(S, 3)`` point cloud, this carries the lattice structure
+    (frame + pitch) that :func:`bin_hits_bilinear` needs to map a ray's hit
+    to fractional cell coordinates. The grid spans ``[-half_x, half_x] ×
+    [-half_y, half_y]`` in ``(local_x, local_y)`` as ``nx × ny`` equal cells,
+    with cell centers at ``-half + pitch·(i + ½)`` — matching
+    :func:`apollo14.geometry.planar_grid_points` with ``cell_centered=True``,
+    so the flattened output aligns index-for-index with that grid.
+    """
+    center: jnp.ndarray    # (3,) grid center (world)
+    local_x: jnp.ndarray   # (3,) unit in-plane axis
+    local_y: jnp.ndarray   # (3,) unit in-plane axis
+    half_x: float          # half-extent along local_x
+    half_y: float          # half-extent along local_y
+    nx: int
+    ny: int
+
+
+def make_sample_lattice(center, normal, half_x, half_y, nx, ny) -> SampleLattice:
+    """Build a :class:`SampleLattice` whose frame matches ``planar_grid_points``.
+
+    Uses the same :func:`compute_local_axes` as ``planar_grid_points`` so a
+    ``bin_hits_bilinear`` result lines up cell-for-cell with the flattened
+    ``planar_grid_points(center, normal, half_x, half_y, nx, ny,
+    cell_centered=True)`` a caller bins against elsewhere.
+    """
+    local_x, local_y = compute_local_axes(jnp.asarray(normal, dtype=jnp.float32))
+    return SampleLattice(
+        center=jnp.asarray(center, dtype=jnp.float32),
+        local_x=local_x, local_y=local_y,
+        half_x=float(half_x), half_y=float(half_y), nx=int(nx), ny=int(ny))
+
+
+def bin_hits_bilinear(trace_result: TraceResult,
+                      lattice: SampleLattice) -> jnp.ndarray:
+    """Bilinear (tent-kernel) splat of ray exit hits onto ``lattice``.
+
+    A faithful, differentiable *deposit*: each ray's hit is projected onto the
+    lattice plane and its intensity is spread to the (up to) four surrounding
+    cell centers by the separable linear-B-spline weights
+    ``max(0, 1 − |frac_index − i|)``. Properties that fix ``bin_hits_soft``'s
+    softmax:
+
+    * **Distance-limited.** The tent has ±1-cell support, so weight *fades*
+      with distance instead of being renormalized back to 1. A ray landing
+      well outside the lattice (beyond any evaluated pupil's reach) deposits
+      ≈ 0 — off-grid weight simply has no cell to land on. No more dumping a
+      far ray's full intensity onto the nearest edge cell.
+    * **Energy-conserving for in-grid rays.** The tent weights are a partition
+      of unity, so a ray strictly inside the lattice deposits exactly its
+      intensity (same total as softmax gave every ray) — only the spurious
+      out-of-grid credit is removed.
+    * **Differentiable w.r.t. ray position.** Piecewise-linear in the hit
+      coordinate, so gradients still flow ``spacing → mirror pos → hit → cell``
+      for spacing optimization (the reason soft binning existed).
+
+    Returns ``(ny*nx,)`` in row-major ``(iy, ix)`` order — index ``iy*nx + ix``
+    — matching ``planar_grid_points``.
+    """
+    pts_flat, ints_flat, valid_flat = _ray_final(trace_result)
+
+    delta = pts_flat - lattice.center[None, :]                     # (R, 3)
+    coord_x = delta @ lattice.local_x                              # (R,) along x
+    coord_y = delta @ lattice.local_y                              # (R,) along y
+
+    pitch_x = 2.0 * lattice.half_x / lattice.nx
+    pitch_y = 2.0 * lattice.half_y / lattice.ny
+    # Fractional cell-center index: cell i center sits at -half + pitch·(i+½).
+    frac_x = (coord_x + lattice.half_x) / pitch_x - 0.5            # (R,)
+    frac_y = (coord_y + lattice.half_y) / pitch_y - 0.5
+
+    cells_x = jnp.arange(lattice.nx)                               # (nx,)
+    cells_y = jnp.arange(lattice.ny)                               # (ny,)
+    weight_x = jnp.clip(1.0 - jnp.abs(frac_x[:, None] - cells_x[None, :]),
+                        0.0, 1.0)                                  # (R, nx)
+    weight_y = jnp.clip(1.0 - jnp.abs(frac_y[:, None] - cells_y[None, :]),
+                        0.0, 1.0)                                  # (R, ny)
+
+    # Per-ray (ny, nx) separable weight, gated by ray validity and intensity.
+    weight = weight_y[:, :, None] * weight_x[:, None, :]           # (R, ny, nx)
+    contribution = jnp.where(valid_flat[:, None, None],
+                             ints_flat[:, None, None] * weight, 0.0)
+    return jnp.sum(contribution, axis=0).reshape(-1)               # (ny*nx,)
+
+
 class PupilGrid(NamedTuple):
     """Precomputed pupil-plane binning grid.
 

@@ -46,6 +46,7 @@ from apollo14.combiner import (
      compensated_reflectances,
 )
 from apollo14.elements.pupil import RectangularPupil
+from apollo14.binning import make_sample_lattice
 from apollo14.geometry import planar_grid_points
 from apollo14.projector import PlayNitrideLed, FovGrid
 from apollo14.spectral import SumOfGaussiansCurve
@@ -239,6 +240,11 @@ EYEBOX_POINTS = planar_grid_points(
     SAMPLE_HALF_X, SAMPLE_HALF_Y, SAMPLE_NX, SAMPLE_NY,
     cell_centered=True,
 )   # (SAMPLE_NX * SAMPLE_NY, 3)
+# Same grid, but as a structured lattice for the differentiable bilinear
+# splat (bin_hits_bilinear). Aligned index-for-index with EYEBOX_POINTS.
+SAMPLE_LATTICE = make_sample_lattice(
+    _pupil.position, _pupil.normal,
+    SAMPLE_HALF_X, SAMPLE_HALF_Y, SAMPLE_NX, SAMPLE_NY)
 # Exclude the 4 corner cells from the merit — geometric coverage at the
 # extreme corners drops below what the optimizer can equalize, so weighting
 # them in pulls the whole design down toward a worse compromise.
@@ -249,10 +255,12 @@ _cell_mask_2d = _cell_mask_2d.at[-1, 0].set(0.0)
 _cell_mask_2d = _cell_mask_2d.at[-1, -1].set(0.0)
 CELL_MASK = _cell_mask_2d.reshape(-1)
 
-# σ ≈ ½ the smaller fine-cell pitch — for soft binning, when used. With
-# the moving-window aggregation in place soft binning is redundant for
-# spatial smoothness, but it's still the only path to spacing gradients.
-BINNING_SIGMA = 0.5 * min(_CELL_PITCH_X, _CELL_PITCH_Y)
+# Spacing gradients flow through the differentiable bilinear splat
+# (SAMPLE_LATTICE + bin_hits_bilinear). Unlike the old softmax soft binning,
+# it's distance-limited: light landing beyond the padded sample grid — i.e.
+# beyond any eyebox pupil's reach — fades to zero instead of being credited
+# to the nearest edge cell. Light a real edge-positioned pupil *does* collect
+# lands inside the padding and is still counted (via the window convolution).
 
 
 def _window_mean(arr: jnp.ndarray, ny: int, nx: int,
@@ -307,7 +315,7 @@ def _compute_spectral_response(params: CombinerParams) -> jnp.ndarray:
             binned = binned + trace_branch_over_fov(
                 prepared, PROJECTOR, EYEBOX_POINTS, wavelength,
                 directions,
-                sigma=BINNING_SIGMA if OPTIMIZE_SPACINGS else None,
+                lattice=SAMPLE_LATTICE if OPTIMIZE_SPACINGS else None,
                 vmap_directions=True)  # (A, S_sample); A=64 fits comfortably
         # (S_sample, A) → moving-window mean → (S_eyebox, A). Windowing
         # *inside* the scan body keeps the per-iteration activation tape

@@ -8,7 +8,11 @@ tensor. Fully differentiable — gradients flow through intensity values.
 import jax
 import jax.numpy as jnp
 
-from apollo14.binning import bin_hits_soft, bin_hits_to_nearest
+from apollo14.binning import (
+    bin_hits_bilinear,
+    bin_hits_soft,
+    bin_hits_to_nearest,
+)
 from apollo14.geometry import planar_grid_points
 from apollo14.trace import trace_rays
 from helios.merit import DEFAULT_WAVELENGTHS
@@ -23,12 +27,23 @@ def eyebox_grid_points(center, normal, radius, nx, ny):
 # ── Response computation ────────────────────────────────────────────────────
 
 def trace_branch_over_fov(route, projector, eyebox_points, wavelength,
-                          directions, sigma=None,
+                          directions, sigma=None, lattice=None,
                           *, vmap_directions: bool = False):
     """Trace one branch route across all FOV directions.
 
     Returns ``(A, S)`` binned intensity at each eyebox sample for each
     FOV direction.
+
+    Binning strategy (first match wins):
+
+    * ``lattice`` (a :class:`apollo14.binning.SampleLattice`) — differentiable
+      **bilinear splat**. Distance-limited (out-of-grid rays fade to ~0
+      instead of being dumped on the edge) and energy-conserving for in-grid
+      rays, while still passing position gradients for spacing optimization.
+      Preferred over ``sigma`` — see :func:`apollo14.binning.bin_hits_bilinear`.
+    * ``sigma`` — legacy softmax soft binning (``bin_hits_soft``). Kept for
+      back-compat; over-credits rays landing outside ``eyebox_points``.
+    * neither — hard nearest-neighbor binning with ``stop_gradient``.
 
     Iteration over directions is configurable:
 
@@ -50,6 +65,8 @@ def trace_branch_over_fov(route, projector, eyebox_points, wavelength,
         ray = projector.generate_rays(direction=direction,
                                       wavelength=wavelength)
         traced = trace_rays(route, ray, wavelength=wavelength)
+        if lattice is not None:
+            return bin_hits_bilinear(traced, lattice)
         if sigma is not None:
             return bin_hits_soft(traced, eyebox_points, sigma)
         return bin_hits_to_nearest(traced, eyebox_points, stop_grad=True)
