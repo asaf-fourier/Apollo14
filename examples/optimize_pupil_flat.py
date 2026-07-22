@@ -1,4 +1,4 @@
-"""Pupil optimization driver — 10 flat (wavelength-uniform) mirrors at
+"""Pupil optimization driver — 8 flat (wavelength-uniform) mirrors at
 fixed spacing.
 
 How this differs from :mod:`examples.optimize_pupil_rgb`
@@ -10,10 +10,10 @@ the pupil and reshape the geometry.
 
 This driver is the deliberately simpler case:
 
-- **10 mirrors** instead of 6.
+- **8 mirrors** instead of 6.
 - **Flat reflectance** — each mirror is a :class:`ConstantCurve`, a
-  single wavelength-uniform scalar (think "5% across the whole
-  spectrum"), not a Gaussian. The only design variables are the 10
+  single wavelength-uniform scalar (think "a few % across the whole
+  spectrum"), not a Gaussian. The only design variables are the 8
   per-mirror reflectance levels.
 - **Fixed geometry** — the inter-mirror spacing is frozen at
   ``FIXED_SPACING_MM``; it is never a design variable, so hard
@@ -68,20 +68,27 @@ from helios.jax_cache import enable_jax_compilation_cache
 enable_jax_compilation_cache()
 
 # ── Combiner geometry (this driver overrides the 6-mirror default) ──────────
-# The spacing is fixed for the whole run — it is *not* a design variable.
-# 10 mirrors × 9 gaps × 1.3 mm = 11.7 mm, comfortably inside the chassis's
-# ~18 mm usable length.
+# The spacing is fixed for the whole run — it is *not* a design variable, so
+# it must fit the chassis on its own (this driver does not call bounds.clip on
+# spacings). The mirror-stack y-footprint is sum(spacings)/sin(_NORMAL_ANGLE):
+# 8 mirrors × 7 gaps × 0.93 mm ÷ sin(42°) ≈ 9.7 mm, comfortably inside the
+# ~13 mm usable stack height (see helios.combiner_params.USABLE_STACK_Y_MM).
+# 0.93 mm keeps the same stack extent as the reference 6-mirror design
+# (5 × 1.3 mm ÷ 7 gaps).
 
 NUM_MIRRORS = 8
-FIXED_SPACING_MM = 1.3
-BASE_RATIO = 0.05  # nominal per-mirror reflected fraction of the original beam
+FIXED_SPACING_MM = 0.93
+# Per-mirror reflected fraction of the original beam, scaled with the mirror
+# count so total picked-off light matches the 6-mirror reference: 0.05·6/8.
+BASE_RATIO = 0.05 * 6 / NUM_MIRRORS
 
 # Chassis glass thickness (z). Thinner glass shrinks the mirror height
 # (∝ chassis_z / cos θ) and the whole combiner cross-section — sweep this to
 # see how thin the combiner can get while still hitting the eyebox target.
 # Threaded into every ``build_parametrized_system`` call below; the pupil stays
-# at a constant eye relief from the (moving) front face. Default 1.7 mm matches
-# ``helios.combiner_params.CHASSIS_Z``.
+# at a constant eye relief from the (moving) front face. This driver targets a
+# thinner 1.7 mm combiner; the library default is the canonical 2.0 mm
+# (``helios.combiner_params.CHASSIS_Z``).
 CHASSIS_Z_MM = 1.7
 
 # ── Eyebox target region (pre-defined, fixed) ───────────────────────────────

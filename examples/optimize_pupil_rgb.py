@@ -51,7 +51,7 @@ from apollo14.projector import PlayNitrideLed, FovGrid
 from apollo14.spectral import SumOfGaussiansCurve
 
 from helios.combiner_params import (
-    CombinerParams, ParamBounds, build_parametrized_system, NUM_MIRRORS,
+    CombinerParams, ParamBounds, build_parametrized_system,
     fwhm_to_sigma,
 )
 from apollo14.trace import prepare_route
@@ -85,6 +85,12 @@ Y_FOV = 8.0 * deg
 # 1.7 mm combiner, so it overrides it explicitly on every build below. The
 # shared PUPIL_OFFSET_Y in combiner_params is tuned for this thickness.
 CHASSIS_Z_MM = 1.7
+
+# Mirror count (local override of the library's 6-mirror default). The seed
+# spacing and per-mirror reflectance below are scaled to this count so the
+# 8 mirrors span the same stack region as the reference 6-mirror design and
+# still deliver the same total light to the eye.
+NUM_MIRRORS = 8
 
 # ── Single broadband projector (panel's calibrated white) ─────────────────
 
@@ -179,7 +185,7 @@ merit_cfg_phase2 = PupilMeritConfig(
     asymmetric_target=False,
 )
 
-bounds = ParamBounds(amplitude_max=0.20, fwhm_max_nm=200, fwhm_min_nm=10)
+bounds = ParamBounds(amplitude_max=0.25, fwhm_max_nm=15, fwhm_min_nm=5)
 
 # True: mirror inter-spacing is a design variable. The tracer switches to
 # soft Gaussian binning so position gradients flow through the chain
@@ -213,8 +219,8 @@ KERNEL_SIZE_CELLS = 3
 PADDING_CELLS = KERNEL_SIZE_CELLS // 2
 
 _ref_system = build_parametrized_system(
-    CombinerParams.initial(), probe_wavelengths=TRACE_WAVELENGTHS,
-    chassis_z=CHASSIS_Z_MM * mm)
+    CombinerParams.initial(num_mirrors=NUM_MIRRORS),
+    probe_wavelengths=TRACE_WAVELENGTHS, chassis_z=CHASSIS_Z_MM * mm)
 _pupil = next(e for e in _ref_system.elements if isinstance(e, RectangularPupil))
 
 # Cell-centered convention: NX × NY cells of equal size exactly tile
@@ -361,8 +367,8 @@ def _mask_frozen(grad: CombinerParams) -> CombinerParams:
 
 # ── Adam optimizer ──────────────────────────────────────────────────────────
 
-PHASE1_STEPS = 200
-PHASE2_STEPS = 300
+PHASE1_STEPS = 100
+PHASE2_STEPS = 100
 
 adam_cfg_phase1 = AdamConfig(peak_lr=3e-3, warmup_steps=20, num_steps=PHASE1_STEPS)
 # Phase 2 enters with the target term already mostly satisfied, so the
@@ -408,12 +414,19 @@ def main():
     # Without this, phase 1 wastes ~30 iterations re-discovering that
     # downstream mirrors need higher local reflectance to compensate for
     # upstream transmission losses.
-    _base_ratio = 0.05
+    # Per-mirror reflected fraction of the original beam. Scaled with the
+    # mirror count so the total picked-off light (≈ NUM_MIRRORS · ratio) — and
+    # thus eye brightness and see-through — matches the 6-mirror reference:
+    # 0.05 · 6/8 = 0.0375. The eyebox target (EYEBOX_TARGET) is unchanged.
+    _base_ratio = 0.05 * 6 / NUM_MIRRORS
     _compensated_amps = compensated_reflectances(
         _base_ratio, NUM_MIRRORS, num_samples=1).reshape(-1)  # (M,)
+    # Seed spacing keeps the same stack extent as the 6-mirror design
+    # (5 · 1.3 mm ÷ 7 gaps ≈ 0.93 mm), so 8 mirrors span the same y-region.
     _seed = CombinerParams.initial(
+        num_mirrors=NUM_MIRRORS,
         amplitude=_base_ratio, width_nm=80,
-        spacing_mm=1.3, centers=_CENTERS_5BAND,
+        spacing_mm=0.93, centers=_CENTERS_5BAND,
     )
     initial_params = _seed._replace(
         curves=SumOfGaussiansCurve(
