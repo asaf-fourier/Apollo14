@@ -106,6 +106,52 @@ def ray_intersect_planar_seg(ray, seg):
     )
 
 
+def rotation_matrix(axis, angle):
+    """Right-handed 3x3 rotation matrix about ``axis`` by ``angle`` radians.
+
+    ``axis`` need not be unit length — it is normalized internally
+    (Rodrigues' formula). Differentiable in both ``axis`` and ``angle``.
+    """
+    unit_axis = normalize(axis)
+    ux, uy, uz = unit_axis[0], unit_axis[1], unit_axis[2]
+    cos_a = jnp.cos(angle)
+    sin_a = jnp.sin(angle)
+    one_minus_cos = 1.0 - cos_a
+    return jnp.array([
+        [cos_a + ux * ux * one_minus_cos,
+         ux * uy * one_minus_cos - uz * sin_a,
+         ux * uz * one_minus_cos + uy * sin_a],
+        [uy * ux * one_minus_cos + uz * sin_a,
+         cos_a + uy * uy * one_minus_cos,
+         uy * uz * one_minus_cos - ux * sin_a],
+        [uz * ux * one_minus_cos - uy * sin_a,
+         uz * uy * one_minus_cos + ux * sin_a,
+         cos_a + uz * uz * one_minus_cos],
+    ])
+
+
+def rotate_vectors(vectors, axis, angle):
+    """Rotate ``(..., 3)`` direction vectors about ``axis`` through the origin.
+
+    Directions have no anchor point, so no pivot is applied — use this for
+    normals and beam directions. Returns the same leading shape as
+    ``vectors``.
+    """
+    rotation = rotation_matrix(axis, angle)
+    return jnp.asarray(vectors) @ rotation.T
+
+
+def rotate_points(points, axis, angle, pivot):
+    """Rotate ``(..., 3)`` points about the line through ``pivot`` along ``axis``.
+
+    Unlike :func:`rotate_vectors`, points are anchored: they are shifted to
+    the pivot frame, rotated, and shifted back. Use this for positions and
+    polygon vertices.
+    """
+    pivot = jnp.asarray(pivot)
+    return rotate_vectors(jnp.asarray(points) - pivot, axis, angle) + pivot
+
+
 def compute_local_axes(normal):
     """Compute two orthogonal axes on the plane defined by normal.
 

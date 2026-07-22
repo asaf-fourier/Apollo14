@@ -9,6 +9,8 @@ from apollo14.geometry import (
     compute_local_axes,
     normalize,
     ray_intersect_planar_seg,
+    rotate_points,
+    rotate_vectors,
     snell_refract,
 )
 from apollo14.materials import Material, air
@@ -183,6 +185,30 @@ class GlassBlock:
         return GlassBlock(
             name=self.name,
             position=self.position + offset,
+            material=self.material,
+            faces=new_faces,
+        )
+
+    def rotate(self, axis, angle, pivot):
+        """Return a new GlassBlock rotated about the line through ``pivot``.
+
+        Face positions and vertices are rotated as points (anchored to the
+        pivot); face normals are rotated as directions. The material and
+        face names are preserved, so route resolution by face name still
+        works after a rotation (e.g. applying pantoscopic tilt).
+        """
+        new_faces = [
+            GlassFace(
+                name=f.name,
+                position=rotate_points(f.position, axis, angle, pivot),
+                normal=rotate_vectors(f.normal, axis, angle),
+                vertices=rotate_points(f.vertices, axis, angle, pivot),
+            )
+            for f in self.faces
+        ]
+        return GlassBlock(
+            name=self.name,
+            position=rotate_points(self.position, axis, angle, pivot),
             material=self.material,
             faces=new_faces,
         )
