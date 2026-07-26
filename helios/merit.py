@@ -82,17 +82,19 @@ def build_combiner_branch_routes(system: OpticalSystem,
                                  num_mirrors: int = 6,
                                  pupil_name: str = "pupil",
                                  chassis_name: str = "chassis",
+                                 include_aperture: bool = True,
                                  ) -> list[Route]:
     """Build unprepared branch routes that terminate on the pupil.
 
     Returns ``num_mirrors`` routes (one per mirror branch) with
     ``MaterialData`` still in ``FaceSeg`` fields — call
     ``prepare_route(r, wavelength)`` before tracing.
+
+    Set ``include_aperture=False`` to omit the beam-defining stop from the
+    path, for systems built without one.
     """
-    main_path: list = [
-        "aperture",
-        (chassis_name, "back"),
-    ]
+    main_path: list = ["aperture"] if include_aperture else []
+    main_path.append((chassis_name, "back"))
     main_path.extend(f"mirror_{i}" for i in range(num_mirrors))
     main_path.append((chassis_name, "front"))
 
