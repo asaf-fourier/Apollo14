@@ -1,29 +1,29 @@
-"""Perseus combiner system definition.
+"""Perseus combiner system definition — the tuned reference geometry.
 
-Perseus is a variant of the Talos / flat combiner with two rigid-body
-tilts plus a reworked mirror stack and chassis:
+Perseus is a tilted, cascaded partial-mirror combiner. This module is the
+**single source of truth** for its geometry: the constants below and
+:func:`build_perseus_geometry` reproduce exactly the layout dialed in by
+``examples/visualize_perseus.py`` (projector tilt + placement, pantoscopic
+tilt about the combiner center, mirror core, tuned beam-defining aperture,
+and the eye-relief-centered pupil). Both the baked-reflectance reference
+:func:`build_perseus_system` and the differentiable
+:func:`helios.perseus_params.build_parametrized_perseus` build on it, so the
+optimizer and the visualization can never drift. ``apollo14`` never imports
+``helios``.
 
-- **Pantoscopic tilt** — the combiner (chassis + mirror stack) is rotated
-  forward about a horizontal (world-x) axis **through the exit-pupil
-  center**. The projector, aperture, and pupil stay put, so the eye box
-  is fixed in space and the tilted combiner rotates beneath it (the
-  "combiner only, about the pupil" convention).
-- **Projector tilt** — the emission axis is rotated about the same
-  world-x axis, away from straight-down ``[0, -1, 0]``. The beam-defining
-  aperture follows the beam (its normal tracks the projector direction);
-  the aperture is *not* affected by the pantoscopic tilt.
+Conventions (rotations are **counter-clockwise about world-x** ``[1,0,0]``;
+``+`` swings toward +z, the eye side; ``0`` is straight down / untilted):
 
-Sign conventions (right-handed about world-x ``[1, 0, 0]``):
+- ``projector_tilt`` leans the emitted beam that far CCW from straight down.
+- ``pantoscopic_tilt`` leans the combiner (chassis + mirror stack) that far
+  CCW, rotating the whole assembly about the **combiner center**.
+- The mirror plane normals sit ``mirror_normal_angle`` off the (untilted)
+  combiner normal ``+z``; a top-side ``prism_angle`` wedge is baked into the
+  chassis as a z-skew.
 
-- ``pantoscopic_tilt > 0`` rotates the **top** of the combiner toward the
-  eye (+z) and the bottom away. Flip the sign for the opposite lean.
-- ``projector_tilt > 0`` swings the downward beam toward −z (away from
-  the eye). ``0`` is straight down, matching Talos / the flat system.
-
-The geometry derivation lives in :func:`build_perseus_geometry` so both
-the baked-reflectance reference :func:`build_perseus_system` here and the
-differentiable :func:`helios.perseus_params.build_parametrized_perseus`
-share one source of truth. ``apollo14`` never imports ``helios``.
+Because these are CCW rotations, they apply the *negative* angle to
+``geometry.rotate_vectors`` (whose positive angle is right-handed, swinging
+toward -z) — matching the visualization exactly.
 """
 
 import math
@@ -31,7 +31,7 @@ from typing import NamedTuple
 
 import jax.numpy as jnp
 
-from apollo14.combiner import DEFAULT_LIGHT_POSITION, compensated_reflectances
+from apollo14.combiner import compensated_reflectances
 from apollo14.elements.aperture import RectangularAperture
 from apollo14.elements.glass_block import GlassBlock
 from apollo14.elements.partial_mirror import (
@@ -39,7 +39,12 @@ from apollo14.elements.partial_mirror import (
     PartialMirror,
 )
 from apollo14.elements.pupil import RectangularPupil
-from apollo14.geometry import normalize, rotate_points, rotate_vectors
+from apollo14.geometry import (
+    compute_local_axes,
+    normalize,
+    rotate_points,
+    rotate_vectors,
+)
 from apollo14.materials import agc_m074, air
 from apollo14.system import OpticalSystem
 from apollo14.units import deg, mm
@@ -49,37 +54,65 @@ from apollo14.units import deg, mm
 X_AXIS = jnp.array([1.0, 0.0, 0.0])          # pantoscopic / projector tilt axis
 STRAIGHT_DOWN = jnp.array([0.0, -1.0, 0.0])  # untilted projector direction
 
-# ── Perseus defaults (differ from Talos: 8 mirrors, thin chassis, tilted) ───
+# ── Projector ───────────────────────────────────────────────────────────────
 
-PERSEUS_LIGHT_POSITION = DEFAULT_LIGHT_POSITION      # [7, 31, 1] mm
-PERSEUS_NUM_MIRRORS = 8
-PERSEUS_DISTANCE_BETWEEN_MIRRORS = 0.93 * mm
-PERSEUS_MIRROR_ANGLE = 48.0 * deg
-PERSEUS_CHASSIS_X = 14.0 * mm
-PERSEUS_CHASSIS_Y = 20.0 * mm
-PERSEUS_CHASSIS_Z = 1.7 * mm                         # thin (Talos is 2.0 mm)
-PERSEUS_SKEW_ANGLE = 6.0 * deg                       # chassis z-wedge (prism)
-PERSEUS_FIRST_MIRROR_OFFSET_Y = 5.0 * mm
-PERSEUS_EYE_RELIEF = 15.0 * mm
+PERSEUS_LIGHT_POSITION = jnp.array([7.0 * mm, 31.0 * mm, 0.6 * mm])
+PERSEUS_PROJECTOR_TILT = 13.422 * deg        # CCW about world-x from straight down
+PERSEUS_BEAM_WIDTH = 10.0 * mm
+PERSEUS_BEAM_HEIGHT = 2.0 * mm
+
+# Emitted beam axis (CCW ⇒ negative angle into the right-handed rotation).
+PERSEUS_PROJECTOR_DIRECTION = normalize(
+    rotate_vectors(STRAIGHT_DOWN, X_AXIS, -PERSEUS_PROJECTOR_TILT))
+
+# ── Combiner (glass chassis + cascade of tilted partial mirrors) ────────────
+
+PERSEUS_PANTOSCOPIC_TILT = 7.0 * deg         # CCW about world-x, about combiner center
+PERSEUS_NUM_MIRRORS = 10
+PERSEUS_PRISM_ANGLE = 10.578 * deg           # top-side wedge (chassis z-skew)
+# Mirror plane normal sits this far off the (untilted) combiner normal +z; the
+# equivalent mirror tilt from horizontal is 90° − this = 50.289°.
+PERSEUS_MIRROR_NORMAL_ANGLE = (90.0 - 50.289) * deg
+PERSEUS_MIRROR_Y_SPACING = 1.0 * mm          # mirror-center spacing along y
+PERSEUS_CHASSIS_Z = 3.0 * mm                 # full chassis depth (z) — "COMBINER_DEPTH"
+PERSEUS_MIRROR_Z_EXTENT = 1.2 * mm           # mirror core, centered in the depth
+PERSEUS_COMBINER_CENTER = jnp.array([7.0 * mm, 24.0 * mm, 1.6 * mm])
+PERSEUS_COMBINER_WIDTH = 14.0 * mm           # chassis x
+PERSEUS_COMBINER_HEIGHT = 12.0 * mm          # chassis y (holds the stack)
+PERSEUS_BASE_RATIO = 0.05 * 6 / PERSEUS_NUM_MIRRORS   # per-mirror pick-off
+
+# ── Beam-defining aperture (opaque frame with a clear opening) ──────────────
+# Oriented parallel to the combiner prism (entry) face; its opening is sized to
+# pass every mirror-hitting ray and recentred along its height axis so a tight
+# 2 mm opening sits over the densest band (see examples/visualize_perseus.py).
+
+PERSEUS_APERTURE_OFFSET = 0.2 * mm           # downstream of the projector along the beam
+PERSEUS_APERTURE_DROP_Y = 0.6 * mm           # extra drop, straight down the y axis
+PERSEUS_APERTURE_HEIGHT_SHIFT = 0.15 * mm    # recentre along the opening's height axis
+PERSEUS_APERTURE_OUTER = (14.0 * mm, 6.0 * mm)   # (width, height) opaque frame
+PERSEUS_APERTURE_INNER = (11.0 * mm, 2.0 * mm)   # (width, height) clear opening
+
+# ── Target pupil (eyebox detector) ──────────────────────────────────────────
+# Fixed in space (not rotated with the combiner); centred on where the reflected
+# light lands at the eye-relief plane over the full FOV scan.
+
+PERSEUS_EYE_RELIEF = 16.0 * mm
 PERSEUS_PUPIL_OFFSET_X = 0.0 * mm
-PERSEUS_PUPIL_OFFSET_Y = -2.38 * mm
+PERSEUS_PUPIL_CENTER_Y = 21.13 * mm
 PERSEUS_PUPIL_WIDTH = 14.0 * mm
 PERSEUS_PUPIL_HEIGHT = 18.0 * mm
-PERSEUS_APERTURE_OUTER = (14.0 * mm, 6.0 * mm)       # (width, height)
-PERSEUS_APERTURE_INNER = (10.0 * mm, 2.0 * mm)       # clear opening
-PERSEUS_BASE_RATIO = 0.05 * 6 / PERSEUS_NUM_MIRRORS  # per-mirror pick-off
+PERSEUS_EYEBOX_SIZE = 8.0 * mm               # target eyebox (square) at the pupil center
 
-# The two defining tilts. Pantoscopic defaults nonzero (it *is* Perseus);
-# projector tilt defaults to 0 (straight down) until a convention/value is set.
-PERSEUS_PANTOSCOPIC_TILT = 10.0 * deg
-PERSEUS_PROJECTOR_TILT = 0.0 * deg
+# ── FOV scan (used by examples/optimizer) ───────────────────────────────────
+# 10° about world-x, 12° about the in-plane perpendicular axis.
+PERSEUS_FOV_AROUND_X = 10.0 * deg
+PERSEUS_FOV_AROUND_PROJECTOR_Y = 12.0 * deg
 
 
 def uniform_spacings(num_mirrors: int,
-                     distance: float = PERSEUS_DISTANCE_BETWEEN_MIRRORS
-                     ) -> jnp.ndarray:
-    """``(num_mirrors - 1,)`` equal perpendicular gaps between mirrors."""
-    return jnp.full((num_mirrors - 1,), distance)
+                     spacing: float = PERSEUS_MIRROR_Y_SPACING) -> jnp.ndarray:
+    """``(num_mirrors - 1,)`` equal mirror-center gaps along y."""
+    return jnp.full((num_mirrors - 1,), spacing)
 
 
 class PerseusGeometry(NamedTuple):
@@ -98,43 +131,109 @@ class PerseusGeometry(NamedTuple):
     mirror_height: float
     light_position: jnp.ndarray     # (3,) projector location
     light_direction: jnp.ndarray    # (3,) tilted beam axis
-    pupil_center: jnp.ndarray       # (3,) pantoscopic pivot
+    pupil_center: jnp.ndarray       # (3,) pupil center
 
 
 def build_perseus_geometry(
     *,
     spacings: jnp.ndarray,
-    mirror_angle: float = PERSEUS_MIRROR_ANGLE,
-    chassis_x: float = PERSEUS_CHASSIS_X,
-    chassis_y: float = PERSEUS_CHASSIS_Y,
+    mirror_normal_angle: float = PERSEUS_MIRROR_NORMAL_ANGLE,
+    mirror_z_extent: float = PERSEUS_MIRROR_Z_EXTENT,
+    combiner_center: jnp.ndarray = PERSEUS_COMBINER_CENTER,
+    combiner_width: float = PERSEUS_COMBINER_WIDTH,
+    combiner_height: float = PERSEUS_COMBINER_HEIGHT,
     chassis_z: float = PERSEUS_CHASSIS_Z,
-    skew_angle: float = PERSEUS_SKEW_ANGLE,
-    first_mirror_offset_y: float = PERSEUS_FIRST_MIRROR_OFFSET_Y,
+    prism_angle: float = PERSEUS_PRISM_ANGLE,
     eye_relief: float = PERSEUS_EYE_RELIEF,
     pupil_offset_x: float = PERSEUS_PUPIL_OFFSET_X,
-    pupil_offset_y: float = PERSEUS_PUPIL_OFFSET_Y,
+    pupil_center_y: float = PERSEUS_PUPIL_CENTER_Y,
     pupil_width: float = PERSEUS_PUPIL_WIDTH,
     pupil_height: float = PERSEUS_PUPIL_HEIGHT,
+    aperture_offset: float = PERSEUS_APERTURE_OFFSET,
+    aperture_drop_y: float = PERSEUS_APERTURE_DROP_Y,
+    aperture_height_shift: float = PERSEUS_APERTURE_HEIGHT_SHIFT,
     aperture_outer: tuple[float, float] = PERSEUS_APERTURE_OUTER,
     aperture_inner: tuple[float, float] = PERSEUS_APERTURE_INNER,
     light_position: jnp.ndarray = PERSEUS_LIGHT_POSITION,
     pantoscopic_tilt: float = PERSEUS_PANTOSCOPIC_TILT,
     projector_tilt: float = PERSEUS_PROJECTOR_TILT,
 ) -> PerseusGeometry:
-    """Place every Perseus element, applying both tilts.
+    """Place every Perseus element, reproducing the visualization exactly.
 
-    ``spacings`` is a ``(M-1,)`` array of perpendicular mirror-plane gaps;
-    the mirror count ``M`` is inferred from it. All other geometry knobs
-    default to the Perseus constants. Returns a :class:`PerseusGeometry`;
-    reflectance is left to the caller.
+    ``spacings`` is a ``(M-1,)`` array of mirror-center gaps along y; the
+    mirror count ``M`` is inferred from it and the stack is centered on the
+    combiner center. All other knobs default to the Perseus constants above.
+    Returns a :class:`PerseusGeometry`; reflectance is left to the caller.
     """
-    chassis_center = jnp.array([chassis_x / 2.0, chassis_y, chassis_z / 2.0])
+    combiner_center = jnp.asarray(combiner_center)
+    light_position = jnp.asarray(light_position)
 
-    # Exit pupil — fixed in space; it is also the pantoscopic pivot.
+    # Projector beam axis — CCW about world-x from straight down.
+    light_direction = normalize(
+        rotate_vectors(STRAIGHT_DOWN, X_AXIS, -projector_tilt))
+
+    # Aperture: parallel to the combiner's prism (entry) face — the inward
+    # prism-face normal [0, -cos(prism), -sin(prism)] leaned CCW by the
+    # pantoscopic tilt. Positioned downstream of the projector along the beam,
+    # dropped in y, then recentred along its height axis so the tight opening
+    # sits over the densest band of mirror-hitting rays.
+    aperture_normal = normalize(rotate_vectors(
+        jnp.array([0.0, -math.cos(float(prism_angle)),
+                   -math.sin(float(prism_angle))]),
+        X_AXIS, -pantoscopic_tilt))
+    aperture_height_axis = compute_local_axes(aperture_normal)[1]
+    aperture_position = (light_position
+                         + aperture_offset * light_direction
+                         - jnp.array([0.0, aperture_drop_y, 0.0])
+                         + aperture_height_shift * aperture_height_axis)
+    aperture = RectangularAperture(
+        name="aperture", position=aperture_position, normal=aperture_normal,
+        width=aperture_outer[0], height=aperture_outer[1],
+        inner_width=aperture_inner[0], inner_height=aperture_inner[1],
+    )
+
+    # Mirror plane orientation (untilted): normal sits mirror_normal_angle off
+    # the combiner normal (+z). Mirrors span the chassis width in x and only the
+    # central mirror-core in z (height = core / sin(angle)).
+    angle = float(mirror_normal_angle)
+    mirror_normal = jnp.array([0.0, math.sin(angle), math.cos(angle)])
+    mirror_width = float(combiner_width)
+    mirror_height = float(mirror_z_extent / math.sin(angle))
+
+    # Chassis with the top-side prism baked in as a z-skew wedge, placed at the
+    # combiner center in the untilted frame.
+    z_skew = float(chassis_z * math.tan(float(prism_angle)))
+    chassis = GlassBlock.create_chassis(
+        name="chassis", x=float(combiner_width), y=float(combiner_height),
+        z=float(chassis_z), material=agc_m074, z_skew=z_skew,
+    ).translate(combiner_center)
+
+    # Mirror centers: consecutive y-gaps from ``spacings``, the stack centered
+    # on the combiner center; all share the combiner x/z center (step only in y).
+    cumulative_offset = jnp.concatenate(
+        [jnp.zeros(1), jnp.cumsum(jnp.asarray(spacings))])  # (M,)
+    num_mirrors = cumulative_offset.shape[0]
+    stack_span = cumulative_offset[-1]
+    top_y = combiner_center[1] + stack_span / 2.0
+    mirror_y = top_y - cumulative_offset
+    mirror_positions = jnp.stack([
+        jnp.full((num_mirrors,), combiner_center[0]),
+        mirror_y,
+        jnp.full((num_mirrors,), combiner_center[2]),
+    ], axis=1)  # (M, 3)
+
+    # Apply the pantoscopic tilt (CCW about world-x) about the combiner center.
+    tilt = -pantoscopic_tilt
+    chassis = chassis.rotate(X_AXIS, tilt, combiner_center)
+    mirror_positions = rotate_points(mirror_positions, X_AXIS, tilt, combiner_center)
+    mirror_normal = normalize(rotate_vectors(mirror_normal, X_AXIS, tilt))
+
+    # Pupil — fixed in space, on the eye-relief plane past the front face,
+    # centered on where the reflected light lands (not rotated with the stack).
     pupil_center = jnp.array([
-        chassis_x / 2.0 + pupil_offset_x,
-        chassis_y + pupil_offset_y,
-        eye_relief + chassis_z,
+        combiner_center[0] + pupil_offset_x,
+        pupil_center_y,
+        combiner_center[2] + chassis_z / 2.0 + eye_relief,
     ])
     pupil = RectangularPupil(
         name="pupil", position=pupil_center,
@@ -142,67 +241,19 @@ def build_perseus_geometry(
         width=pupil_width, height=pupil_height,
     )
 
-    # Projector beam axis, tilted about world-x from straight down.
-    light_direction = normalize(
-        rotate_vectors(STRAIGHT_DOWN, X_AXIS, projector_tilt))
-
-    # Beam-defining stop, half a mm downstream of the emitter along the beam.
-    # Follows the projector tilt; unaffected by the pantoscopic tilt.
-    aperture = RectangularAperture(
-        name="aperture",
-        position=light_position + 0.5 * mm * light_direction,
-        normal=light_direction,
-        width=aperture_outer[0], height=aperture_outer[1],
-        inner_width=aperture_inner[0], inner_height=aperture_inner[1],
-    )
-
-    # Chassis: axis-aligned wedge, translated to place, then pantoscopically
-    # rotated about the pupil.
-    z_skew = float(chassis_z * math.tan(skew_angle))
-    chassis = (GlassBlock.create_chassis(
-        name="chassis", x=float(chassis_x), y=float(chassis_y),
-        z=float(chassis_z), material=agc_m074, z_skew=z_skew)
-        .translate(chassis_center)
-        .rotate(X_AXIS, pantoscopic_tilt, pupil_center))
-
-    # Mirror stack in the untilted frame, then rotated about the pupil.
-    normal_angle = math.pi / 2.0 - mirror_angle
-    mirror_normal = jnp.array([0.0, math.sin(normal_angle), math.cos(normal_angle)])
-    mirror_width = float(chassis_x)
-    mirror_height = float(chassis_z / math.cos(mirror_angle))
-
-    first_mirror_center = chassis_center + jnp.array(
-        [0.0, first_mirror_offset_y, 0.0])
-    mirror_edge_to_center_y = 0.5 * math.sqrt(
-        mirror_height ** 2 - float(chassis_z) ** 2)
-    first_pos = first_mirror_center - jnp.array(
-        [0.0, mirror_edge_to_center_y, 0.0])
-
-    # Each perpendicular gap projects onto y by 1/sin(normal_angle).
-    unit_offset = jnp.array([0.0, 1.0 / math.sin(normal_angle), 0.0])
-    cumulative_offset = jnp.concatenate(
-        [jnp.zeros(1), jnp.cumsum(jnp.asarray(spacings))])  # (M,)
-    mirror_positions = (
-        first_pos[None, :] - cumulative_offset[:, None] * unit_offset[None, :])
-
-    mirror_positions = rotate_points(
-        mirror_positions, X_AXIS, pantoscopic_tilt, pupil_center)
-    mirror_normal = normalize(
-        rotate_vectors(mirror_normal, X_AXIS, pantoscopic_tilt))
-
     return PerseusGeometry(
         chassis=chassis, aperture=aperture, pupil=pupil,
         mirror_positions=mirror_positions, mirror_normal=mirror_normal,
         mirror_width=mirror_width, mirror_height=mirror_height,
-        light_position=jnp.asarray(light_position),
-        light_direction=light_direction, pupil_center=pupil_center,
+        light_position=light_position, light_direction=light_direction,
+        pupil_center=pupil_center,
     )
 
 
 def build_perseus_system(
     *,
     num_mirrors: int = PERSEUS_NUM_MIRRORS,
-    distance_between_mirrors: float = PERSEUS_DISTANCE_BETWEEN_MIRRORS,
+    mirror_y_spacing: float = PERSEUS_MIRROR_Y_SPACING,
     base_ratio: float = PERSEUS_BASE_RATIO,
     pantoscopic_tilt: float = PERSEUS_PANTOSCOPIC_TILT,
     projector_tilt: float = PERSEUS_PROJECTOR_TILT,
@@ -213,12 +264,11 @@ def build_perseus_system(
 
     Each mirror gets a wavelength-flat, Talos-compensated reflectance
     (``base_ratio / (1 - i·base_ratio)``) on the default mirror wavelength
-    grid — the fixed-design analogue of the flat driver's warm start.
-    Extra ``geometry_kwargs`` pass straight through to
-    :func:`build_perseus_geometry` (chassis dims, eye relief, pupil, …).
+    grid — the fixed-design analogue of the flat driver's warm start. Extra
+    ``geometry_kwargs`` pass straight through to :func:`build_perseus_geometry`.
     """
     geometry = build_perseus_geometry(
-        spacings=uniform_spacings(num_mirrors, distance_between_mirrors),
+        spacings=uniform_spacings(num_mirrors, mirror_y_spacing),
         pantoscopic_tilt=pantoscopic_tilt, projector_tilt=projector_tilt,
         chassis_z=chassis_z, **geometry_kwargs)
 
