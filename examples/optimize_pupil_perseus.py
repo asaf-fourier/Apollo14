@@ -55,7 +55,7 @@ from apollo14.perseus import (
     PERSEUS_PROJECTOR_DIRECTION,
 )
 from apollo14.projector import PlayNitrideLed, FovGrid
-from apollo14.spectral import SumOfGaussiansCurve
+from apollo14.spectral import ConstantCurve, SumOfGaussiansCurve
 
 from helios.combiner_params import CombinerParams, ParamBounds, fwhm_to_sigma
 from helios.perseus_params import build_parametrized_perseus
@@ -83,9 +83,18 @@ CHASSIS_Z = PERSEUS_CHASSIS_Z              # 3.0 mm full combiner depth
 SEED_SPACING = PERSEUS_MIRROR_Y_SPACING    # 1.0 mm mirror-center y-gap, frozen
 FROZEN_SPACINGS = jnp.full((NUM_MIRRORS - 1,), SEED_SPACING)
 
-# Spacings are NOT a design variable here — only the RGB reflectance curves are.
+# Spacings are NOT a design variable here — only the reflectance curves are.
 # Frozen spacings ⇒ hard nearest-neighbor binning is sufficient.
 OPTIMIZE_SPACINGS = False
+
+# Reflectance model:
+#   "rgb"  — each mirror is a 5-band SumOfGaussiansCurve (amplitude + width per
+#            band), optimized in two phases (target, then target + spectrum-
+#            preserving shape) for white balance. Like optimize_pupil_rgb.
+#   "flat" — each mirror is a single wavelength-uniform ConstantCurve scalar,
+#            optimized in ONE target phase (a flat mirror preserves the panel's
+#            spectrum, so there is no color term). Like optimize_pupil_flat.
+CURVE_MODE = "flat"   # "rgb" | "flat"
 
 # ── Eyebox target region (pre-defined, fixed) ───────────────────────────────
 # The Perseus target eyebox: an 8×8 mm square on the pupil plane, 1×1 mm cells.
@@ -179,7 +188,12 @@ merit_cfg_phase2 = PupilMeritConfig(
     asymmetric_target=False,
 )
 
-bounds = ParamBounds(amplitude_max=0.25, fwhm_max_nm=15, fwhm_min_nm=5)
+if CURVE_MODE == "flat":
+    # Flat (ConstantCurve): only the per-mirror amplitude is a design variable.
+    bounds = ParamBounds(amplitude_min=0.0, amplitude_max=0.20)
+else:
+    # RGB (SumOfGaussiansCurve): amplitude + Gaussian width (FWHM) per band.
+    bounds = ParamBounds(amplitude_max=0.25, fwhm_max_nm=15, fwhm_min_nm=5)
 
 
 # ── Reference input flux (photometric, matches luminance_weights) ──────────
@@ -324,9 +338,15 @@ def _freeze_spacings(grad: CombinerParams) -> CombinerParams:
 def _clip(params: CombinerParams) -> CombinerParams:
     """Clip curves into bounds and re-pin spacings to their frozen value.
 
-    ``bounds.clip`` also rescales spacings to fit the chassis; re-injecting
-    ``FROZEN_SPACINGS`` afterward guarantees the frozen geometry stays exact.
+    Flat curves clip the single amplitude; RGB curves use ``bounds.clip``
+    (amplitude + σ). Either way ``FROZEN_SPACINGS`` is re-injected so the frozen
+    geometry stays exact (``bounds.clip`` would otherwise rescale spacings).
     """
+    if CURVE_MODE == "flat":
+        clipped_amp = jnp.clip(params.curves.amplitude,
+                               bounds.amplitude_min, bounds.amplitude_max)
+        return params._replace(spacings=FROZEN_SPACINGS,
+                               curves=ConstantCurve(amplitude=clipped_amp))
     clipped = bounds.clip(params)
     return clipped._replace(spacings=FROZEN_SPACINGS)
 
@@ -340,6 +360,95 @@ adam_cfg_phase1 = AdamConfig(peak_lr=3e-3, warmup_steps=20, num_steps=PHASE1_STE
 # Phase 2 polishes the shape term in a flat region; drop the LR so Adam's
 # 1/sqrt(variance) step actually descends instead of dithering.
 adam_cfg_phase2 = AdamConfig(peak_lr=5e-4, warmup_steps=10, num_steps=PHASE2_STEPS)
+
+
+# ── Curve-mode helpers (flat ConstantCurve vs RGB SumOfGaussiansCurve) ──────
+
+# 5-band RGB reflectance basis (fixed centers): R/G/B primaries (446, 545,
+# 627 nm) plus two intermediates (490, 590 nm) so a per-mirror curve can be
+# near-wavelength-flat at a modest FWHM without one Gaussian bridging the R–B gap.
+_RGB_CENTERS = jnp.array([446.0, 490.0, 545.0, 590.0, 627.0]) * nm
+
+
+def _warm_start_amps() -> jnp.ndarray:
+    """Talos cascade-compensation seed amplitudes ``(M,)``.
+
+    Each mirror's absolute reflected fraction of the original beam is equal
+    (``ratio / (1 - i·ratio)``), so downstream mirrors start higher to offset
+    upstream transmission losses. Pick-off scaled to the mirror count.
+    """
+    base_ratio = 0.05 * 6 / NUM_MIRRORS
+    return compensated_reflectances(
+        base_ratio, NUM_MIRRORS, num_samples=1).reshape(-1).astype(jnp.float32)
+
+
+def _build_initial_params() -> CombinerParams:
+    """Warm-started initial design for the selected ``CURVE_MODE``."""
+    amps = _warm_start_amps()   # (M,)
+    if CURVE_MODE == "flat":
+        return CombinerParams(spacings=FROZEN_SPACINGS,
+                              curves=ConstantCurve(amplitude=amps))
+    seed = CombinerParams.initial(
+        num_mirrors=NUM_MIRRORS, amplitude=float(amps.mean()), width_nm=80,
+        spacing_mm=float(SEED_SPACING / mm), centers=_RGB_CENTERS)
+    return seed._replace(
+        spacings=FROZEN_SPACINGS,
+        curves=SumOfGaussiansCurve(
+            amplitude=jnp.broadcast_to(amps[:, None],
+                                       seed.curves.amplitude.shape),
+            sigma=seed.curves.sigma,
+            centers=seed.curves.centers,
+        ),
+    )
+
+
+def _ceiling_params(template: CombinerParams) -> CombinerParams:
+    """All-mirrors-at-max design, for the brightness-ceiling diagnostic."""
+    if CURVE_MODE == "flat":
+        curves = ConstantCurve(amplitude=jnp.full_like(
+            template.curves.amplitude, bounds.amplitude_max))
+    else:
+        curves = SumOfGaussiansCurve(
+            amplitude=jnp.full_like(template.curves.amplitude, bounds.amplitude_max),
+            sigma=jnp.full_like(template.curves.sigma,
+                                fwhm_to_sigma(bounds.fwhm_max_nm * nm)),
+            centers=template.curves.centers)
+    return CombinerParams(spacings=template.spacings, curves=curves)
+
+
+def _num_design_vars(params: CombinerParams) -> int:
+    if CURVE_MODE == "flat":
+        return int(params.curves.amplitude.size)
+    return int(params.curves.amplitude.size + params.curves.sigma.size)
+
+
+def _print_final_curves(params: CombinerParams) -> None:
+    """Print optimized reflectance per mirror + a bounds-pegged diagnostic."""
+    if CURVE_MODE == "flat":
+        print("Final flat reflectance per mirror:")
+        for mirror_idx in range(NUM_MIRRORS):
+            print(f"  m{mirror_idx}: {float(params.curves.amplitude[mirror_idx]):.4f}")
+        pegged_lo = int(jnp.sum(params.curves.amplitude <= bounds.amplitude_min + 1e-4))
+        pegged_hi = int(jnp.sum(params.curves.amplitude >= bounds.amplitude_max - 1e-4))
+        print(f"\nReflectances at a bound: {pegged_lo} at lower / "
+              f"{pegged_hi} at upper ({bounds.amplitude_min}–{bounds.amplitude_max})")
+        return
+    print("Final amplitudes per mirror (per basis):")
+    for mirror_idx in range(NUM_MIRRORS):
+        row = "  ".join(f"{float(a):.4f}" for a in params.curves.amplitude[mirror_idx])
+        print(f"  m{mirror_idx}: {row}")
+    print("Final widths per mirror (nm):")
+    for mirror_idx in range(NUM_MIRRORS):
+        row = "  ".join(f"{float(w) / nm:.1f}" for w in params.curves.sigma[mirror_idx])
+        print(f"  m{mirror_idx}: {row}")
+    sigma_max = fwhm_to_sigma(bounds.fwhm_max_nm * nm)
+    amp_pegged = int(jnp.sum(params.curves.amplitude >= bounds.amplitude_max - 1e-4))
+    sigma_pegged = int(jnp.sum(params.curves.sigma >= sigma_max - 1e-4))
+    print(f"\nParameters at upper bound:")
+    print(f"  amplitudes: {amp_pegged} / {params.curves.amplitude.size} "
+          f"(at {bounds.amplitude_max})")
+    print(f"  sigmas:     {sigma_pegged} / {params.curves.sigma.size} "
+          f"(at FWHM {bounds.fwhm_max_nm:.1f} nm)")
 
 
 # ── Run ─────────────────────────────────────────────────────────────────────
@@ -362,40 +471,16 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Run directory: {run_dir}")
 
-    # 5-band reflectance basis: R/G/B (446, 545, 627 nm) plus intermediates at
-    # 490 and 590 nm so a per-mirror curve can be near-wavelength-flat with a
-    # modest FWHM without one Gaussian having to bridge the R–B gap. Centers are
-    # fixed; the optimizer tunes amplitudes and sigmas around them.
-    _CENTERS_5BAND = jnp.array([446.0, 490.0, 545.0, 590.0, 627.0]) * nm
-
-    # Warm-start with the Talos cascade compensation so downstream mirrors start
-    # with the higher local reflectance needed to offset upstream losses. Per-
-    # mirror pick-off scaled to the mirror count: 0.05·6/8 = 0.0375.
-    _base_ratio = 0.05 * 6 / NUM_MIRRORS
-    _compensated_amps = compensated_reflectances(
-        _base_ratio, NUM_MIRRORS, num_samples=1).reshape(-1)  # (M,)
-    _seed = CombinerParams.initial(
-        num_mirrors=NUM_MIRRORS,
-        amplitude=_base_ratio, width_nm=80,
-        spacing_mm=float(SEED_SPACING / mm), centers=_CENTERS_5BAND,
-    )
-    initial_params = _seed._replace(
-        spacings=FROZEN_SPACINGS,
-        curves=SumOfGaussiansCurve(
-            amplitude=jnp.broadcast_to(
-                _compensated_amps[:, None],
-                _seed.curves.amplitude.shape).astype(jnp.float32),
-            sigma=_seed.curves.sigma,
-            centers=_seed.curves.centers,
-        ),
-    )
+    initial_params = _build_initial_params()
     params = initial_params
     state = adam_init(params)
+    is_flat = CURVE_MODE == "flat"
 
-    num_vars = params.curves.amplitude.size + params.curves.sigma.size
-    print("── Perseus pupil optimization (RGB reflectance, spacings frozen) ──")
-    print(f"Variables: {num_vars} "
-          f"(per-mirror per-band amplitude + sigma)")
+    model_label = "flat reflectance" if is_flat else "RGB reflectance"
+    var_detail = ("one flat reflectance per mirror" if is_flat
+                  else "per-mirror per-band amplitude + sigma")
+    print(f"── Perseus pupil optimization ({model_label}, spacings frozen) ──")
+    print(f"Variables: {_num_design_vars(params)} ({var_detail})")
     window_mm_x = KERNEL_SIZE_CELLS * float(_CELL_PITCH_X) / mm
     window_mm_y = KERNEL_SIZE_CELLS * float(_CELL_PITCH_Y) / mm
     print(f"Mirrors:   {NUM_MIRRORS}, frozen spacing {float(SEED_SPACING)/mm:.2f} mm, "
@@ -410,27 +495,17 @@ def main():
     print(f"Spectrum:  {SPECTRAL_SAMPLES} uniform samples, "
           f"{float(_w_lo)/nm:.0f}–{float(_w_hi)/nm:.0f} nm "
           f"(W > {SPECTRAL_THRESHOLD:.0%} of peak)")
-    print(f"Shape target: projector W spectrum (preserve panel's D65 white)")
+    if not is_flat:
+        print(f"Shape target: projector W spectrum (preserve panel's D65 white)")
     print(f"I_in:      {INPUT_FLUX:.1f}  "
           f"(target_relative={merit_cfg_phase1.target_relative})")
 
-    # Ceiling diagnostic — what brightness can we hope for?
-    ceiling_curves = SumOfGaussiansCurve(
-        amplitude=jnp.full_like(initial_params.curves.amplitude,
-                                 bounds.amplitude_max),
-        sigma=jnp.full_like(initial_params.curves.sigma,
-                             fwhm_to_sigma(bounds.fwhm_max_nm * nm)),
-        centers=initial_params.curves.centers,
-    )
-    ceiling_params = CombinerParams(
-        spacings=initial_params.spacings,
-        curves=ceiling_curves,
-    )
-    ceiling_response = _compute_spectral_response(ceiling_params)
+    # Ceiling diagnostic — brightest achievable if every mirror pegs at max.
+    ceiling_response = _compute_spectral_response(_ceiling_params(initial_params))
     ceiling_lum_per_angle = jnp.sum(
         ceiling_response * LUMINANCE_TRACE_WEIGHTS.reshape(1, 1, -1), axis=-1)
     ceiling_brightness = jnp.mean(ceiling_lum_per_angle, axis=-1) / INPUT_FLUX
-    print(f"Ceiling per-cell brightness (amp=max, FWHM=max): "
+    print(f"Ceiling per-cell brightness (reflectance=max): "
           f"min={float(ceiling_brightness.min()):.5f}  "
           f"mean={float(ceiling_brightness.mean()):.5f}  "
           f"max={float(ceiling_brightness.max()):.5f}  "
@@ -453,42 +528,29 @@ def main():
     phase1_breakdown = breakdown_fn(params, merit_cfg_phase1)
     _print_breakdown("Phase 1 result", phase1_breakdown)
 
-    print("\n── Phase 2: target + spectrum-preserving shape ──")
-    state = adam_init(params)
-    for step in range(PHASE2_STEPS):
-        loss, grad = value_and_grad_phase2(params)
-        params, state = adam_step(params, _freeze_spacings(grad), state,
-                                  adam_cfg_phase2)
-        params = _clip(params)
-        loss_history.append(float(loss))
-        print(f"step {step+1:4d}/{PHASE2_STEPS}  loss={float(loss):.8f}")
+    # Phase 2 (RGB only): polish spectrum-preservation. A flat mirror preserves
+    # the panel spectrum by construction, so a shape phase has nothing to do.
+    if is_flat:
+        final_merit_cfg = merit_cfg_phase1
+        final_breakdown = phase1_breakdown
+    else:
+        print("\n── Phase 2: target + spectrum-preserving shape ──")
+        state = adam_init(params)
+        for step in range(PHASE2_STEPS):
+            loss, grad = value_and_grad_phase2(params)
+            params, state = adam_step(params, _freeze_spacings(grad), state,
+                                      adam_cfg_phase2)
+            params = _clip(params)
+            loss_history.append(float(loss))
+            print(f"step {step+1:4d}/{PHASE2_STEPS}  loss={float(loss):.8f}")
+        final_merit_cfg = merit_cfg_phase2
+        final_breakdown = breakdown_fn(params, final_merit_cfg)
 
-    final_breakdown = breakdown_fn(params, merit_cfg_phase2)
     _print_breakdown("Final merit", final_breakdown)
 
     print("\nFrozen spacings (mm):",
           [f"{float(spacing)/mm:.3f}" for spacing in params.spacings])
-    print("Final amplitudes per mirror (per basis):")
-    for mirror_idx in range(NUM_MIRRORS):
-        mirror_amplitude = params.curves.amplitude[mirror_idx]
-        row = "  ".join(f"{float(a):.4f}" for a in mirror_amplitude)
-        print(f"  m{mirror_idx}: {row}")
-    print("Final widths per mirror (nm):")
-    for mirror_idx in range(NUM_MIRRORS):
-        mirror_width = params.curves.sigma[mirror_idx]
-        row = "  ".join(f"{float(w) / nm:.1f}" for w in mirror_width)
-        print(f"  m{mirror_idx}: {row}")
-
-    # Bounds-pegged diagnostic — is the optimizer stalled at a bound?
-    sigma_max = fwhm_to_sigma(bounds.fwhm_max_nm * nm)
-    amp_pegged = int(jnp.sum(
-        params.curves.amplitude >= bounds.amplitude_max - 1e-4))
-    sigma_pegged = int(jnp.sum(params.curves.sigma >= sigma_max - 1e-4))
-    print(f"\nParameters at upper bound:")
-    print(f"  amplitudes: {amp_pegged} / {params.curves.amplitude.size} "
-          f"(at {bounds.amplitude_max})")
-    print(f"  sigmas:     {sigma_pegged} / {params.curves.sigma.size} "
-          f"(at FWHM {bounds.fwhm_max_nm:.1f} nm)")
+    _print_final_curves(params)
 
     response = _compute_spectral_response(params)
     luminance_per_angle = jnp.sum(
@@ -507,34 +569,44 @@ def main():
     final_system = build_parametrized_perseus(
         params, probe_wavelengths=TRACE_WAVELENGTHS,
         chassis_z=CHASSIS_Z)
+
+    if is_flat:
+        optimizer_config = {
+            "algorithm": "adam",
+            "steps": PHASE1_STEPS,
+            "peak_lr": adam_cfg_phase1.peak_lr,
+            "warmup_steps": adam_cfg_phase1.warmup_steps,
+            "focus": "target (flat reflectance, fixed spacing)",
+            "curve": "ConstantCurve (wavelength-flat)",
+        }
+    else:
+        optimizer_config = {
+            "algorithm": "adam_two_phase",
+            "phase1": {"steps": PHASE1_STEPS, "peak_lr": adam_cfg_phase1.peak_lr,
+                       "warmup_steps": adam_cfg_phase1.warmup_steps, "focus": "target"},
+            "phase2": {"steps": PHASE2_STEPS, "peak_lr": adam_cfg_phase2.peak_lr,
+                       "warmup_steps": adam_cfg_phase2.warmup_steps,
+                       "focus": "target+shape (spectrum-preserving)"},
+            "schedule": "warmup_cosine_decay",
+            "total_steps": PHASE1_STEPS + PHASE2_STEPS,
+            "curve": "SumOfGaussiansCurve (5-band RGB)",
+        }
+    optimizer_config.update({
+        "spectral_threshold": SPECTRAL_THRESHOLD,
+        "spectral_samples": SPECTRAL_SAMPLES,
+        "num_mirrors": NUM_MIRRORS,
+        "optimize_spacings": OPTIMIZE_SPACINGS,
+        "curve_mode": CURVE_MODE,
+        "geometry": "perseus (tilted 10-mirror, build_parametrized_perseus)",
+    })
+
     report_path = save_optimization_report(
         run_dir,
         system=final_system,
         projectors=[PROJECTOR],
         fov_grid=FOV_GRID,
-        merit_config=merit_cfg_phase2,
-        optimizer_config={
-            "algorithm": "adam_two_phase",
-            "phase1": {
-                "steps": PHASE1_STEPS,
-                "peak_lr": adam_cfg_phase1.peak_lr,
-                "warmup_steps": adam_cfg_phase1.warmup_steps,
-                "focus": "target",
-            },
-            "phase2": {
-                "steps": PHASE2_STEPS,
-                "peak_lr": adam_cfg_phase2.peak_lr,
-                "warmup_steps": adam_cfg_phase2.warmup_steps,
-                "focus": "target+shape (spectrum-preserving)",
-            },
-            "schedule": "warmup_cosine_decay",
-            "total_steps": PHASE1_STEPS + PHASE2_STEPS,
-            "spectral_threshold": SPECTRAL_THRESHOLD,
-            "spectral_samples": SPECTRAL_SAMPLES,
-            "num_mirrors": NUM_MIRRORS,
-            "optimize_spacings": OPTIMIZE_SPACINGS,
-            "geometry": "perseus (tilted 8-mirror, build_parametrized_perseus)",
-        },
+        merit_config=final_merit_cfg,
+        optimizer_config=optimizer_config,
         param_bounds=bounds,
         initial_params=initial_params,
         final_params=params,
