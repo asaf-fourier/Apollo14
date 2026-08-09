@@ -187,3 +187,5 @@ fabric.properties
 
 examples/**/*.json
 examples/**/*.npz
+examples/reports/**
+examples/examples/reports/**
