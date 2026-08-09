@@ -68,12 +68,17 @@ PERSEUS_PROJECTOR_DIRECTION = normalize(
 # ── Combiner (glass chassis + cascade of tilted partial mirrors) ────────────
 
 PERSEUS_PANTOSCOPIC_TILT = 7.0 * deg         # CCW about world-x, about combiner center
-PERSEUS_NUM_MIRRORS = 10
+PERSEUS_NUM_MIRRORS = 8
 PERSEUS_PRISM_ANGLE = 10.578 * deg           # top-side wedge (chassis z-skew)
 # Mirror plane normal sits this far off the (untilted) combiner normal +z; the
 # equivalent mirror tilt from horizontal is 90° − this = 50.289°.
 PERSEUS_MIRROR_NORMAL_ANGLE = (90.0 - 50.289) * deg
-PERSEUS_MIRROR_Y_SPACING = 1.0 * mm          # mirror-center spacing along y
+# The mirror stack fills a fixed y-extent; the per-mirror gap is derived from it
+# and the mirror count, so changing the count repacks the same region (more
+# mirrors ⇒ smaller gaps). See spacings_for_count().
+PERSEUS_MIRROR_STACK_SPAN = 9.8 * mm         # y-extent the mirror-center stack fills
+PERSEUS_MIRROR_Y_SPACING = (                 # per-mirror gap at the default count
+    PERSEUS_MIRROR_STACK_SPAN / (PERSEUS_NUM_MIRRORS - 1))
 PERSEUS_CHASSIS_Z = 3.0 * mm                 # full chassis depth (z) — "COMBINER_DEPTH"
 PERSEUS_MIRROR_Z_EXTENT = 1.2 * mm           # mirror core, centered in the depth
 PERSEUS_COMBINER_CENTER = jnp.array([7.0 * mm, 24.0 * mm, 1.6 * mm])
@@ -109,10 +114,16 @@ PERSEUS_FOV_AROUND_X = 10.0 * deg
 PERSEUS_FOV_AROUND_PROJECTOR_Y = 12.0 * deg
 
 
-def uniform_spacings(num_mirrors: int,
-                     spacing: float = PERSEUS_MIRROR_Y_SPACING) -> jnp.ndarray:
-    """``(num_mirrors - 1,)`` equal mirror-center gaps along y."""
-    return jnp.full((num_mirrors - 1,), spacing)
+def spacings_for_count(num_mirrors: int,
+                       stack_span: float = PERSEUS_MIRROR_STACK_SPAN
+                       ) -> jnp.ndarray:
+    """``(num_mirrors - 1,)`` equal mirror-center y-gaps summing to ``stack_span``.
+
+    Changing ``num_mirrors`` keeps the stack's total y-extent fixed at
+    ``stack_span`` and just repacks the mirrors — more mirrors ⇒ smaller gaps —
+    so a single count knob controls the whole layout.
+    """
+    return jnp.full((num_mirrors - 1,), stack_span / (num_mirrors - 1))
 
 
 class PerseusGeometry(NamedTuple):
@@ -253,7 +264,7 @@ def build_perseus_geometry(
 def build_perseus_system(
     *,
     num_mirrors: int = PERSEUS_NUM_MIRRORS,
-    mirror_y_spacing: float = PERSEUS_MIRROR_Y_SPACING,
+    stack_span: float = PERSEUS_MIRROR_STACK_SPAN,
     base_ratio: float = PERSEUS_BASE_RATIO,
     pantoscopic_tilt: float = PERSEUS_PANTOSCOPIC_TILT,
     projector_tilt: float = PERSEUS_PROJECTOR_TILT,
@@ -262,13 +273,14 @@ def build_perseus_system(
 ) -> OpticalSystem:
     """Build the Perseus reference system with baked flat reflectances.
 
-    Each mirror gets a wavelength-flat, Talos-compensated reflectance
-    (``base_ratio / (1 - i·base_ratio)``) on the default mirror wavelength
-    grid — the fixed-design analogue of the flat driver's warm start. Extra
+    ``num_mirrors`` is the single layout knob: the mirror-center gaps are
+    derived so the stack always fills ``stack_span`` (see
+    :func:`spacings_for_count`). Each mirror gets a wavelength-flat,
+    Talos-compensated reflectance (``base_ratio / (1 - i·base_ratio)``). Extra
     ``geometry_kwargs`` pass straight through to :func:`build_perseus_geometry`.
     """
     geometry = build_perseus_geometry(
-        spacings=uniform_spacings(num_mirrors, mirror_y_spacing),
+        spacings=spacings_for_count(num_mirrors, stack_span),
         pantoscopic_tilt=pantoscopic_tilt, projector_tilt=projector_tilt,
         chassis_z=chassis_z, **geometry_kwargs)
 

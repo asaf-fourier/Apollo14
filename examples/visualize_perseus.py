@@ -57,6 +57,7 @@ from apollo14.elements.pupil import RectangularPupil
 from apollo14.geometry import (
     compute_local_axes, normalize, rotate_points, rotate_vectors)
 from apollo14.materials import agc_m074, air
+from apollo14.perseus import PERSEUS_MIRROR_STACK_SPAN, PERSEUS_NUM_MIRRORS
 from apollo14.projector import FovGrid, PlayNitrideLed
 from apollo14.route import combiner_main_path
 from apollo14.system import OpticalSystem
@@ -112,10 +113,13 @@ APERTURE_INNER_HEIGHT = 2.0 * mm   # tight height; center shifted to pass the mo
 
 # Combiner (glass chassis + cascade of tilted partial mirrors)
 COMBINER_PANTOSCOPIC_TILT = 7.0 * deg          # CCW about world-x (normal tilt)
-COMBINER_NUM_MIRRORS = 10
+COMBINER_NUM_MIRRORS = PERSEUS_NUM_MIRRORS      # the single count knob (in the library)
 COMBINER_PRISM_ANGLE = 10.578 * deg            # top-side wedge (chassis z-skew)
 MIRROR_TO_COMBINER_NORMAL_ANGLE = (90 - 50.289) * deg  # mirror normal vs combiner normal
-MIRROR_Y_SPACING = 1.0 * mm                    # mirror-center spacing along y
+# Per-mirror gap derived so the stack fills a fixed y-extent regardless of count
+# (PERSEUS_MIRROR_STACK_SPAN, shared with the library) — change PERSEUS_NUM_MIRRORS
+# and the mirrors repack the same region (more mirrors ⇒ smaller gaps).
+MIRROR_Y_SPACING = PERSEUS_MIRROR_STACK_SPAN / (COMBINER_NUM_MIRRORS - 1)
 COMBINER_DEPTH = 3.0 * mm                      # full chassis thickness (z)
 MIRROR_Z_EXTENT = 1.2 * mm                     # mirror core, centered in the depth
 COMBINER_MATERIAL = agc_m074                   # glass; env outside is air
@@ -312,6 +316,56 @@ def normal_trace(position, direction, name, color) -> go.Scatter3d:
     )
 
 
+def angle_arc_traces(apex, dir_a, dir_b, *, radius=1.3 * mm,
+                     line_length=2.0 * mm, color="magenta",
+                     num_points=48) -> list:
+    """Mark the angle between directions ``dir_a`` and ``dir_b`` at ``apex``.
+
+    Draws the two directions as radial lines from ``apex``, a great-circle arc
+    sweeping between them at ``radius``, and a text label at the bisector giving
+    the angle between the two directions in degrees. Returns a list of
+    ``go.Scatter3d`` traces ready for ``fig.add_traces``.
+    """
+    apex = np.asarray(apex, dtype=float)
+    unit_a = np.asarray(dir_a, dtype=float)
+    unit_a = unit_a / np.linalg.norm(unit_a)
+    unit_b = np.asarray(dir_b, dtype=float)
+    unit_b = unit_b / np.linalg.norm(unit_b)
+
+    theta = float(np.arccos(np.clip(np.dot(unit_a, unit_b), -1.0, 1.0)))
+    sin_theta = np.sin(theta)
+
+    # Slerp from unit_a to unit_b for a true great-circle arc between them.
+    fractions = np.linspace(0.0, 1.0, num_points)[:, None]
+    arc_dirs = (np.sin((1.0 - fractions) * theta) * unit_a
+                + np.sin(fractions * theta) * unit_b) / sin_theta
+    arc = apex[None, :] + radius * arc_dirs
+
+    def _radial(direction, **line_kw):
+        end = apex + line_length * direction
+        return go.Scatter3d(
+            x=[apex[0], end[0]], y=[apex[1], end[1]], z=[apex[2], end[2]],
+            mode="lines", line=line_kw, hoverinfo="skip", showlegend=False)
+
+    bisector = unit_a + unit_b
+    bisector = bisector / np.linalg.norm(bisector)
+    label_pos = apex + radius * 1.45 * bisector
+
+    return [
+        _radial(unit_a, color=color, width=3),
+        _radial(unit_b, color=color, width=3, dash="dot"),
+        go.Scatter3d(
+            x=arc[:, 0], y=arc[:, 1], z=arc[:, 2], mode="lines",
+            line=dict(color=color, width=5),
+            name="mirror↔combiner normal angle", hoverinfo="name"),
+        go.Scatter3d(
+            x=[label_pos[0]], y=[label_pos[1]], z=[label_pos[2]],
+            mode="text", text=[f"{np.degrees(theta):.1f}°"],
+            textfont=dict(size=15, color=color),
+            hoverinfo="skip", showlegend=False),
+    ]
+
+
 def main():
     projector = build_projector()
 
@@ -400,6 +454,17 @@ def main():
             APERTURE_POSITION, APERTURE_NORMAL, "aperture normal", "orange"))
     fig.add_trace(normal_trace(
         COMBINER_CENTER, COMBINER_NORMAL, "combiner normal", "lime"))
+
+    # Arc + label marking the angle between the 4th mirror's normal and the
+    # combiner normal (drawn at the 4th mirror; all mirrors share this angle).
+    fourth_mirror = mirrors[3]           # the 4th mirror (0-indexed mirror_3)
+    normal_angle_deg = float(np.degrees(np.arccos(np.clip(np.dot(
+        np.asarray(fourth_mirror.normal) / np.linalg.norm(fourth_mirror.normal),
+        np.asarray(COMBINER_NORMAL) / np.linalg.norm(COMBINER_NORMAL)),
+        -1.0, 1.0))))
+    print(f"4th-mirror normal vs combiner normal: {normal_angle_deg:.3f} deg")
+    fig.add_traces(angle_arc_traces(
+        fourth_mirror.position, fourth_mirror.normal, COMBINER_NORMAL))
 
     # Target eyebox — an EYEBOX_SIZE square drawn on the pupil plane, centered
     # on the pupil center, so you can see how the ray landing sits inside it.

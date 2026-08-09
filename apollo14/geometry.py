@@ -28,7 +28,11 @@ def snell_refract(direction, normal, n1, n2):
     """Snell's law refraction.
 
     Returns (refracted_direction, is_tir).
-    normal must point into the medium the ray is entering (toward n2 side).
+    normal must oppose the ray — it points back into the incident (n1) medium,
+    so that ``dot(normal, direction) < 0`` and ``cos_i`` below comes out
+    positive. Callers orient it with the idiom
+    ``where(dot(dir, n) < 0, n, -n)``; feeding the outward-facing normal
+    instead reverses the refracted ray rather than bending it.
     If TIR, returns the reflected direction instead.
     """
     cos_i = -jnp.dot(normal, direction)

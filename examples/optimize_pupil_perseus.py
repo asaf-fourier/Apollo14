@@ -5,18 +5,21 @@ The Perseus analogue of :mod:`examples.optimize_pupil_rgb`. It optimizes the
 — the differentiable counterpart of :func:`apollo14.perseus.build_perseus_system`)
 rather than the flat/Talos cascade:
 
-- **Tilted 10-mirror stack** inside a 3.0 mm chassis, with the Perseus
-  rigid-body tilts baked into the builder (pantoscopic tilt about the combiner
-  center, projector leaning ``PERSEUS_PROJECTOR_TILT`` ≈ 13.4° into it). The
-  library geometry now matches ``examples/visualize_perseus.py`` exactly.
-- **Per-color RGB reflectance** — each mirror is a
-  :class:`~apollo14.spectral.SumOfGaussiansCurve` on a 5-band basis, so the
-  optimizer can white-balance the eyebox (amplitudes **and** widths per band).
-- **Frozen spacings** — the inter-mirror gaps are fixed at the Perseus
-  ``1.0 mm`` mirror-center y-spacing and never optimized, so hard
+- **Tilted mirror stack** inside a 3.0 mm chassis, with the Perseus rigid-body
+  tilts baked into the builder (pantoscopic tilt about the combiner center,
+  projector leaning ``PERSEUS_PROJECTOR_TILT`` ≈ 13.4° into it). The library
+  geometry matches ``examples/visualize_perseus.py`` exactly. ``NUM_MIRRORS`` is
+  a single layout knob — the per-mirror gap is re-derived so the stack always
+  fills the same y-extent (``PERSEUS_MIRROR_STACK_SPAN``).
+- **Reflectance model** — ``CURVE_MODE`` selects ``"rgb"`` (per-mirror 5-band
+  :class:`~apollo14.spectral.SumOfGaussiansCurve`, two phases, white-balanced)
+  or ``"flat"`` (one wavelength-uniform
+  :class:`~apollo14.spectral.ConstantCurve` scalar per mirror, a single target
+  phase — like ``optimize_pupil_flat``).
+- **Frozen spacings** — the mirror gaps are frozen (never optimized), so hard
   nearest-neighbor binning suffices (no soft/bilinear binning, no gradients).
 
-Two phases, exactly as in the RGB driver:
+Phases (``"rgb"`` runs both; ``"flat"`` runs phase 1 only):
 
 1. **Target** — pull every eyebox cell to the per-cell brightness target
    (symmetric squared error). Shape (color) term off.
@@ -50,9 +53,10 @@ from apollo14.perseus import (
     PERSEUS_FOV_AROUND_PROJECTOR_Y,
     PERSEUS_FOV_AROUND_X,
     PERSEUS_LIGHT_POSITION,
-    PERSEUS_MIRROR_Y_SPACING,
+    PERSEUS_MIRROR_STACK_SPAN,
     PERSEUS_NUM_MIRRORS,
     PERSEUS_PROJECTOR_DIRECTION,
+    spacings_for_count,
 )
 from apollo14.projector import PlayNitrideLed, FovGrid
 from apollo14.spectral import ConstantCurve, SumOfGaussiansCurve
@@ -78,10 +82,13 @@ enable_jax_compilation_cache()
 # num_mirrors, chassis depth and mirror spacing come from the Perseus library
 # constants, so this driver optimizes exactly the system build_perseus_system
 # builds — which now matches examples/visualize_perseus.py element-for-element.
-NUM_MIRRORS = PERSEUS_NUM_MIRRORS          # 10
+# NUM_MIRRORS is the single layout knob — change it and the per-mirror gap is
+# re-derived so the stack still fills PERSEUS_MIRROR_STACK_SPAN (more mirrors ⇒
+# smaller gaps). Spacings are frozen (not optimized).
+NUM_MIRRORS = PERSEUS_NUM_MIRRORS          # ← tune the mirror count here
 CHASSIS_Z = PERSEUS_CHASSIS_Z              # 3.0 mm full combiner depth
-SEED_SPACING = PERSEUS_MIRROR_Y_SPACING    # 1.0 mm mirror-center y-gap, frozen
-FROZEN_SPACINGS = jnp.full((NUM_MIRRORS - 1,), SEED_SPACING)
+FROZEN_SPACINGS = spacings_for_count(NUM_MIRRORS)   # (M-1,) span-constant gaps
+SEED_SPACING = PERSEUS_MIRROR_STACK_SPAN / (NUM_MIRRORS - 1)   # per-mirror gap
 
 # Spacings are NOT a design variable here — only the reflectance curves are.
 # Frozen spacings ⇒ hard nearest-neighbor binning is sufficient.

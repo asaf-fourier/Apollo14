@@ -8,6 +8,7 @@ dependencies = [
     "jaxlib",
     "plotly",
     "numpy",
+    "atlas",
 ]
 
 [project.optional-dependencies]
@@ -47,6 +48,9 @@ ignore = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["apollo14", "helios"]
+
+[tool.uv.sources]
+atlas = { path = "../Atlas", editable = true }
 
 [build-system]
 requires = ["hatchling"]
