@@ -6,6 +6,7 @@ that together conserve energy, and the reflected geometry matches a
 hand-computed golden case.
 """
 
+import jax
 import jax.numpy as jnp
 
 from apollo14.elements.partial_mirror import (
@@ -16,7 +17,8 @@ from apollo14.elements.partial_mirror import (
 from apollo14.geometry import normalize
 from apollo14.materials import air
 from apollo14.ray import Ray
-from apollo14.route import REFLECT, TRANSMIT
+from apollo14.route import REFLECT, TRANSMIT, Route, _group_mirror_runs
+from apollo14.trace import prepare_route
 from apollo14.units import nm
 
 
@@ -42,16 +44,27 @@ def _incident_ray(intensity=1.0):
     )
 
 
-def test_energy_conservation_reflect_plus_transmit():
-    mirror = _mirror(reflectance=0.3)
+def _prepared_segments(mirror, wavelength):
     reflect_seg, _ = mirror.build_segment(air, REFLECT)
     transmit_seg, _ = mirror.build_segment(air, TRANSMIT)
+    transmit_stack, = _group_mirror_runs([transmit_seg])
+
+    prepared_reflect, = prepare_route(
+        Route(segments=(reflect_seg,)), wavelength).segments
+    prepared_stack, = prepare_route(
+        Route(segments=(transmit_stack,)), wavelength).segments
+    prepared_transmit = jax.tree.map(lambda value: value[0], prepared_stack)
+    return prepared_reflect, prepared_transmit
+
+
+def test_energy_conservation_reflect_plus_transmit():
+    mirror = _mirror(reflectance=0.3)
     ray = _incident_ray(intensity=1.0)
     wavelength = 550.0 * nm
+    reflect_seg, transmit_seg = _prepared_segments(mirror, wavelength)
 
-    reflected, _, reflect_valid = mirror_reflect_one(reflect_seg, ray, wavelength)
-    transmitted, _, transmit_valid = mirror_transmit_one(
-        transmit_seg, ray, wavelength)
+    reflected, _, reflect_valid = mirror_reflect_one(reflect_seg, ray)
+    transmitted, _, transmit_valid = mirror_transmit_one(transmit_seg, ray)
 
     assert bool(reflect_valid) and bool(transmit_valid)
     # r + (1 - r) = 1 — no energy created or lost at the coating.
@@ -64,21 +77,19 @@ def test_energy_conservation_reflect_plus_transmit():
 def test_energy_conservation_scales_with_input():
     """Split fractions hold for an arbitrary incoming intensity."""
     mirror = _mirror(reflectance=0.25)
-    reflect_seg, _ = mirror.build_segment(air, REFLECT)
-    transmit_seg, _ = mirror.build_segment(air, TRANSMIT)
+    reflect_seg, transmit_seg = _prepared_segments(mirror, 550.0 * nm)
     ray = _incident_ray(intensity=0.4)
 
-    reflected, _, _ = mirror_reflect_one(reflect_seg, ray, 550.0 * nm)
-    transmitted, _, _ = mirror_transmit_one(transmit_seg, ray, 550.0 * nm)
+    reflected, _, _ = mirror_reflect_one(reflect_seg, ray)
+    transmitted, _, _ = mirror_transmit_one(transmit_seg, ray)
     assert abs(float(reflected.intensity)
                + float(transmitted.intensity) - 0.4) < 1e-5
 
 
 def test_golden_reflected_ray():
     mirror = _mirror(reflectance=0.3)
-    reflect_seg, _ = mirror.build_segment(air, REFLECT)
-    reflected, hit, _ = mirror_reflect_one(reflect_seg, _incident_ray(),
-                                           550.0 * nm)
+    reflect_seg, _ = _prepared_segments(mirror, 550.0 * nm)
+    reflected, hit, _ = mirror_reflect_one(reflect_seg, _incident_ray())
     # Hand-computed: hits the y=0 plane at the origin; a 45° down-right ray
     # reflects to up-right off a +Y normal.
     assert jnp.allclose(hit, jnp.array([0.0, 0.0, 0.0]), atol=1e-5)
@@ -88,9 +99,8 @@ def test_golden_reflected_ray():
 
 def test_transmit_preserves_direction():
     mirror = _mirror(reflectance=0.3)
-    transmit_seg, _ = mirror.build_segment(air, TRANSMIT)
-    transmitted, _, _ = mirror_transmit_one(transmit_seg, _incident_ray(),
-                                            550.0 * nm)
+    _, transmit_seg = _prepared_segments(mirror, 550.0 * nm)
+    transmitted, _, _ = mirror_transmit_one(transmit_seg, _incident_ray())
     # A thin coating in one medium doesn't bend the transmitted ray.
     assert jnp.allclose(transmitted.dir, _incident_ray().dir, atol=1e-6)
 
@@ -109,10 +119,10 @@ def test_transmit_miss_passes_through_unchanged():
     """A live ray that misses the rectangle is NOT terminated — it keeps its
     intensity and direction and continues (only its interaction is skipped)."""
     mirror = _mirror(reflectance=0.3)
-    transmit_seg, _ = mirror.build_segment(air, TRANSMIT)
+    _, transmit_seg = _prepared_segments(mirror, 550.0 * nm)
     ray = _missing_ray(intensity=0.8)
 
-    transmitted, _, valid = mirror_transmit_one(transmit_seg, ray, 550.0 * nm)
+    transmitted, _, valid = mirror_transmit_one(transmit_seg, ray)
 
     assert not bool(valid)                                    # no interaction
     assert abs(float(transmitted.intensity) - 0.8) < 1e-6     # intensity kept
@@ -122,10 +132,10 @@ def test_transmit_miss_passes_through_unchanged():
 def test_transmit_dead_ray_stays_dead():
     """A ray that already died upstream (intensity 0) is never resurrected."""
     mirror = _mirror(reflectance=0.3)
-    transmit_seg, _ = mirror.build_segment(air, TRANSMIT)
+    _, transmit_seg = _prepared_segments(mirror, 550.0 * nm)
     ray = _incident_ray(intensity=0.0)  # hits the rectangle, but is a corpse
 
-    transmitted, _, valid = mirror_transmit_one(transmit_seg, ray, 550.0 * nm)
+    transmitted, _, valid = mirror_transmit_one(transmit_seg, ray)
 
     assert not bool(valid)
     assert float(transmitted.intensity) == 0.0

@@ -418,7 +418,7 @@ def main():
             direction=direction, wavelength=viz_wavelength)
         for route in routes:
             trace_results.append(
-                _trace_rays_jit(route, beam, wavelength=viz_wavelength))
+                _trace_rays_jit(route, beam))
 
     print(f"Traced {len(trace_results)} beams "
           f"({len(fov_grid)} angles x {len(routes)} routes). Rendering...")

@@ -1,9 +1,9 @@
 """Partial mirror — splits light into reflected and transmitted fractions.
 
 Reflectance is stored as a sampled spectral curve: a shared ``wavelengths``
-grid and a per-mirror ``reflectance`` array. At trace time the effective
-reflectance is ``jnp.interp(wavelength, wavelengths, reflectance)`` —
-differentiable w.r.t. the control values and continuous in wavelength.
+grid and a per-mirror ``reflectance`` array. During route preparation the
+effective reflectance is interpolated at the trace wavelength — differentiable
+with respect to the control values and continuous in wavelength.
 
 Reflectance can be supplied two ways:
 
@@ -76,6 +76,26 @@ class ReflectMirrorSeg(NamedTuple):
     reflectance: jnp.ndarray    # (K,)
 
 
+class PreparedMirrorStackSeg(NamedTuple):
+    """Wavelength-resolved transmit mirrors, ready for tracing."""
+    position: jnp.ndarray       # (M, 3)
+    normal: jnp.ndarray         # (M, 3)
+    local_x: jnp.ndarray        # (M, 3)
+    local_y: jnp.ndarray        # (M, 3)
+    half_extents: jnp.ndarray   # (M, 2)
+    reflectance: jnp.ndarray    # (M,)
+
+
+class PreparedReflectMirrorSeg(NamedTuple):
+    """One wavelength-resolved reflecting mirror, ready for tracing."""
+    position: jnp.ndarray       # (3,)
+    normal: jnp.ndarray
+    local_x: jnp.ndarray
+    local_y: jnp.ndarray
+    half_extents: jnp.ndarray
+    reflectance: jnp.ndarray    # scalar
+
+
 @dataclass
 class PartialMirror(PlanarElement):
     reflectance: jnp.ndarray = None   # (K,) sampled reflectance curve
@@ -126,12 +146,7 @@ class PartialMirror(PlanarElement):
         return seg, current_material
 
 
-def _interp_reflectance(wavelengths, reflectance, wavelength):
-    """``jnp.interp`` with a consistent float32 output."""
-    return jnp.interp(wavelength, wavelengths, reflectance)
-
-
-def mirror_transmit_one(mirror_params, ray: Ray, wavelength):
+def mirror_transmit_one(mirror_params: PreparedMirrorStackSeg, ray: Ray):
     """Transmit through one partial mirror (used inside ``lax.scan``).
 
     The mirror coating is a thin layer inside a single medium, so the
@@ -150,9 +165,7 @@ def mirror_transmit_one(mirror_params, ray: Ray, wavelength):
 
     hit, _, in_bounds = ray_intersect_planar_seg(ray, mirror_params)
 
-    r = _interp_reflectance(
-        mirror_params.wavelengths, mirror_params.reflectance, wavelength)
-    attenuated = ray.intensity * (1.0 - r)
+    attenuated = ray.intensity * (1.0 - mirror_params.reflectance)
 
     # Attenuate only where a live ray crosses the rectangle; otherwise the
     # ray passes through unchanged (a live miss keeps its intensity; a dead
@@ -163,7 +176,7 @@ def mirror_transmit_one(mirror_params, ray: Ray, wavelength):
     return Ray(pos=out_pos, dir=ray.dir, intensity=out_intensity), hit, interacted
 
 
-def mirror_reflect_one(seg: ReflectMirrorSeg, ray: Ray, wavelength):
+def mirror_reflect_one(seg: PreparedReflectMirrorSeg, ray: Ray):
     """Reflect off one partial mirror (branch fork point)."""
     alive_in = ray.intensity > 0
 
@@ -172,8 +185,7 @@ def mirror_reflect_one(seg: ReflectMirrorSeg, ray: Ray, wavelength):
     facing = jnp.where(jnp.dot(ray.dir, seg.normal) < 0,
                        seg.normal, -seg.normal)
     reflected = reflect(ray.dir, facing)
-    r = _interp_reflectance(seg.wavelengths, seg.reflectance, wavelength)
-    new_intensity = ray.intensity * r
+    new_intensity = ray.intensity * seg.reflectance
 
     valid = in_bounds & alive_in
     out_intensity = jnp.where(valid, new_intensity, 0.0)

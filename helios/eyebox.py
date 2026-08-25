@@ -64,7 +64,7 @@ def trace_branch_over_fov(route, projector, eyebox_points, wavelength,
     def per_direction(direction):
         ray = projector.generate_rays(direction=direction,
                                       wavelength=wavelength)
-        traced = trace_rays(route, ray, wavelength=wavelength)
+        traced = trace_rays(route, ray)
         if lattice is not None:
             return bin_hits_bilinear(traced, lattice)
         if sigma is not None:

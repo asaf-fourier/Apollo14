@@ -77,7 +77,7 @@ class TestEyebox:
                 for s in route.segments
             )
             prepared = prepare_route(Route(segments=new_segs), 550e-6)
-            tr = trace_rays(prepared, ray, wavelength=525e-6)
+            tr = trace_rays(prepared, ray)
             return jnp.sum(tr.final_intensity)
 
         grads = jax.grad(loss)(stack.reflectance)
@@ -150,7 +150,7 @@ class TestBranchGeometry:
             def trace_dir(direction):
                 ray = projector.generate_rays(direction=direction,
                                               wavelength=wavelength)
-                res = trace_rays(route, ray, wavelength=wavelength)
+                res = trace_rays(route, ray)
                 return res.final_pos, res.final_dir, res.valids[:, -1]
 
             pos_all, dir_all, valid_all = jax.vmap(trace_dir)(

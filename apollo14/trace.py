@@ -19,6 +19,8 @@ from apollo14.elements.aperture import ApertureSeg, aperture_interact
 from apollo14.elements.glass_block import FaceSeg, face_interact
 from apollo14.elements.partial_mirror import (
     MirrorStackSeg,
+    PreparedMirrorStackSeg,
+    PreparedReflectMirrorSeg,
     ReflectMirrorSeg,
     mirror_reflect_one,
     mirror_transmit_one,
@@ -55,27 +57,63 @@ def _resolve_face(seg: FaceSeg, wavelength) -> FaceSeg:
     )
 
 
-def prepare_route(route: Route, wavelength) -> Route:
-    """Resolve every ``FaceSeg``'s ``MaterialData`` to a scalar n at
-    ``wavelength``. Mirror/aperture/pupil segments pass through unchanged.
-    """
-    new_segs = tuple(
-        _resolve_face(s, wavelength) if isinstance(s, FaceSeg) else s
-        for s in route.segments
+def _resolve_mirror_stack(seg: MirrorStackSeg, wavelength) -> PreparedMirrorStackSeg:
+    reflectance = jax.vmap(
+        lambda wavelengths, samples: jnp.interp(wavelength, wavelengths, samples)
+    )(seg.wavelengths, seg.reflectance)
+    return PreparedMirrorStackSeg(
+        position=seg.position,
+        normal=seg.normal,
+        local_x=seg.local_x,
+        local_y=seg.local_y,
+        half_extents=seg.half_extents,
+        reflectance=reflectance,
     )
-    return Route(segments=new_segs)
+
+
+def _resolve_reflect_mirror(
+    seg: ReflectMirrorSeg, wavelength
+) -> PreparedReflectMirrorSeg:
+    return PreparedReflectMirrorSeg(
+        position=seg.position,
+        normal=seg.normal,
+        local_x=seg.local_x,
+        local_y=seg.local_y,
+        half_extents=seg.half_extents,
+        reflectance=jnp.interp(wavelength, seg.wavelengths, seg.reflectance),
+    )
+
+
+def prepare_route(route: Route, wavelength) -> Route:
+    """Resolve all wavelength-dependent route data before tracing."""
+    new_segs = []
+    for seg in route.segments:
+        if isinstance(seg, FaceSeg):
+            new_segs.append(_resolve_face(seg, wavelength))
+        elif isinstance(seg, MirrorStackSeg):
+            new_segs.append(_resolve_mirror_stack(seg, wavelength))
+        elif isinstance(seg, ReflectMirrorSeg):
+            new_segs.append(_resolve_reflect_mirror(seg, wavelength))
+        else:
+            new_segs.append(seg)
+    return Route(segments=tuple(new_segs))
 
 
 # ── Tracing ──────────────────────────────────────────────────────────────────
 
-def trace(route: Route, ray: Ray, wavelength: float = 0.0) -> TraceResult:
+def trace(route: Route, ray: Ray) -> TraceResult:
     """Trace one ``Ray`` through a wavelength-resolved ``Route``.
 
-    ``wavelength`` is passed to each element's interact function. Elements
-    that care (partial mirrors) use it to interpolate their reflectance
-    curve; aperture/face/pupil ignore it at trace time — face index is
-    already resolved to a scalar by ``prepare_route``.
+    All wavelength-dependent material indices and mirror reflectances must
+    already be resolved by :func:`prepare_route`.
     """
+    for seg in route.segments:
+        is_raw_face = isinstance(seg, FaceSeg) and isinstance(seg.n1, MaterialData)
+        if isinstance(seg, (MirrorStackSeg, ReflectMirrorSeg)) or is_raw_face:
+            raise TypeError(
+                "Route contains unprepared wavelength-dependent segments; "
+                "call prepare_route(route, wavelength) before tracing.")
+
     hits_accum = []
     valids_accum = []
 
@@ -85,27 +123,27 @@ def trace(route: Route, ray: Ray, wavelength: float = 0.0) -> TraceResult:
 
     for seg in route.segments:
         if isinstance(seg, ApertureSeg):
-            ray, hit, valid = aperture_interact(seg, ray, wavelength)
+            ray, hit, valid = aperture_interact(seg, ray, 0.0)
             _push(hit, valid)
 
         elif isinstance(seg, FaceSeg):
-            ray, hit, valid = face_interact(seg, ray, wavelength)
+            ray, hit, valid = face_interact(seg, ray, 0.0)
             _push(hit, valid)
 
-        elif isinstance(seg, MirrorStackSeg):
+        elif isinstance(seg, PreparedMirrorStackSeg):
             def step(r, params):
-                r_out, hit, valid = mirror_transmit_one(params, r, wavelength)
+                r_out, hit, valid = mirror_transmit_one(params, r)
                 return r_out, (hit, valid)
             ray, (stack_hits, stack_valids) = jax.lax.scan(step, ray, seg)
             hits_accum.append(stack_hits)
             valids_accum.append(stack_valids)
 
-        elif isinstance(seg, ReflectMirrorSeg):
-            ray, hit, valid = mirror_reflect_one(seg, ray, wavelength)
+        elif isinstance(seg, PreparedReflectMirrorSeg):
+            ray, hit, valid = mirror_reflect_one(seg, ray)
             _push(hit, valid)
 
         elif isinstance(seg, PupilSeg):
-            ray, hit, valid = pupil_interact(seg, ray, wavelength)
+            ray, hit, valid = pupil_interact(seg, ray, 0.0)
             _push(hit, valid)
 
         else:
@@ -123,21 +161,19 @@ def trace(route: Route, ray: Ray, wavelength: float = 0.0) -> TraceResult:
     )
 
 
-def trace_rays(route: Route, ray: Ray, wavelength: float = 0.0) -> TraceResult:
+def trace_rays(route: Route, ray: Ray) -> TraceResult:
     """Trace a batched ``Ray`` through a ``Route``.
 
     ``ray.pos`` must be ``(N, 3)`` and ``ray.intensity`` ``(N,)``; ``ray.dir``
     is ``(3,)`` and shared across all rays (collimated beam). Returns a
     ``TraceResult`` whose fields carry a leading batch dim of ``N``.
 
-    ``wavelength`` is a scalar (float or traced) that drives mirror
-    reflectance curve evaluation. Faces must already be resolved for the
-    same wavelength via ``prepare_route``.
+    The route must already be wavelength-resolved via :func:`prepare_route`.
     """
     shared_dir = jnp.asarray(ray.dir, dtype=jnp.float32)
 
     def one(pos, intensity):
         r = Ray(pos=pos, dir=shared_dir, intensity=intensity)
-        return trace(route, r, wavelength)
+        return trace(route, r)
 
     return jax.vmap(one)(ray.pos, ray.intensity)

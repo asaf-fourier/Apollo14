@@ -227,7 +227,7 @@ def trace_scan(routes, projector, wavelength, fov_grid) -> list:
         beam = projector.generate_rays(direction=direction,
                                        wavelength=wavelength)
         for route in routes:
-            results.append(_trace_rays_jit(route, beam, wavelength=wavelength))
+            results.append(_trace_rays_jit(route, beam))
     return results
 
 

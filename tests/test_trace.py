@@ -2,6 +2,7 @@
 
 import jax
 import jax.numpy as jnp
+import pytest
 
 from apollo14.combiner import (
     DEFAULT_LIGHT_DIRECTION,
@@ -11,7 +12,11 @@ from apollo14.combiner import (
 )
 from apollo14.elements.aperture import ApertureSeg
 from apollo14.elements.glass_block import FaceSeg
-from apollo14.elements.partial_mirror import MirrorStackSeg, PartialMirror
+from apollo14.elements.partial_mirror import (
+    MirrorStackSeg,
+    PartialMirror,
+    PreparedMirrorStackSeg,
+)
 from apollo14.elements.pupil import PupilSeg
 from apollo14.materials import air
 from apollo14.ray import Ray
@@ -98,8 +103,54 @@ class TestPrepareRoute:
         assert faces[0].n1.shape == ()
         assert faces[0].n2.shape == ()
 
+    def test_mirror_reflectance_is_resolved(self):
+        system = build_default_system()
+        route = combiner_main_path(system)
+        raw_stack = _mirror_stack(route)
+
+        wavelength = 500.0 * nm
+        prepared = prepare_route(route, wavelength)
+        prepared_stack = next(
+            seg for seg in prepared.segments
+            if isinstance(seg, PreparedMirrorStackSeg)
+        )
+
+        expected = jax.vmap(
+            lambda wavelengths, reflectance: jnp.interp(
+                wavelength, wavelengths, reflectance)
+        )(raw_stack.wavelengths, raw_stack.reflectance)
+        assert prepared_stack.reflectance.shape == (6,)
+        assert jnp.allclose(prepared_stack.reflectance, expected)
+
+    def test_dynamic_wavelength_jit_resolves_mirrors(self):
+        system = build_default_system()
+        route = combiner_main_path(system)
+        stack = _mirror_stack(route)
+        spectral_reflectance = jnp.broadcast_to(
+            jnp.array([0.01, 0.05, 0.20]), stack.reflectance.shape)
+        route = _replace_mirror_reflectance(route, spectral_reflectance)
+
+        @jax.jit
+        def resolved_reflectance(wavelength):
+            prepared = prepare_route(route, wavelength)
+            prepared_stack = next(
+                seg for seg in prepared.segments
+                if isinstance(seg, PreparedMirrorStackSeg)
+            )
+            return prepared_stack.reflectance
+
+        blue = resolved_reflectance(460.0 * nm)
+        red = resolved_reflectance(630.0 * nm)
+        assert jnp.allclose(blue, 0.01)
+        assert jnp.allclose(red, 0.20)
+
 
 class TestTraceRay:
+
+    def test_unprepared_route_is_rejected(self):
+        system = build_default_system()
+        with pytest.raises(TypeError, match="unprepared wavelength-dependent"):
+            trace(combiner_main_path(system), _default_ray())
 
     def test_single_ray_shapes(self):
         system = build_default_system()
@@ -183,7 +234,7 @@ class TestTransmitMissSurvives:
         ray = Ray(pos=jnp.array([0.0, 10.0, 0.0]),
                   dir=jnp.array([0.0, -1.0, 0.0]),
                   intensity=jnp.asarray(1.0))
-        result = trace(route, ray, wavelength=550.0 * nm)
+        result = trace(prepare_route(route, 550.0 * nm), ray)
 
         # Only mirror_1 attenuates: 1 * (1 - 0.3) = 0.7. Not killed (0.0), and
         # not also hit by mirror_0 (which would give 0.5 * 0.7 = 0.35).
