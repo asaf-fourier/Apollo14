@@ -95,7 +95,7 @@ PERSEUS_APERTURE_OFFSET = 0.2 * mm           # downstream of the projector along
 PERSEUS_APERTURE_DROP_Y = 0.6 * mm           # extra drop, straight down the y axis
 PERSEUS_APERTURE_HEIGHT_SHIFT = 0.15 * mm    # recentre along the opening's height axis
 PERSEUS_APERTURE_OUTER = (14.0 * mm, 6.0 * mm)   # (width, height) opaque frame
-PERSEUS_APERTURE_INNER = (11.0 * mm, 2.0 * mm)   # (width, height) clear opening
+PERSEUS_APERTURE_INNER = (12.0 * mm, 3.0 * mm)   # (width, height) clear opening
 
 # ── Target pupil (eyebox detector) ──────────────────────────────────────────
 # Fixed in space (not rotated with the combiner); centred on where the reflected

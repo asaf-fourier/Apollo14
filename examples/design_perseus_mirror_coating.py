@@ -46,6 +46,8 @@ from pathlib import Path
 
 import numpy as np
 import jax.numpy as jnp
+import plotly.graph_objects as go
+from plotly.colors import sample_colorscale
 
 from apollo14.units import nm, mm
 from apollo14.materials import agc_m074
@@ -73,25 +75,26 @@ MIRROR_INDICES: list[int] | None = None
 REFERENCE_WAVELENGTH_NM = 550.0     # glass index / QWOT seed reference
 POLARIZATION = "both"               # combiner light is effectively unpolarized
 NUM_WAVELENGTHS = 120               # target sample points across the band
+SPECTRUM_NM = (440, 670)
 NUM_ANGLES = 5                      # AOI samples across the swept range
 
 # Alternating high/low-index films (DBR-style contrast) in AGC M-074 glass.
-NUM_SEED_FILMS = 9
-THICKNESS_BOUNDS_NM = (20.0, 300.0)
+NUM_SEED_FILMS = 15
+THICKNESS_BOUNDS_NM = (20.0, 200.0)
 TIO2_N_BOUNDS = (2.0, 2.525)        # PLD_TiO2 tunable index range
 AL2O3_N_BOUNDS = (1.47, 1.65)       # PLD_Al2O3 tunable index range
 SEED_N_HIGH = 2.50                  # QWOT seed indices (max Δn)
 SEED_N_LOW = 1.47
-THICKNESS_TOLERANCE_NM = 1
+THICKNESS_TOLERANCE_NM = 2
 N_TOLERANCE = 0.005
 
 # Optimizer budget PER MIRROR. Modest defaults so a full stack runs in minutes;
 # bump for production recipes (BH max_iterations→100+, local_maxiter→500).
-BH_MAX_ITERATIONS = 300
+BH_MAX_ITERATIONS = 400
 BH_LOCAL_MAXITER = 400
 BH_STEPSIZE = 0.2
 BH_TEMPERATURE = 0.01
-POLISH_MAX_ITERATIONS = 1500
+POLISH_MAX_ITERATIONS = 500
 
 SAVE_PER_MIRROR_PLOTS = True
 OUTPUT_ROOT = "examples/reports"
@@ -226,12 +229,16 @@ def _seed_layers(glass, seed_thickness_high, seed_thickness_low) -> list:
 def _seed_moveon_layers(moveon, seed_thickness_high, seed_thickness_low) -> list:
     """moveon materials only."""
     layers = [Layer(material=moveon.MR10)]
-    stack_materials = [moveon.SiO2, moveon.Ti3O5, moveon.SiO2, moveon.TiO2, moveon.Al2O3, moveon.TiO2, moveon.SiO2, moveon.Ti3O5, moveon.SiO2]
-    for i, material in enumerate(stack_materials):
-        is_high = i % 2 == 1
+    # stack_materials = [moveon.SiO2, moveon.Ti3O5, moveon.SiO2, moveon.TiO2, moveon.Al2O3, moveon.TiO2, moveon.SiO2, moveon.Ti3O5, moveon.SiO2]
+    # stack_materials = [moveon.SiO2, moveon.TiO2, moveon.SiO2, moveon.TiO2, moveon.SiO2, moveon.TiO2, moveon.SiO2, moveon.TiO2, moveon.SiO2, moveon.TiO2, moveon.SiO2, moveon.TiO2, moveon.SiO2]
+    # stack_materials = [moveon.TiO2, moveon.SiO2, moveon.TiO2, moveon.SiO2, moveon.TiO2]
+    # for i, material in enumerate(stack_materials):
+    for i in range(NUM_SEED_FILMS):
+        is_tio2 = i % 2 == 1
         layers.append(Layer(
-            material=material,
-            thickness=seed_thickness_high if is_high else seed_thickness_low,
+            # material=material,
+            material=moveon.TiO2 if is_tio2 else moveon.SiO2,
+            thickness=seed_thickness_high if is_tio2 else seed_thickness_low,
             vary_thickness=True,
             thickness_bounds=THICKNESS_BOUNDS_NM,
             thickness_tolerance=THICKNESS_TOLERANCE_NM,
@@ -261,8 +268,8 @@ def design_mirror(mirror_index, target_wavelengths_nm, target_reflectance,
     )
 
     designer = OpticalDesigner(
-        # layers=_seed_layers(glass, seed_thickness_high, seed_thickness_low),
-        layers=_seed_moveon_layers(Materials.moveon, seed_thickness_high, seed_thickness_low),
+        layers=_seed_layers(Materials.moveon.MR10, seed_thickness_high, seed_thickness_low),
+        # layers=_seed_moveon_layers(Materials.moveon, seed_thickness_high, seed_thickness_low),
         target=target)
     hop_state = {"hop": 0, "best": float("inf")}
 
@@ -304,6 +311,66 @@ def _layer_to_dict(layer) -> dict:
         "k": float(nk.imag),
         "is_tunable": bool(layer.material.is_tunable),
     }
+
+
+def save_mirror_plot_html(result, path: Path, config_text: str) -> None:
+    """Interactive target-vs-achieved plot for one mirror, as a Plotly HTML file.
+
+    Replaces Atlas's ``plot_per_angle`` PNG. These coatings sit near R≈3%, so a
+    static image over a fixed 0–1 axis buries the whole result on the axis line;
+    here the axes autoscale to the data and you can zoom into the per-angle
+    spread and the ripple between the projector's emission bands.
+    """
+    wavelengths_nm = np.asarray(result.wavelengths_nm)
+    target = np.asarray(result.target_reflectance)
+    achieved = np.asarray(result.reflectance)
+    if achieved.ndim == 1:
+        achieved = achieved[:, np.newaxis]
+    angles_deg = np.asarray(result.angles_deg)
+
+    figure = go.Figure()
+    # One trace per angle of incidence, coloured across the swept range.
+    colors = sample_colorscale(
+        "Viridis",
+        np.linspace(0.1, 0.9, achieved.shape[1]).tolist())
+    for angle_idx, (angle, color) in enumerate(zip(angles_deg, colors)):
+        figure.add_trace(go.Scatter(
+            x=wavelengths_nm, y=achieved[:, angle_idx],
+            mode="lines", name=f"{float(angle):.1f}°",
+            line=dict(color=color, width=1.5),
+            hovertemplate="%{x:.1f} nm<br>R=%{y:.4f}<extra>%{fullData.name}</extra>"))
+    # Target last so it draws on top of the achieved family.
+    figure.add_trace(go.Scatter(
+        x=wavelengths_nm, y=target, mode="lines", name="Target",
+        line=dict(color="black", width=2.5, dash="dash"),
+        hovertemplate="%{x:.1f} nm<br>target R=%{y:.4f}<extra>Target</extra>"))
+
+    if len(angles_deg) > 1:
+        angle_span = (f"{float(angles_deg[0]):.1f}°–{float(angles_deg[-1]):.1f}° "
+                      f"({len(angles_deg)} samples)")
+    else:
+        angle_span = f"{float(angles_deg[0]):.1f}°"
+
+    figure.update_layout(
+        title=(f"Target vs achieved reflectance — angles {angle_span}, "
+               f"merit={result.merit:.3e}"),
+        xaxis_title="Wavelength (nm)",
+        yaxis_title="Reflectance",
+        hovermode="x unified",
+        legend=dict(title="Angle"),
+        template="plotly_white",
+    )
+    # Free y-axis: the point of the HTML version is that the reader zooms
+    # instead of the author guessing a range.
+    figure.update_yaxes(rangemode="normal", tickformat=".3f")
+    figure.add_annotation(
+        text=config_text.replace("\n", "<br>"),
+        xref="paper", yref="paper", x=0.01, y=0.99,
+        showarrow=False, align="left",
+        font=dict(family="monospace", size=11),
+        bgcolor="rgba(255,255,255,0.85)", bordercolor="#bbbbbb", borderwidth=1)
+
+    figure.write_html(str(path), include_plotlyjs="cdn")
 
 
 def _result_to_dict(result) -> dict:
@@ -370,6 +437,7 @@ def main():
     run_start = time.perf_counter()
     for design_position, mirror_index in enumerate(indices):
         _, wavelengths_nm, reflectance = mirrors[mirror_index]
+        wavelengths_nm = np.linspace(SPECTRUM_NM[0], SPECTRUM_NM[1], len(wavelengths_nm))
         print(f"[{design_position + 1}/{len(indices)}] mirror {mirror_index}: "
               f"target R {reflectance.min():.3f}..{reflectance.max():.3f}")
         print("    target R(λ): " + "  ".join(
@@ -381,8 +449,9 @@ def main():
         print(f"    → merit {result.merit:.4e}, {len(result.film_layers)} films")
 
         if SAVE_PER_MIRROR_PLOTS:
-            result.plot_per_angle(
-                filename=str(out_dir / f"coating_mirror_{mirror_index}.png"),
+            save_mirror_plot_html(
+                result,
+                out_dir / f"coating_mirror_{mirror_index}.html",
                 config_text=(f"Perseus mirror #{mirror_index}/{num_mirrors}\n"
                              f"AOI {aoi_min:.1f}–{aoi_max:.1f}°  merit {result.merit:.3e}"))
 
@@ -464,7 +533,7 @@ def main():
               f"{min(target_values):.3f}..{max(target_values):.3f}")
     print(f"\nSaved consolidated design: {design_path}")
     if SAVE_PER_MIRROR_PLOTS:
-        print(f"Per-mirror plots:          {out_dir}/coating_mirror_*.png")
+        print(f"Per-mirror plots:          {out_dir}/coating_mirror_*.html")
 
 
 if __name__ == "__main__":
