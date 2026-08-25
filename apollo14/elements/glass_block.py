@@ -141,24 +141,25 @@ class GlassBlock:
         t_rb = jnp.array([hx, hy - z_skew, hz])
         t_lb = jnp.array([-hx, hy - z_skew, hz])
 
-        def _face(name, pos, normal, verts):
-            return GlassFace(name=name, position=pos,
+        def _face(name, normal, verts):
+            vertices = jnp.stack(verts)
+            return GlassFace(name=name, position=jnp.mean(vertices, axis=0),
                              normal=jnp.array(normal, dtype=float),
-                             vertices=jnp.stack(verts))
+                             vertices=vertices)
 
         def _face_from_edges(name, verts):
-            pos = verts[0]
+            vertices = jnp.stack(verts)
             e1 = normalize(verts[1] - verts[0])
             e2 = normalize(verts[3] - verts[0])
             n = normalize(jnp.cross(e1, e2))
-            return GlassFace(name=name, position=pos, normal=n,
-                             vertices=jnp.stack(verts))
+            return GlassFace(name=name, position=jnp.mean(vertices, axis=0),
+                             normal=n, vertices=vertices)
 
         faces = [
-            _face("bottom", b_lf, [0, 0, -1], [b_lf, b_rf, b_rb, b_lb]),
-            _face("top", t_lf, [0, 0, 1], [t_lf, t_lb, t_rb, t_rf]),
-            _face("left", b_lf, [-1, 0, 0], [b_lf, b_lb, t_lb, t_lf]),
-            _face("right", b_rf, [1, 0, 0], [b_rb, b_rf, t_rf, t_rb]),
+            _face("bottom", [0, 0, -1], [b_lf, b_rf, b_rb, b_lb]),
+            _face("top", [0, 0, 1], [t_lf, t_lb, t_rb, t_rf]),
+            _face("left", [-1, 0, 0], [b_lf, b_lb, t_lb, t_lf]),
+            _face("right", [1, 0, 0], [b_rb, b_rf, t_rf, t_rb]),
             _face_from_edges("front", [b_lf, b_rf, t_rf, t_lf]),
             _face_from_edges("back", [b_rb, b_lb, t_lb, t_rb]),
         ]

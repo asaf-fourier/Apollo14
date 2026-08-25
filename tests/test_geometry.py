@@ -1,6 +1,7 @@
 import jax.numpy as jnp
 from jax import grad
 
+from apollo14.elements.glass_block import GlassBlock
 from apollo14.geometry import (
     compute_local_axes,
     normalize,
@@ -11,6 +12,7 @@ from apollo14.geometry import (
     reflect,
     snell_refract,
 )
+from apollo14.materials import agc_m074
 
 
 def test_normalize():
@@ -164,3 +166,23 @@ def test_ray_rect_intersect_near_parallel_returns_inf():
         jnp.array([0.0, 0.0, 0.0]), jnp.array([1.0, 0.0, 0.0]), **_rect())
     assert not bool(in_bounds)
     assert jnp.isinf(t)
+
+
+def test_chassis_faces_are_centered_on_their_vertex_polygons():
+    """Face bounds must be measured from the polygon center, not a corner."""
+    chassis = GlassBlock.create_chassis(
+        name="chassis", x=14.0, y=20.0, z=2.0,
+        material=agc_m074, z_skew=0.25,
+    )
+
+    for face in chassis.faces:
+        expected_center = jnp.mean(face.vertices, axis=0)
+        assert jnp.allclose(face.position, expected_center, atol=1e-6)
+
+        deltas = face.vertices - expected_center
+        expected_half_extents = jnp.array([
+            jnp.max(jnp.abs(deltas @ face._local_x)),
+            jnp.max(jnp.abs(deltas @ face._local_y)),
+        ])
+        assert jnp.allclose(face.half_extents, expected_half_extents,
+                            atol=1e-6)
