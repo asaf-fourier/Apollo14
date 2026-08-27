@@ -79,7 +79,7 @@ SPECTRUM_NM = (440, 670)
 NUM_ANGLES = 5                      # AOI samples across the swept range
 
 # Alternating high/low-index films (DBR-style contrast) in AGC M-074 glass.
-NUM_SEED_FILMS = 15
+NUM_SEED_FILMS = 9
 THICKNESS_BOUNDS_NM = (20.0, 200.0)
 TIO2_N_BOUNDS = (2.0, 2.525)        # PLD_TiO2 tunable index range
 AL2O3_N_BOUNDS = (1.47, 1.65)       # PLD_Al2O3 tunable index range
@@ -90,7 +90,7 @@ N_TOLERANCE = 0.005
 
 # Optimizer budget PER MIRROR. Modest defaults so a full stack runs in minutes;
 # bump for production recipes (BH max_iterations→100+, local_maxiter→500).
-BH_MAX_ITERATIONS = 400
+BH_MAX_ITERATIONS = 200
 BH_LOCAL_MAXITER = 400
 BH_STEPSIZE = 0.2
 BH_TEMPERATURE = 0.01
@@ -268,8 +268,8 @@ def design_mirror(mirror_index, target_wavelengths_nm, target_reflectance,
     )
 
     designer = OpticalDesigner(
-        layers=_seed_layers(Materials.moveon.MR10, seed_thickness_high, seed_thickness_low),
-        # layers=_seed_moveon_layers(Materials.moveon, seed_thickness_high, seed_thickness_low),
+        # layers=_seed_layers(Materials.moveon.MR10, seed_thickness_high, seed_thickness_low),
+        layers=_seed_moveon_layers(Materials.moveon, seed_thickness_high, seed_thickness_low),
         target=target)
     hop_state = {"hop": 0, "best": float("inf")}
 
