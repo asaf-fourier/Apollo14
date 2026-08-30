@@ -33,6 +33,7 @@ import json
 import os
 import sys
 import ctypes
+import shutil
 from pathlib import Path
 
 import clr
@@ -335,6 +336,88 @@ def disconnect(application):
         application.CloseApplication()
 
 
+def _candidate_coating_folders():
+    """Yield likely Zemax coating folders in preference order."""
+    candidates = []
+
+    for env_var in COATING_INSTALL_ENV_VARS:
+        value = os.environ.get(env_var)
+        if value:
+            candidates.append(value)
+
+    home = Path.home()
+    common_roots = [
+        home / "Documents" / "Zemax" / "Coatings",
+        home / "OneDrive" / "Documents" / "Zemax" / "Coatings",
+        home / "Zemax" / "Coatings",
+    ]
+    for root in common_roots:
+        candidates.append(str(root))
+
+    for root_name in ("ProgramData", "LOCALAPPDATA"):
+        root = os.environ.get(root_name)
+        if root:
+            candidates.append(os.path.join(root, "Zemax", "Coatings"))
+
+    search_roots = [home]
+    for root_name in ("ProgramData", "LOCALAPPDATA"):
+        root = os.environ.get(root_name)
+        if root:
+            search_roots.append(Path(root))
+
+    for search_root in search_roots:
+        if not search_root.exists():
+            continue
+        try:
+            for match in search_root.rglob("COATING.DAT"):
+                candidates.append(str(match.parent))
+        except OSError:
+            continue
+
+    seen = set()
+    for candidate in candidates:
+        normalized = os.path.normpath(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        yield normalized
+
+
+def _find_zemax_coating_folder():
+    """Return the configured Zemax coating folder, falling back to defaults."""
+    for candidate in _candidate_coating_folders():
+        if os.path.isdir(candidate):
+            return candidate
+    return os.path.join(str(Path.home()), "Documents", "Zemax", "Coatings")
+
+
+def _install_coating_file(source_directory, coating_file):
+    """Copy the exported coating file into the machine's Zemax coating folder."""
+    if not coating_file:
+        return
+
+    source_candidates = [
+        os.path.join(source_directory, coating_file),
+        os.path.join(source_directory, "Coatings", coating_file),
+    ]
+    source_path = next((path for path in source_candidates
+                        if os.path.exists(path)), None)
+    if source_path is None:
+        raise FileNotFoundError(
+            f"Could not find coating file {coating_file!r} next to the "
+            f"prescription in {source_directory!r}.")
+
+    coating_folder = _find_zemax_coating_folder()
+    os.makedirs(coating_folder, exist_ok=True)
+    target_path = os.path.join(coating_folder, coating_file)
+
+    if os.path.abspath(source_path) == os.path.abspath(target_path):
+        return
+
+    shutil.copy2(source_path, target_path)
+    print(f"Installed coating file to {target_path}")
+
+
 # ── Tolerant configuration helpers ──────────────────────────────────────────
 # ZOS-API renames properties and enum members between releases. Rather than
 # hard-code one spelling and fail, everything uncertain is attempted by name
@@ -522,6 +605,8 @@ def set_first_available(targets, candidates, value, description):
 OBJECT_TYPE_CANDIDATES = {
     "polygon": ["PolygonObject", "Polygon"],
     "rectangle": ["Rectangle"],
+    "rectangular_volume": ["RectangularVolume", "VolumeRectangle",
+                            "Rectangular Volume"],
     "detector_rectangle": ["DetectorRectangle", "DetectorRect"],
     "source_two_angle": ["SourceTwoAngle", "SourceTwoAngles"],
 }
@@ -542,6 +627,12 @@ SOURCE_RAY_COUNT_ATTRIBUTE_CANDIDATES = {
     "analysis": ["NumberOfAnalysisRays", "NumberOfAnalysisRaysUsed",
                   "AnalysisRays"],
 }
+COATING_ATTRIBUTE_CANDIDATES = ["Coating", "CoatingName", "CoatName"]
+COAT_SCATTER_ATTRIBUTE_CANDIDATES = [
+    "CoatScatterData",
+    "CoatingData",
+    "SurfaceData",
+]
 
 POLYGON_FILE_ATTRIBUTE_CANDIDATES = [
     "Filename",
@@ -592,6 +683,13 @@ DEBUG_DUMP_ZOSAPI_MEMBERS = os.environ.get("APOLLO14_DUMP_ZOSAPI_MEMBERS", "").l
     "yes",
     "on",
 }
+
+COATING_INSTALL_ENV_VARS = (
+    "APOLLO14_ZEMAX_COATINGS_DIR",
+    "ZEMAX_COATINGS_DIR",
+    "ZEMAX_COATING_DIR",
+    "ZOSAPI_COATINGS_DIR",
+)
 
 
 def _iter_nested_targets(target):
@@ -705,6 +803,14 @@ def _apply_system_settings(ZOSAPI, system, settings):
             f"add glass catalog {glass_catalog}",
             lambda: system.SystemData.MaterialCatalogs.AddCatalog(glass_catalog))
 
+    coating_file = settings.get("coating_file")
+    if coating_file:
+        def apply_coating_file():
+            system.SystemData.Files.CoatingFile = coating_file
+            system.SystemData.Files.ReloadFiles()
+
+        configure(f"select coating file {coating_file}", apply_coating_file)
+
     def apply_wavelengths():
         wavelength_data = system.SystemData.Wavelengths
         while wavelength_data.NumberOfWavelengths > 1:
@@ -764,6 +870,7 @@ def build(prescription_path, output_path):
     nce_types = ZOSAPI.Editors.NCE
     prescription, prescription_directory = _load_prescription(prescription_path)
     settings = prescription["system"]
+    _install_coating_file(prescription_directory, settings.get("coating_file"))
 
     system.New(False)
     system.MakeNonSequential()
@@ -890,6 +997,9 @@ def _apply_object_data(targets, object_type, data, comment):
     if "half_width_x" in data:
         _apply_half_widths(targets, data, comment)
 
+    if object_type == "rectangular_volume":
+        _apply_rectangular_volume_dimensions(targets, data, comment)
+
     if object_type == "detector_rectangle":
         _apply_detector_pixels(targets, data, comment)
 
@@ -906,6 +1016,30 @@ def _apply_half_widths(targets, data, comment):
         set_first_available(targets, ["YHalfWidth", "YHalfWidth1",
                                       "HalfWidthY", "YHalfWidth_mm"],
                             data["half_width_y"], f"{comment}: Y half width")
+
+
+def _apply_rectangular_volume_dimensions(targets, data, comment):
+    """Apply rectangular-volume dimensions through the usual object data."""
+    set_first_available(targets,
+                        ["X1HalfWidth", "X1HalfWidth1", "XHalfWidth1",
+                         "HalfWidthX1", "X1HalfWidth_mm"],
+                        data["x1_half_width"], f"{comment}: X1 half width")
+    set_first_available(targets,
+                        ["Y1HalfWidth", "Y1HalfWidth1", "YHalfWidth1",
+                         "HalfWidthY1", "Y1HalfWidth_mm"],
+                        data["y1_half_width"], f"{comment}: Y1 half width")
+    set_first_available(targets,
+                        ["ZLength", "ZLength1", "LengthZ", "Thickness",
+                         "ZLength_mm"],
+                        data["z_length"], f"{comment}: Z length")
+    set_first_available(targets,
+                        ["X2HalfWidth", "X2HalfWidth1", "XHalfWidth2",
+                         "HalfWidthX2", "X2HalfWidth_mm"],
+                        data["x2_half_width"], f"{comment}: X2 half width")
+    set_first_available(targets,
+                        ["Y2HalfWidth", "Y2HalfWidth1", "YHalfWidth2",
+                         "HalfWidthY2", "Y2HalfWidth_mm"],
+                        data["y2_half_width"], f"{comment}: Y2 half width")
 
 
 def _apply_detector_pixels(targets, data, comment):
@@ -939,17 +1073,64 @@ def _apply_source_angles_and_power(targets, data, comment):
 def _apply_coating(nce_object, coating_name, face_number, comment):
     """Assign a coating to one face (0 = every face of a simple object)."""
     def assign():
-        _set_coating_on_face(nce_object, face_number, coating_name)
+        _set_coating_on_object(nce_object, face_number, coating_name)
 
     configure(f"{comment}: coating {coating_name} on face {face_number}",
               assign)
 
 
-def _set_coating_on_face(nce_object, face_number, coating_name):
-    """Write one coating name to one face data object."""
-    coat_scatter = nce_object.CoatScatterData
-    face_data = coat_scatter.GetFaceData(face_number)
-    face_data.Coating = coating_name
+def _set_coating_on_object(nce_object, face_number, coating_name):
+    """Write one coating using the face-data path, then direct fallbacks."""
+    if _set_coating_via_face_data(nce_object, face_number, coating_name):
+        return
+    set_first_available([nce_object], COATING_ATTRIBUTE_CANDIDATES,
+                        coating_name, "direct coating")
+
+
+def _set_coating_via_face_data(nce_object, face_number, coating_name):
+    """Try every face-data entry point that OpticStudio versions expose."""
+    coat_scatter = _get_first_available_target(
+        [nce_object], COAT_SCATTER_ATTRIBUTE_CANDIDATES)
+    if coat_scatter is None:
+        return False
+
+    face_data = _get_face_data(coat_scatter, face_number)
+    if face_data is None:
+        return False
+
+    set_first_available([face_data], COATING_ATTRIBUTE_CANDIDATES,
+                        coating_name, f"face {face_number} coating")
+    return True
+
+
+def _get_first_available_target(targets, candidates):
+    """Return the first target exposing one of the candidate attributes."""
+    for target in _iter_targets(targets):
+        attribute_name = _resolve_attribute_name(target, candidates)
+        if attribute_name is not None:
+            return target
+    return None
+
+
+def _get_face_data(coat_scatter, face_number):
+    """Fetch face data with both zero-based and one-based fallbacks."""
+    face_numbers = [face_number]
+    if face_number == 0:
+        face_numbers.append(1)
+
+    for candidate_face_number in face_numbers:
+        for getter_name in ("GetFaceData", "GetFace", "FaceData"):
+            getter = getattr(coat_scatter, getter_name, None)
+            if getter is None:
+                continue
+            try:
+                face_data = (getter(candidate_face_number)
+                             if callable(getter) else getter)
+            except Exception:  # noqa: BLE001
+                continue
+            if face_data is not None:
+                return face_data
+    return None
 
 
 if __name__ == "__main__":

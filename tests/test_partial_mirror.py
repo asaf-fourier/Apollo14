@@ -18,6 +18,9 @@ from apollo14.geometry import normalize
 from apollo14.materials import air
 from apollo14.ray import Ray
 from apollo14.route import REFLECT, TRANSMIT, Route, _group_mirror_runs
+from apollo14.system import OpticalSystem
+from apollo14.export.prescription import build_prescription
+from apollo14.export.zosapi_script import build_script_text
 from apollo14.trace import prepare_route
 from apollo14.units import nm
 
@@ -139,3 +142,52 @@ def test_transmit_dead_ray_stays_dead():
 
     assert not bool(valid)
     assert float(transmitted.intensity) == 0.0
+
+
+def test_partial_mirror_exports_as_rectangular_volume_with_face_coating():
+    system = OpticalSystem(env_material=air)
+    system.add(_mirror(reflectance=0.3))
+
+    prescription = build_prescription(
+        system,
+        chassis_pivot=jnp.array([0.0, 0.0, 0.0]),
+        chassis_tilt_deg=0.0,
+        sources=[],
+        trace_wavelengths=jnp.array([550.0]) * nm,
+        glass_names={},
+        coating_names={"m": "MIRROR_COAT"},
+    )
+
+    assert prescription.objects[0]["type"] == "rectangular_volume"
+    assert prescription.objects[0]["face_coatings"] == {"1": "MIRROR_COAT"}
+    assert prescription.objects[0]["data"]["z_length"] == 0.01
+
+
+def test_each_mirror_volume_keeps_its_own_coating():
+    system = OpticalSystem(env_material=air)
+    mirror_a = _mirror(reflectance=0.2)
+    mirror_a.name = "m_a"
+    mirror_b = _mirror(reflectance=0.4)
+    mirror_b.name = "m_b"
+    system.add(mirror_a)
+    system.add(mirror_b)
+
+    prescription = build_prescription(
+        system,
+        chassis_pivot=jnp.array([0.0, 0.0, 0.0]),
+        chassis_tilt_deg=0.0,
+        sources=[],
+        trace_wavelengths=jnp.array([550.0]) * nm,
+        glass_names={},
+        coating_names={"m_a": "COAT_A", "m_b": "COAT_B"},
+    )
+
+    mirrors = {entry["comment"]: entry for entry in prescription.objects}
+    assert mirrors["m_a"]["face_coatings"] == {"1": "COAT_A"}
+    assert mirrors["m_b"]["face_coatings"] == {"1": "COAT_B"}
+
+
+def test_generated_build_script_selects_the_coating_file():
+    script = build_script_text()
+    assert "SystemData.Files.CoatingFile" in script
+    assert "SystemData.Files.ReloadFiles()" in script

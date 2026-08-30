@@ -40,6 +40,7 @@ from apollo14.units import nm
 DEFAULT_MAX_SEGMENTS = 4000
 DEFAULT_MAX_INTERSECTIONS = 400
 DEFAULT_MIN_RELATIVE_INTENSITY = 1e-9
+MIRROR_VOLUME_Z_LENGTH_MM = 0.01
 
 
 class SourceSpec(NamedTuple):
@@ -129,6 +130,7 @@ def build_prescription(
     objects: list[dict] = []
     polygon_files: dict[str, str] = {}
     block_indices: dict[str, int] = {}
+    chassis_material_name = _resolve_chassis_material_name(system, glass_names)
 
     for element in system.elements:
         if isinstance(element, GlassBlock):
@@ -141,7 +143,8 @@ def build_prescription(
             entry, polygon_text, file_name = _export_aperture(element)
             polygon_files[file_name] = polygon_text
         elif isinstance(element, PartialMirror):
-            entry = _export_partial_mirror(element, coating_names)
+            entry = _export_partial_mirror(
+                element, coating_names, chassis_material_name)
         elif isinstance(element, RectangularPupil):
             entry = _export_pupil(element, detector_pixels)
         else:
@@ -232,27 +235,43 @@ def _export_aperture(aperture):
     return entry, polygon_text, file_name
 
 
-def _export_partial_mirror(mirror, coating_names):
+def _export_partial_mirror(mirror, coating_names, chassis_material_name):
     placement = planar_placement(mirror, mirror.name)
     half_x, half_y = half_extents_in_zemax_frame(mirror, mirror.name)
 
     entry = {
-        "type": "rectangle",
+        "type": "rectangular_volume",
         "comment": mirror.name,
         "position": [float(v) for v in placement.position],
         "tilt_deg": [float(v) for v in placement.tilt_deg],
-        # Blank material: the rectangle is a coated interface inside the glass,
-        # not a medium change. Ray splitting at it is governed by the coating.
-        "material": "",
+        # Use the enclosing glass material when available so the carrier is
+        # optically invisible apart from the coated front face.
+        "material": chassis_material_name or "",
         "inside_of": 0,          # filled in once the chassis index is known
-        "data": {"half_width_x": half_x, "half_width_y": half_y},
-        "coating": coating_names.get(mirror.name, ""),
+        "data": {
+            "x1_half_width": half_x,
+            "y1_half_width": half_y,
+            "z_length": MIRROR_VOLUME_Z_LENGTH_MM,
+            "x2_half_width": half_x,
+            "y2_half_width": half_y,
+        },
+        "face_coatings": ({
+            "1": coating_names[mirror.name],
+        } if mirror.name in coating_names else {}),
         "reference_reflectance": {
             "wavelengths_nm": [float(w) / nm for w in mirror.wavelengths],
             "values": [float(r) for r in mirror.reflectance],
         },
     }
     return entry
+
+
+def _resolve_chassis_material_name(system, glass_names):
+    """Pick the first glass block material name before exporting mirrors."""
+    for element in system.elements:
+        if isinstance(element, GlassBlock):
+            return glass_names.get(element.material.name)
+    return None
 
 
 def _export_pupil(pupil, detector_pixels):

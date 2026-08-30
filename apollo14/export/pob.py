@@ -300,3 +300,30 @@ def polygon_from_aperture(aperture) -> tuple[PolygonObject, Placement]:
     # the one the placement produces.
     zemax_plane_axes(aperture.normal, "aperture")
     return polygon, placement
+
+
+def polygon_from_partial_mirror(mirror) -> tuple[PolygonObject, Placement]:
+    """Convert a :class:`~apollo14.elements.partial_mirror.PartialMirror`.
+
+    OpticStudio's rectangle object greys out the coating selector in some
+    builds, while polygon objects expose face groups consistently. The mirror is
+    still a zero-thickness planar interface: we just express that interface as
+    a single rectangular facet so the coating can be assigned in the editor.
+    """
+    half_x, half_y = half_extents_in_zemax_frame(mirror, mirror.name)
+    placement = planar_placement(mirror, mirror.name)
+
+    vertices = np.array([
+        [-half_x, -half_y, 0.0],
+        [half_x, -half_y, 0.0],
+        [half_x, half_y, 0.0],
+        [-half_x, half_y, 0.0],
+    ])
+
+    polygon = PolygonObject(
+        vertices=vertices,
+        facets=[Facet(vertex_numbers=(1, 2, 3, 4), is_reflective=REFRACTIVE,
+                      face_number=1)],
+        face_names={1: f"{mirror.name} face"},
+    )
+    return polygon, placement
