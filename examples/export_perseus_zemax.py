@@ -27,6 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
+from apollo14.elements.pupil import RectangularPupil
 from apollo14.elements.partial_mirror import PartialMirror
 from apollo14.export import export_zemax_bundle
 from apollo14.export.coating import (
@@ -74,9 +75,6 @@ MIRROR_FACE_COATING_MODES = {
 NUM_FOV_X = 3
 NUM_FOV_Y = 3
 
-# Pupil detector resolution. 0.1 mm pixels over the 14 × 18 mm pupil.
-DETECTOR_PIXELS = (140, 180)
-
 # Source ray budget for the OpticStudio validation sweep. This is much lower
 # than the optimizer's internal sampling because the sweep is for regression and
 # throughput checks, not for a final Monte Carlo estimate.
@@ -99,7 +97,7 @@ def latest_run(root: Path, file_name: str) -> Path:
 
 
 def load_optimizer_report(report_dir: Path):
-    """Return ``(mirrors, spacings)`` from an optimize_pupil_perseus run.
+    """Return ``(mirrors, spacings, eyebox)`` from an optimize_pupil_perseus run.
 
     ``mirrors`` is a list of ``(wavelengths_nm, reflectance)`` in mirror order.
     """
@@ -117,7 +115,48 @@ def load_optimizer_report(report_dir: Path):
         mirrors.append((wavelengths_nm[order], reflectance[order]))
 
     spacings = np.asarray(report["final_params"]["spacings"], dtype=float)
-    return mirrors, spacings
+    eyebox = report["eyebox"]
+    return mirrors, spacings, eyebox
+
+
+def load_detector_axes(report_dir: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Return the saved pupil sampling axes from the optimization run."""
+    response_path = report_dir / "response.npz"
+    if not response_path.exists():
+        raise FileNotFoundError(
+            f"Missing response.npz next to {report_dir / 'optimization_report.json'}; "
+            "the export needs the saved pupil axes to keep detector sampling "
+            "consistent.")
+    with np.load(response_path) as data:
+        return np.asarray(data["pupil_x_mm"], dtype=float), np.asarray(
+            data["pupil_y_mm"], dtype=float)
+
+
+def detector_pixels_for_axis(axis: np.ndarray) -> int:
+    """Return the pixel count implied by one saved detector axis."""
+    if axis.size < 2:
+        raise ValueError("Detector axis must have at least two samples.")
+    return int(axis.size)
+
+
+def detector_pixels_for_size(width_mm: float, height_mm: float,
+                             pitch_x_mm: float, pitch_y_mm: float
+                             ) -> tuple[int, int]:
+    """Return detector pixels for a rectangle at the saved axis pitch."""
+    return (int(round(width_mm / pitch_x_mm)),
+            int(round(height_mm / pitch_y_mm)))
+
+
+def build_eyebox_detector(system: OpticalSystem, eyebox: dict) -> RectangularPupil:
+    """Build the exported 8×8 eyebox detector on the physical pupil plane."""
+    pupil = next(e for e in system.elements if isinstance(e, RectangularPupil))
+    return RectangularPupil(
+        name="eyebox",
+        position=pupil.position,
+        normal=pupil.normal,
+        width=2.0 * float(eyebox["half_x"]),
+        height=2.0 * float(eyebox["half_y"]),
+    )
 
 
 def load_coating_design(coating_dir: Path | None, report_dir: Path):
@@ -278,9 +317,22 @@ def main():
     except FileNotFoundError:
         coating_dir = None
 
-    mirrors, spacings = load_optimizer_report(report_dir)
+    mirrors, spacings, eyebox = load_optimizer_report(report_dir)
+    pupil_x_mm, pupil_y_mm = load_detector_axes(report_dir)
     coating_results = load_coating_design(coating_dir, report_dir)
     system = build_system(mirrors, spacings)
+    eyebox_detector = build_eyebox_detector(system, eyebox)
+    pupil_pitch_x_mm = abs(float(pupil_x_mm[1] - pupil_x_mm[0]))
+    pupil_pitch_y_mm = abs(float(pupil_y_mm[1] - pupil_y_mm[0]))
+
+    pupil = next(e for e in system.elements if isinstance(e, RectangularPupil))
+    detector_pixels_by_name = {
+        pupil.name: (detector_pixels_for_axis(pupil_x_mm),
+                     detector_pixels_for_axis(pupil_y_mm)),
+        eyebox_detector.name: detector_pixels_for_size(
+            float(eyebox_detector.width), float(eyebox_detector.height),
+            pupil_pitch_x_mm, pupil_pitch_y_mm),
+    }
 
     projector = Projector.uniform(
         position=PERSEUS_LIGHT_POSITION,
@@ -321,10 +373,12 @@ def main():
         glass_materials=[agc_m074],
         coating_blocks=blocks,
         face_coatings=face_coatings,
-        detector_pixels=DETECTOR_PIXELS,
+        detector_pixels_by_name=detector_pixels_by_name,
+        extra_pupils=[eyebox_detector],
         notes=(f"Perseus combiner, {len(mirrors)} mirrors, front face mode "
                f"`{FRONT_FACE_COATING_MODE}`.\n\n"
                f"- face coating modes: `{MIRROR_FACE_COATING_MODES}`\n"
+               f"- detector pixels: `{detector_pixels_by_name}`\n"
                f"- optimizer run: `{report_dir}`\n"
                f"- coating run: `{coating_dir or 'none'}`\n"),
     )

@@ -8,7 +8,7 @@ One call writes everything OpticStudio needs plus the two scripts that drive it:
 ``<catalog>.AGF``            glass catalog for the substrate
 ``<coatings>.DAT``           coating definitions for the mirror stack
 ``build_zemax_model.py``     ZOS-API script that constructs the ``.ZMX``
-``run_fov_sweep.py``         ZOS-API script that traces and dumps the detector
+``run_fov_sweep.py``         ZOS-API script that traces and dumps detector CSVs
 ``README.md``                install steps and what to verify first
 ===========================  =================================================
 """
@@ -21,6 +21,7 @@ from pathlib import Path
 from apollo14.export.agf import fit_sellmeier, format_glass_catalog
 from apollo14.export.coating import format_coating_file
 from apollo14.export.prescription import build_prescription
+from apollo14.system import OpticalSystem
 from apollo14.export.zosapi_script import (
     build_and_run_script_text,
     build_script_text,
@@ -55,6 +56,8 @@ def export_zemax_bundle(
     face_coatings=None,
     glass_names=None,
     detector_pixels=(140, 180),
+    detector_pixels_by_name=None,
+    extra_pupils=(),
     glass_catalog: str = DEFAULT_GLASS_CATALOG,
     coating_file: str = DEFAULT_COATING_FILE,
     notes: str = "",
@@ -77,10 +80,13 @@ def export_zemax_bundle(
     resolved_glass_names = _resolve_glass_names(glass_materials, glass_names)
     resolved_coating_names = _resolve_coating_names(
         system, coating_blocks, coating_names)
+    system_for_export = _clone_system_with_extra_pupils(system, extra_pupils)
     prescription = _build_prescription(
-        system, chassis_pivot, chassis_tilt_deg, sources, trace_wavelengths,
+        system_for_export, chassis_pivot, chassis_tilt_deg, sources, trace_wavelengths,
         resolved_glass_names, resolved_coating_names, face_coatings, detector_pixels,
         coating_file, glass_catalog, prescription_kwargs)
+    _apply_detector_pixel_overrides(
+        prescription, detector_pixels_by_name or {})
 
     _write_prescription(output_dir, prescription, notes)
     fits = _write_polygon_files_and_glass_catalog(
@@ -130,10 +136,36 @@ def _resolve_coating_names(system, coating_blocks, coating_names):
     return resolved
 
 
+def _clone_system_with_extra_pupils(system, extra_pupils):
+    """Return a shallow copy of ``system`` with extra exported pupils appended."""
+    if not extra_pupils:
+        return system
+    cloned = OpticalSystem(
+        elements=list(system.elements),
+        env_material=system.env_material,
+    )
+    for pupil in extra_pupils:
+        cloned.add(pupil)
+    return cloned
+
+
+def _apply_detector_pixel_overrides(prescription, detector_pixels_by_name):
+    """Patch detector pixel counts in an already-built prescription."""
+    for entry in prescription.objects:
+        if entry.get("type") != "detector_rectangle":
+            continue
+        pixels = detector_pixels_by_name.get(entry.get("comment"))
+        if pixels is None:
+            continue
+        pixels_x, pixels_y = pixels
+        entry["data"]["pixels_x"] = int(pixels_x)
+        entry["data"]["pixels_y"] = int(pixels_y)
+
+
 def _build_prescription(system, chassis_pivot, chassis_tilt_deg, sources,
                         trace_wavelengths, resolved_glass_names, coating_names,
-                        face_coatings, detector_pixels, coating_file,
-                        glass_catalog, prescription_kwargs):
+                        face_coatings, detector_pixels, coating_file, glass_catalog,
+                        prescription_kwargs):
     """Build the JSON prescription and attach bundle metadata later."""
     return build_prescription(
         system,
@@ -275,7 +307,7 @@ def _readme_install(glass_catalog, coating_file):
         "",
         "       python build_zemax_model.py prescription.json apollo14_combiner.zmx",
         "",
-        "5. Trace every FOV direction and dump the pupil detector:",
+        "5. Trace every FOV direction and dump each detector's CSVs:",
         "",
         "       python run_fov_sweep.py apollo14_combiner.zmx prescription.json out\\",
         "",

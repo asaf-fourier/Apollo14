@@ -7,8 +7,8 @@ Two scripts are emitted:
     by object, then saves a ``.ZMX``.
 ``run_fov_sweep.py``
     Opens that ``.ZMX``, enables one projector source at a time, traces, and
-    writes the pupil detector to CSV — one file per FOV direction, ready to
-    compare against Apollo14's own pupil response.
+    writes detector CSVs — one file per FOV direction and detector, ready to
+    compare against Apollo14's own responses.
 
 Both run on the Windows machine with OpticStudio; neither imports apollo14.
 
@@ -1345,15 +1345,15 @@ if __name__ == "__main__":
 '''
 
 
-SWEEP_SCRIPT = r'''"""Trace the exported combiner once per FOV direction and dump the detector.
+SWEEP_SCRIPT = r'''"""Trace the exported combiner once per FOV direction and dump detectors.
 
 Run on the machine with OpticStudio, after build_zemax_model.py:
 
     python run_fov_sweep.py apollo14_combiner.zmx prescription.json [out_dir]
 
-Writes one CSV per source (the pupil detector's incoherent irradiance grid) plus
-a summary of total detected power per FOV direction — the quantities to compare
-against Apollo14's pupil response.
+Writes one CSV per source for each exported detector plus a summary of total
+detected power per FOV direction — the quantities to compare against Apollo14's
+responses.
 
 Of the two generated scripts this is the more version-sensitive: detector
 readout has several APIs across OpticStudio releases. It tries the bulk data
@@ -1406,11 +1406,12 @@ def _tee_console(log_path):
 
 
 def find_objects(prescription):
-    detector = next(entry for entry in prescription["objects"]
-                    if entry["type"] == "detector_rectangle")
+    detectors = [entry for entry in prescription["objects"]
+                 if entry["type"] == "detector_rectangle"]
     sources = [entry for entry in prescription["objects"]
                if entry["type"] == "source_two_angle"]
-    return detector, sources
+    detectors.sort(key=lambda entry: entry["index"])
+    return detectors, sources
 
 
 def _set_first_available_attribute(target, candidates, value):
@@ -1515,6 +1516,17 @@ def _load_sweep_inputs(prescription_path):
         return json.load(handle)
 
 
+def _detector_label(detector):
+    """Return a filesystem-friendly label for one detector."""
+    label = detector.get("comment", f"detector_{detector['index']}")
+    return label.replace(" ", "_")
+
+
+def _detector_output_directory(output_directory, detector):
+    """Return the directory that holds one detector's sweep results."""
+    return os.path.join(output_directory, _detector_label(detector))
+
+
 def _output_csv_path(output_directory, label):
     """Return the detector CSV path for one source label."""
     return os.path.join(output_directory, PUPIL_CSV_TEMPLATE.format(label=label))
@@ -1528,20 +1540,29 @@ def _record_source_result(summary, source, rows):
     return total
 
 
-def _run_source_sweep(system, sources, detector_index, pixels_x, pixels_y,
-                      output_directory, summary):
-    """Trace each source independently and write its detector output."""
+def _run_source_sweep(system, sources, detector, output_directory):
+    """Trace each source independently and write one detector's output."""
+    detector_index = detector["index"]
+    pixels_x = detector["data"]["pixels_x"]
+    pixels_y = detector["data"]["pixels_y"]
+    detector_output_directory = _detector_output_directory(
+        output_directory, detector)
+    os.makedirs(detector_output_directory, exist_ok=True)
+
+    summary = []
     for source in sources:
         label = source.get("label", f"source_{source['index']}")
         set_only_active_source(system.NCE, sources, source["index"])
         trace(system)
         rows, route = read_detector(system, detector_index, pixels_x, pixels_y)
 
-        csv_path = _output_csv_path(output_directory, label)
+        csv_path = _output_csv_path(detector_output_directory, label)
         _write_csv_rows(csv_path, rows)
 
         total = _record_source_result(summary, source, rows)
         print(f"{label}: total {total:.6e}  →  {csv_path}  [{route}]")
+
+    _finalize_sweep(detector_output_directory, summary)
 
 
 def _finalize_sweep(output_directory, summary):
@@ -1555,17 +1576,16 @@ def main(model_path, prescription_path, output_directory):
     ZOSAPI, application, system = connect()
     prescription = _load_sweep_inputs(prescription_path)
 
-    detector, sources = find_objects(prescription)
-    pixels_x = detector["data"]["pixels_x"]
-    pixels_y = detector["data"]["pixels_y"]
+    detectors, sources = find_objects(prescription)
 
     system.LoadFile(model_path, False)
     os.makedirs(output_directory, exist_ok=True)
 
-    summary = []
-    _run_source_sweep(system, sources, detector["index"], pixels_x, pixels_y,
-                      output_directory, summary)
-    _finalize_sweep(output_directory, summary)
+    for detector in detectors:
+        print(
+            f"Tracing detector {detector.get('comment', detector['index'])!r} "
+            f"at {detector['data']['pixels_x']}×{detector['data']['pixels_y']} px")
+        _run_source_sweep(system, sources, detector, output_directory)
 
     disconnect(application)
 
