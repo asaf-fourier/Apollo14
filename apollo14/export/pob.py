@@ -305,10 +305,10 @@ def polygon_from_aperture(aperture) -> tuple[PolygonObject, Placement]:
 def polygon_from_partial_mirror(mirror) -> tuple[PolygonObject, Placement]:
     """Convert a :class:`~apollo14.elements.partial_mirror.PartialMirror`.
 
-    OpticStudio's rectangle object greys out the coating selector in some
-    builds, while polygon objects expose face groups consistently. The mirror is
-    still a zero-thickness planar interface: we just express that interface as
-    a single rectangular facet so the coating can be assigned in the editor.
+    A one-facet polygon object exposes the coating on face 0 by default in the
+    Object Properties dialog, which avoids the extra face switching needed for a
+    rectangular volume. The mirror remains a zero-thickness planar interface;
+    we only change the NSC carrier so the coating is easy to select and see.
     """
     half_x, half_y = half_extents_in_zemax_frame(mirror, mirror.name)
     placement = planar_placement(mirror, mirror.name)
@@ -323,7 +323,7 @@ def polygon_from_partial_mirror(mirror) -> tuple[PolygonObject, Placement]:
     polygon = PolygonObject(
         vertices=vertices,
         facets=[Facet(vertex_numbers=(1, 2, 3, 4), is_reflective=REFRACTIVE,
-                      face_number=1)],
-        face_names={1: f"{mirror.name} face"},
+                      face_number=0)],
+        face_names={0: f"{mirror.name} face"},
     )
     return polygon, placement

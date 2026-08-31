@@ -40,7 +40,7 @@ from apollo14.units import nm
 DEFAULT_MAX_SEGMENTS = 4000
 DEFAULT_MAX_INTERSECTIONS = 400
 DEFAULT_MIN_RELATIVE_INTENSITY = 1e-9
-MIRROR_VOLUME_Z_LENGTH_MM = 0.01
+PARTIAL_MIRROR_THICKNESS_MM = 0.01
 
 
 class SourceSpec(NamedTuple):
@@ -116,8 +116,10 @@ def build_prescription(
             internal units.
         glass_names: Apollo14 material name → Zemax catalog glass name.
         coating_names: element name → coating name, for the partial mirrors.
-        face_coatings: ``(block name, face name)`` → coating name, for putting
-            an AR coating on the chassis faces the beam crosses.
+        face_coatings: ``(object name, face name)`` → coating name. For
+            partial mirrors, face names may be the mirror-side aliases
+            ``front`` and ``back``. For polygon objects, use their actual face
+            names from the exported geometry.
         detector_pixels: ``(x, y)`` pixel counts for the pupil detector.
 
     Returns:
@@ -130,7 +132,6 @@ def build_prescription(
     objects: list[dict] = []
     polygon_files: dict[str, str] = {}
     block_indices: dict[str, int] = {}
-    chassis_material_name = _resolve_chassis_material_name(system, glass_names)
 
     for element in system.elements:
         if isinstance(element, GlassBlock):
@@ -143,8 +144,8 @@ def build_prescription(
             entry, polygon_text, file_name = _export_aperture(element)
             polygon_files[file_name] = polygon_text
         elif isinstance(element, PartialMirror):
-            entry = _export_partial_mirror(
-                element, coating_names, chassis_material_name)
+            entry = _export_partial_mirror(element, coating_names,
+                                           face_coatings)
         elif isinstance(element, RectangularPupil):
             entry = _export_pupil(element, detector_pixels)
         else:
@@ -235,29 +236,29 @@ def _export_aperture(aperture):
     return entry, polygon_text, file_name
 
 
-def _export_partial_mirror(mirror, coating_names, chassis_material_name):
-    placement = planar_placement(mirror, mirror.name)
+def _export_partial_mirror(mirror, coating_names, face_coatings):
     half_x, half_y = half_extents_in_zemax_frame(mirror, mirror.name)
+    placement = planar_placement(mirror, mirror.name)
 
     entry = {
         "type": "rectangular_volume",
         "comment": mirror.name,
         "position": [float(v) for v in placement.position],
         "tilt_deg": [float(v) for v in placement.tilt_deg],
-        # Use the enclosing glass material when available so the carrier is
-        # optically invisible apart from the coated front face.
-        "material": chassis_material_name or "",
-        "inside_of": 0,          # filled in once the chassis index is known
+        "material": "",
+        "inside_of": 0,
         "data": {
             "x1_half_width": half_x,
             "y1_half_width": half_y,
-            "z_length": MIRROR_VOLUME_Z_LENGTH_MM,
+            "z_length": PARTIAL_MIRROR_THICKNESS_MM,
             "x2_half_width": half_x,
             "y2_half_width": half_y,
         },
-        "face_coatings": ({
-            "1": coating_names[mirror.name],
-        } if mirror.name in coating_names else {}),
+        # NSC coatings live on faces; the mirror's front face is 1 and the
+        # back face is 2. The helper below lets the caller configure faces by
+        # side name instead of hard-coding row numbers everywhere.
+        "face_coatings": _partial_mirror_face_coatings(
+            mirror.name, coating_names, face_coatings),
         "reference_reflectance": {
             "wavelengths_nm": [float(w) / nm for w in mirror.wavelengths],
             "values": [float(r) for r in mirror.reflectance],
@@ -266,11 +267,37 @@ def _export_partial_mirror(mirror, coating_names, chassis_material_name):
     return entry
 
 
-def _resolve_chassis_material_name(system, glass_names):
-    """Pick the first glass block material name before exporting mirrors."""
-    for element in system.elements:
-        if isinstance(element, GlassBlock):
-            return glass_names.get(element.material.name)
+def _partial_mirror_face_coatings(mirror_name, coating_names, face_coatings):
+    """Return the face coating map for one partial mirror.
+
+    ``coating_names`` remains a backward-compatible shorthand for the front
+    face. ``face_coatings`` can override either face explicitly using
+    ``front``/``back`` or the corresponding face numbers.
+    """
+    face_coatings = face_coatings or {}
+
+    front_coating = _lookup_face_coating(
+        face_coatings, mirror_name, ("front", "1", 1))
+    if front_coating is None and mirror_name in coating_names:
+        front_coating = coating_names[mirror_name]
+
+    back_coating = _lookup_face_coating(
+        face_coatings, mirror_name, ("back", "2", 2))
+
+    coatings_by_face_number = {}
+    if front_coating is not None:
+        coatings_by_face_number["1"] = front_coating
+    if back_coating is not None:
+        coatings_by_face_number["2"] = back_coating
+    return coatings_by_face_number
+
+
+def _lookup_face_coating(face_coatings, object_name, face_aliases):
+    """Resolve one face coating from the user-facing face aliases."""
+    for face_alias in face_aliases:
+        coating = face_coatings.get((object_name, str(face_alias)))
+        if coating is not None:
+            return coating
     return None
 
 

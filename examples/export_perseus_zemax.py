@@ -8,10 +8,9 @@ ZOS-API scripts that build and trace it on the Windows machine.
 
 The coating file carries **every** fidelity rung side by side — ideal, flat
 ``R(λ)``, Atlas ``R(λ, θ)``, and the physical film stack — under distinct names.
-``COATING_MODE`` picks which one the exported objects reference; switching rungs
-afterwards is then a coating-name edit in OpticStudio rather than a re-export.
-Working up the rungs is how the exercise isolates each assumption the tracer
-makes: geometry first, then spectrum, then angle, then polarization.
+The face-coating map below chooses which rung each mirror face uses. That keeps
+the policy in one small, editable block instead of burying it in the generated
+ZOS-API script.
 
 Run::
 
@@ -60,8 +59,14 @@ COATING_RUNS_ROOT = Path("examples/reports/design_perseus_mirror_coating")
 REPORT_DIR: Path | None = None
 COATING_DIR: Path | None = None
 
-# Which rung the exported objects reference: "ideal", "flat", "atlas" or "stack".
-COATING_MODE = "ideal"
+# Default rung for the mirror front face. Change this value to move the front
+# face to a different fidelity rung without touching the exporter internals.
+FRONT_FACE_COATING_MODE = "flat"
+BACK_FACE_COATING_MODE = None
+MIRROR_FACE_COATING_MODES = {
+    "front": FRONT_FACE_COATING_MODE,
+    "back": BACK_FACE_COATING_MODE,
+}
 
 # FOV sampling for the exported sources. Apollo14 traces one direction at a
 # time, so this is also the number of Zemax sources and the number of traces the
@@ -71,6 +76,11 @@ NUM_FOV_Y = 3
 
 # Pupil detector resolution. 0.1 mm pixels over the 14 × 18 mm pupil.
 DETECTOR_PIXELS = (140, 180)
+
+# Source ray budget for the OpticStudio validation sweep. This is much lower
+# than the optimizer's internal sampling because the sweep is for regression and
+# throughput checks, not for a final Monte Carlo estimate.
+SOURCE_ANALYSIS_RAYS = 20_000
 
 # Trace wavelengths registered in the Zemax system — the R/G/B lines Apollo14
 # optimizes against.
@@ -157,8 +167,8 @@ def build_system(mirrors, spacings) -> OpticalSystem:
 
 # ── Coatings: every rung, named so they can be swapped in OpticStudio ───────
 
-def build_coatings(mirrors, coating_results, mode: str):
-    """Return ``(blocks, names_by_element, notes)`` for all four rungs."""
+def build_coatings(mirrors, coating_results):
+    """Return coating blocks and names for all four rungs."""
     blocks = []
     names_by_mode: dict[str, dict[str, str]] = {
         "ideal": {}, "flat": {}, "atlas": {}, "stack": {}}
@@ -207,10 +217,24 @@ def build_coatings(mirrors, coating_results, mode: str):
         ))
         names_by_mode["stack"][element_name] = stack_name
 
-    if mode not in names_by_mode:
-        raise ValueError(f"COATING_MODE must be one of {list(names_by_mode)}, "
-                         f"got {mode!r}")
-    return blocks, names_by_mode[mode], notes
+    return blocks, names_by_mode, notes
+
+
+def select_mirror_face_coatings(names_by_mode, face_modes):
+    """Resolve ``front``/``back`` face policy to per-mirror coating names."""
+    face_coatings = {}
+    for face_name, mode_name in face_modes.items():
+        if mode_name is None:
+            continue
+        try:
+            mode_coatings = names_by_mode[mode_name]
+        except KeyError as error:
+            raise ValueError(
+                f"Unknown face coating mode {mode_name!r} for {face_name!r}; "
+                f"choose one of {sorted(names_by_mode)} or None.") from error
+        for mirror_name, coating_name in mode_coatings.items():
+            face_coatings[(mirror_name, face_name)] = coating_name
+    return face_coatings
 
 
 # ── Sources: one per FOV direction ──────────────────────────────────────────
@@ -240,6 +264,7 @@ def build_sources(projector: Projector) -> list[SourceSpec]:
             # Apollo14 traces one direction at a time; the sweep script gives
             # each source the power in turn, so only the first is live here.
             power=1.0 if direction_index == 0 else 0.0,
+            analysis_rays=SOURCE_ANALYSIS_RAYS,
         ))
     return sources
 
@@ -263,8 +288,10 @@ def main():
         beam_width=PERSEUS_BEAM_WIDTH, beam_height=PERSEUS_BEAM_HEIGHT,
         nx=1, ny=1)
 
-    blocks, coating_names, coating_notes = build_coatings(
-        mirrors, coating_results, COATING_MODE)
+    blocks, coating_names_by_mode, coating_notes = build_coatings(
+        mirrors, coating_results)
+    face_coatings = select_mirror_face_coatings(
+        coating_names_by_mode, MIRROR_FACE_COATING_MODES)
     sources = build_sources(projector)
 
     print("── Perseus → Zemax OpticStudio ──")
@@ -272,7 +299,8 @@ def main():
     print(f"coating run   : {coating_dir or '(none — flat R(λ) only)'}")
     print(f"mirrors       : {len(mirrors)}  spacings "
           f"{np.round(spacings, 4).tolist()}")
-    print(f"coating mode  : {COATING_MODE}  "
+    print(f"face coatings : {MIRROR_FACE_COATING_MODES}")
+    print(f"front mode    : {FRONT_FACE_COATING_MODE}  "
           f"({len(coating_results)} Atlas designs available)")
     for note in coating_notes:
         print(f"  ! {note}")
@@ -292,10 +320,11 @@ def main():
                            for wavelength in TRACE_WAVELENGTHS_NM],
         glass_materials=[agc_m074],
         coating_blocks=blocks,
-        coating_names=coating_names,
+        face_coatings=face_coatings,
         detector_pixels=DETECTOR_PIXELS,
-        notes=(f"Perseus combiner, {len(mirrors)} mirrors, coating rung "
-               f"`{COATING_MODE}`.\n\n"
+        notes=(f"Perseus combiner, {len(mirrors)} mirrors, front face mode "
+               f"`{FRONT_FACE_COATING_MODE}`.\n\n"
+               f"- face coating modes: `{MIRROR_FACE_COATING_MODES}`\n"
                f"- optimizer run: `{report_dir}`\n"
                f"- coating run: `{coating_dir or 'none'}`\n"),
     )

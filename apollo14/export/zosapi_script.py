@@ -34,6 +34,8 @@ import os
 import sys
 import ctypes
 import shutil
+import time
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 
 import clr
@@ -72,6 +74,31 @@ try:
     import winreg
 except ImportError:   # pragma: no cover - only relevant on Windows
     winreg = None
+
+
+class _Tee:
+    """Mirror text writes to multiple streams."""
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for stream in self._streams:
+            stream.write(data)
+
+    def flush(self):
+        for stream in self._streams:
+            stream.flush()
+
+
+@contextmanager
+def _tee_console(log_path):
+    """Mirror stdout/stderr to a log file under the bundle's out directory."""
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("w", encoding="utf-8") as handle:
+        with redirect_stdout(_Tee(sys.stdout, handle)):
+            with redirect_stderr(_Tee(sys.stderr, handle)):
+                yield
 
 
 def _extend_candidates(candidates, *items):
@@ -561,6 +588,7 @@ def _search_target_for_available_attribute(target, candidates, value, path,
     attribute_name = _resolve_attribute_name(writable, candidates)
     if attribute_name is not None:
         setattr(writable, attribute_name, value)
+        searched.append(f"{path}.{attribute_name}")
         return True
 
     method_name = _try_invoke_string_method(writable, value)
@@ -633,6 +661,7 @@ COAT_SCATTER_ATTRIBUTE_CANDIDATES = [
     "CoatingData",
     "SurfaceData",
 ]
+COATING_NONE_VALUES = {None, "", "None", "NULL"}
 
 POLYGON_FILE_ATTRIBUTE_CANDIDATES = [
     "Filename",
@@ -657,6 +686,8 @@ NESTED_TARGET_ATTRIBUTE_CANDIDATES = (
     "ObjectData",
     "TypeData",
     "CADData",
+    "FacetedObjectData",
+    "CoatingPerformanceData",
     "VolumePhysicsData",
     "DrawData",
     "IndexData",
@@ -790,6 +821,44 @@ def _load_prescription(prescription_path):
     return prescription, prescription_directory
 
 
+def _print_mirror_coating_plan(prescription):
+    """Print the mirror coating mapping before any OpticStudio writes."""
+    print("\nMirror coating plan:")
+    mirrors = [entry for entry in prescription["objects"]
+               if entry.get("comment", "").startswith("mirror_")]
+    if not mirrors:
+        print("  (no mirror objects found)")
+        return
+
+    for entry in mirrors:
+        coating = entry.get("coating")
+        face_coatings = entry.get("face_coatings", {})
+        visible_coating = coating or _visible_face_coating(face_coatings)
+        reference = entry.get("reference_reflectance", {})
+        wavelengths = reference.get("wavelengths_nm", [])
+        values = reference.get("values", [])
+        if values:
+            reflectance_text = f"{min(values):.4f}..{max(values):.4f}"
+        else:
+            reflectance_text = "n/a"
+        print(
+            f"  {entry['comment']}: type={entry.get('type')}, "
+            f"coating={visible_coating!r}, raw_coating={coating!r}, "
+            f"face_coatings={face_coatings!r}, "
+            f"reference_samples={len(wavelengths)}, R={reflectance_text}")
+
+
+def _visible_face_coating(face_coatings):
+    """Show the first face coating when the object-level field is empty."""
+    if not face_coatings:
+        return None
+    if len(face_coatings) == 1:
+        return next(iter(face_coatings.values()))
+    face_number, face_coating = next(iter(sorted(
+        face_coatings.items(), key=lambda item: int(item[0]))))
+    return f"face {face_number}: {face_coating}"
+
+
 def _apply_system_settings(ZOSAPI, system, settings):
     """Apply the system-wide settings from the prescription."""
     configure("lens units → millimetres", lambda: setattr(
@@ -805,6 +874,7 @@ def _apply_system_settings(ZOSAPI, system, settings):
 
     coating_file = settings.get("coating_file")
     if coating_file:
+        print(f"Selected coating file: {coating_file}")
         def apply_coating_file():
             system.SystemData.Files.CoatingFile = coating_file
             system.SystemData.Files.ReloadFiles()
@@ -870,6 +940,12 @@ def build(prescription_path, output_path):
     nce_types = ZOSAPI.Editors.NCE
     prescription, prescription_directory = _load_prescription(prescription_path)
     settings = prescription["system"]
+    print("Loaded prescription:")
+    print(f"  source: {prescription_path}")
+    print(f"  objects: {len(prescription['objects'])}")
+    print(f"  wavelengths_um: {settings.get('wavelengths_um')}")
+    print(f"  coating_file: {settings.get('coating_file')!r}")
+    _print_mirror_coating_plan(prescription)
     _install_coating_file(prescription_directory, settings.get("coating_file"))
 
     system.New(False)
@@ -888,6 +964,17 @@ def build(prescription_path, output_path):
 def _apply_object(ZOSAPI, nce_types, nce_object, entry, base_directory):
     """Type, place and parameterise one non-sequential object."""
     comment = entry["comment"]
+    print(
+        f"\nApplying object {entry['index']}: {comment} ({entry['type']})")
+    print(
+        f"  raw coating fields: coating={entry.get('coating')!r}, "
+        f"face_coatings={entry.get('face_coatings', {})!r}")
+    if entry.get("material"):
+        print(f"  material: {entry['material']}")
+    if entry.get("inside_of"):
+        print(f"  inside_of: {entry['inside_of']}")
+    if entry.get("data"):
+        print(f"  data keys: {sorted(entry['data'])}")
     object_type = resolve_enum(
         nce_types.ObjectType, OBJECT_TYPE_CANDIDATES[entry["type"]],
         f"object type for {comment}")
@@ -984,11 +1071,19 @@ def _apply_object_metadata(nce_object, object_data, entry, comment):
 
 def _apply_object_coatings(nce_object, entry, comment):
     """Apply the face coatings declared for one object."""
+    coatings = []
     if entry.get("coating"):
-        _apply_coating(nce_object, entry["coating"], face_number=0,
-                       comment=comment)
+        coatings.append((0, entry["coating"]))
     for face_number, coating_name in entry.get("face_coatings", {}).items():
-        _apply_coating(nce_object, coating_name, face_number=int(face_number),
+        coatings.append((int(face_number), coating_name))
+
+    if not coatings:
+        print("  coating assignment: none")
+        return
+
+    for face_number, coating_name in coatings:
+        print(f"  coating assignment: face {face_number} -> {coating_name}")
+        _apply_coating(nce_object, coating_name, face_number=face_number,
                        comment=comment)
 
 
@@ -1083,23 +1178,88 @@ def _set_coating_on_object(nce_object, face_number, coating_name):
     """Write one coating using the face-data path, then direct fallbacks."""
     if _set_coating_via_face_data(nce_object, face_number, coating_name):
         return
-    set_first_available([nce_object], COATING_ATTRIBUTE_CANDIDATES,
-                        coating_name, "direct coating")
+    if set_first_available([nce_object], COATING_ATTRIBUTE_CANDIDATES,
+                           coating_name, "direct coating"):
+        _log_coating_readback(
+            nce_object, coating_name, "direct object coating", indent="  ")
+        return
+    _log_coating_readback(nce_object, coating_name,
+                          "direct object coating", indent="  ")
 
 
 def _set_coating_via_face_data(nce_object, face_number, coating_name):
     """Try every face-data entry point that OpticStudio versions expose."""
-    coat_scatter = _get_first_available_target(
+    coat_scatter = _get_first_available_child(
         [nce_object], COAT_SCATTER_ATTRIBUTE_CANDIDATES)
     if coat_scatter is None:
+        if _should_dump_coatings():
+            _dump_member_inventory(
+                f"face {face_number} coat/scatter target", nce_object)
         return False
 
-    face_data = _get_face_data(coat_scatter, face_number)
+    if _should_dump_coatings():
+        _dump_member_inventory(
+            f"face {face_number} coat/scatter object", coat_scatter)
+
+    face_data = _get_coating_performance_data(coat_scatter, face_number)
     if face_data is None:
+        face_data = _get_face_data(coat_scatter, face_number)
+    if face_data is None:
+        face_data = _get_coating_performance_data(nce_object, face_number)
+    if face_data is None:
+        face_data = _get_face_data(nce_object, face_number)
+    if face_data is None:
+        if _should_dump_coatings():
+            _dump_member_inventory(
+                f"face {face_number} coat/scatter target", coat_scatter)
         return False
 
-    set_first_available([face_data], COATING_ATTRIBUTE_CANDIDATES,
-                        coating_name, f"face {face_number} coating")
+    if _should_dump_coatings():
+        _dump_member_inventory(f"face {face_number} coating target", face_data)
+    if set_first_available([face_data], COATING_ATTRIBUTE_CANDIDATES,
+                           coating_name, f"face {face_number} coating"):
+        _log_coating_readback(
+            face_data, coating_name, f"face {face_number} coating",
+            indent="    ")
+        return True
+
+    _log_coating_readback(
+        face_data, coating_name, f"face {face_number} coating", indent="    ")
+    return False
+
+
+def _log_coating_readback(target, expected_coating, context, indent=""):
+    """Report the coating value OpticStudio exposes after a write."""
+    attribute_name, actual_value = _read_first_available_value(
+        target, COATING_ATTRIBUTE_CANDIDATES)
+    if attribute_name is None:
+        print(f"{indent}{context} readback: no coating attribute found")
+        if _should_dump_coatings():
+            _dump_member_inventory(f"{context} readback target", target)
+        return
+
+    print(
+        f"{indent}{context} readback: {attribute_name}={actual_value!r} "
+        f"(expected {expected_coating!r})")
+    if actual_value in COATING_NONE_VALUES or actual_value != expected_coating:
+        if _should_dump_coatings():
+            _dump_member_inventory(f"{context} readback target", target)
+
+
+def _read_first_available_value(target, candidates):
+    """Return the first readable attribute among ``candidates``."""
+    for attribute_name in candidates:
+        if not hasattr(target, attribute_name):
+            continue
+        try:
+            return attribute_name, getattr(target, attribute_name)
+        except Exception:  # noqa: BLE001
+            continue
+    return None, None
+
+
+def _should_dump_coatings():
+    """Return whether face-coating debug dumps are enabled."""
     return True
 
 
@@ -1112,6 +1272,21 @@ def _get_first_available_target(targets, candidates):
     return None
 
 
+def _get_first_available_child(targets, candidates):
+    """Return the first resolved attribute value across ``targets``."""
+    for target in _iter_targets(targets):
+        attribute_name = _resolve_attribute_name(target, candidates)
+        if attribute_name is None:
+            continue
+        try:
+            child = getattr(target, attribute_name)
+        except Exception:  # noqa: BLE001
+            continue
+        if child is not None:
+            return child
+    return None
+
+
 def _get_face_data(coat_scatter, face_number):
     """Fetch face data with both zero-based and one-based fallbacks."""
     face_numbers = [face_number]
@@ -1119,7 +1294,8 @@ def _get_face_data(coat_scatter, face_number):
         face_numbers.append(1)
 
     for candidate_face_number in face_numbers:
-        for getter_name in ("GetFaceData", "GetFace", "FaceData"):
+        for getter_name in ("GetNSCObjectFaceData", "GetFaceData",
+                            "GetNSCObjectFace", "GetFace", "FaceData"):
             getter = getattr(coat_scatter, getter_name, None)
             if getter is None:
                 continue
@@ -1133,12 +1309,39 @@ def _get_face_data(coat_scatter, face_number):
     return None
 
 
+def _get_coating_performance_data(target, face_number):
+    """Fetch the coating-performance face object if the API exposes it."""
+    face_numbers = [face_number]
+    if face_number == 0:
+        face_numbers.append(1)
+
+    for candidate_face_number in face_numbers:
+        for method_name in (
+            "GetCoatingPerformanceData",
+            "get_CoatingPerformanceData",
+            "CoatingPerformanceData",
+        ):
+            getter = getattr(target, method_name, None)
+            if getter is None:
+                continue
+            try:
+                face_data = (getter(candidate_face_number)
+                             if callable(getter) else getter)
+            except Exception:  # noqa: BLE001
+                continue
+            if face_data is not None:
+                return face_data
+    return None
+
+
 if __name__ == "__main__":
-    prescription_argument = (sys.argv[1] if len(sys.argv) > 1
-                             else "prescription.json")
-    output_argument = (sys.argv[2] if len(sys.argv) > 2
-                       else os.path.abspath("apollo14_combiner.zmx"))
-    build(prescription_argument, os.path.abspath(output_argument))
+    with _tee_console(Path(__file__).resolve().parent / "out" /
+                      "build_zemax_model.log"):
+        prescription_argument = (sys.argv[1] if len(sys.argv) > 1
+                                 else "prescription.json")
+        output_argument = (sys.argv[2] if len(sys.argv) > 2
+                           else os.path.abspath("apollo14_combiner.zmx"))
+        build(prescription_argument, os.path.abspath(output_argument))
 '''
 
 
@@ -1162,6 +1365,8 @@ Generated by apollo14.export — regenerate rather than edit.
 import json
 import os
 import sys
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from pathlib import Path
 
 import clr
 
@@ -1173,6 +1378,31 @@ PUPIL_CSV_TEMPLATE = "pupil_{label}.csv"
 SUMMARY_FILENAME = "sweep_summary.csv"
 CSV_FLOAT_FORMAT = ".9e"
 SOURCE_POWER_CANDIDATES = ("Power", "SourcePower")
+
+
+class _Tee:
+    """Mirror text writes to multiple streams."""
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for stream in self._streams:
+            stream.write(data)
+
+    def flush(self):
+        for stream in self._streams:
+            stream.flush()
+
+
+@contextmanager
+def _tee_console(log_path):
+    """Mirror stdout/stderr to a log file under the bundle's out directory."""
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("w", encoding="utf-8") as handle:
+        with redirect_stdout(_Tee(sys.stdout, handle)):
+            with redirect_stderr(_Tee(sys.stderr, handle)):
+                yield
 
 
 def find_objects(prescription):
@@ -1248,18 +1478,18 @@ def _read_detector_with_viewer(system, detector_index):
 def read_detector(system, detector_index, pixels_x, pixels_y):
     """Return the detector grid as rows, plus the route used."""
     try:
-        rows = _read_detector_with_nce(system, detector_index, pixels_x,
-                                       pixels_y)
-        return rows, "NCE.GetDetectorData"
-    except Exception as nce_error:                    # noqa: BLE001
+        rows = _read_detector_with_viewer(system, detector_index)
+        return rows, "DetectorViewer.GetDataGrid"
+    except Exception as viewer_error:                 # noqa: BLE001
         try:
-            rows = _read_detector_with_viewer(system, detector_index)
-            return rows, "DetectorViewer.GetDataGrid"
-        except Exception as viewer_error:             # noqa: BLE001
+            rows = _read_detector_with_nce(system, detector_index, pixels_x,
+                                           pixels_y)
+            return rows, "NCE.GetDetectorData"
+        except Exception as nce_error:                # noqa: BLE001
             raise RuntimeError(
                 f"Could not read detector {detector_index}. "
-                f"GetDetectorData failed with {nce_error!r}; "
-                f"DetectorViewer failed with {viewer_error!r}.")
+                f"DetectorViewer failed with {viewer_error!r}; "
+                f"GetDetectorData failed with {nce_error!r}.")
 
 
 def _write_csv_rows(csv_path, rows):
@@ -1341,12 +1571,14 @@ def main(model_path, prescription_path, output_directory):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print(__doc__)
-        raise SystemExit(1)
-    main(os.path.abspath(sys.argv[1]), os.path.abspath(sys.argv[2]),
-         os.path.abspath(sys.argv[3] if len(sys.argv) > 3
-                        else DEFAULT_OUTPUT_DIRECTORY))
+    with _tee_console(Path(__file__).resolve().parent / "out" /
+                      "run_fov_sweep.log"):
+        if len(sys.argv) < 3:
+            print(__doc__)
+            raise SystemExit(1)
+        main(os.path.abspath(sys.argv[1]), os.path.abspath(sys.argv[2]),
+             os.path.abspath(sys.argv[3] if len(sys.argv) > 3
+                            else DEFAULT_OUTPUT_DIRECTORY))
 '''
 
 
@@ -1358,3 +1590,118 @@ def build_script_text() -> str:
 def sweep_script_text() -> str:
     """The FOV sweep runner, ready to write next to the model."""
     return SWEEP_SCRIPT
+
+
+BUILD_AND_RUN_SCRIPT = r'''"""Build the model and run the FOV sweep from the bundle directory.
+
+Run this from the bundle folder itself:
+
+    python build_and_run.py
+
+It assumes the current working directory contains the generated build and sweep
+scripts next to ``prescription.json`` and writes runtime output to ``out/``.
+"""
+
+import subprocess
+import sys
+import time
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from pathlib import Path
+
+
+class _Tee:
+    """Mirror text writes to multiple streams."""
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for stream in self._streams:
+            stream.write(data)
+
+    def flush(self):
+        for stream in self._streams:
+            stream.flush()
+
+
+@contextmanager
+def _tee_console(log_path):
+    """Mirror stdout/stderr to a log file under the bundle's out directory."""
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("w", encoding="utf-8") as handle:
+        with redirect_stdout(_Tee(sys.stdout, handle)):
+            with redirect_stderr(_Tee(sys.stderr, handle)):
+                yield
+
+
+def _run_logged(command, log_path, *, cwd):
+    """Run one subprocess while teeing its output into a dedicated log."""
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Running: {' '.join(command)}")
+    start = time.perf_counter()
+    with log_path.open("w", encoding="utf-8") as handle:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        try:
+            assert process.stdout is not None
+            for line in process.stdout:
+                sys.stdout.write(line)
+                handle.write(line)
+                sys.stdout.flush()
+                handle.flush()
+            return_code = process.wait()
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+    elapsed = time.perf_counter() - start
+    print(f"Finished in {elapsed:.1f}s with exit code {return_code}")
+    if return_code != 0:
+        raise subprocess.CalledProcessError(return_code, command)
+
+
+def main():
+    bundle_dir = Path.cwd()
+    build_script = bundle_dir / "build_zemax_model.py"
+    sweep_script = bundle_dir / "run_fov_sweep.py"
+    prescription = bundle_dir / "prescription.json"
+    model = bundle_dir / "apollo14_combiner.zmx"
+    out_dir = bundle_dir / "out"
+    wrapper_log = out_dir / "build_and_run.log"
+    build_log = out_dir / "build_zemax_model.log"
+    sweep_log = out_dir / "run_fov_sweep.log"
+
+    with _tee_console(wrapper_log):
+        print(f"Bundle directory: {bundle_dir}")
+        print(f"  build log : {build_log}")
+        print(f"  sweep log : {sweep_log}")
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        _run_logged(
+            [sys.executable, "-u", str(build_script), str(prescription),
+             str(model)],
+            build_log, cwd=bundle_dir)
+
+        _run_logged(
+            [sys.executable, "-u", str(sweep_script), str(model),
+             str(prescription),
+             str(out_dir)],
+            sweep_log, cwd=bundle_dir)
+
+        print("Build-and-run completed.")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def build_and_run_script_text() -> str:
+    """The bundle wrapper that builds the ZMX and runs the sweep."""
+    return BUILD_AND_RUN_SCRIPT

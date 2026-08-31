@@ -144,7 +144,7 @@ def test_transmit_dead_ray_stays_dead():
     assert float(transmitted.intensity) == 0.0
 
 
-def test_partial_mirror_exports_as_rectangular_volume_with_face_coating():
+def test_partial_mirror_exports_as_volume_rectangle_with_face_coating():
     system = OpticalSystem(env_material=air)
     system.add(_mirror(reflectance=0.3))
 
@@ -158,9 +158,41 @@ def test_partial_mirror_exports_as_rectangular_volume_with_face_coating():
         coating_names={"m": "MIRROR_COAT"},
     )
 
-    assert prescription.objects[0]["type"] == "rectangular_volume"
-    assert prescription.objects[0]["face_coatings"] == {"1": "MIRROR_COAT"}
-    assert prescription.objects[0]["data"]["z_length"] == 0.01
+    mirror = prescription.objects[0]
+    assert mirror["type"] == "rectangular_volume"
+    assert mirror.get("coating") is None
+    assert mirror["face_coatings"] == {"1": "MIRROR_COAT"}
+    assert mirror["data"]["x1_half_width"] == 5.0
+    assert mirror["data"]["y1_half_width"] == 5.0
+    assert mirror["data"]["x2_half_width"] == 5.0
+    assert mirror["data"]["y2_half_width"] == 5.0
+    assert mirror["data"]["z_length"] > 0.0
+    assert "m.POB" not in prescription.polygon_files
+
+
+def test_partial_mirror_accepts_front_and_back_face_labels():
+    system = OpticalSystem(env_material=air)
+    system.add(_mirror(reflectance=0.3))
+
+    prescription = build_prescription(
+        system,
+        chassis_pivot=jnp.array([0.0, 0.0, 0.0]),
+        chassis_tilt_deg=0.0,
+        sources=[],
+        trace_wavelengths=jnp.array([550.0]) * nm,
+        glass_names={},
+        coating_names={},
+        face_coatings={
+            ("m", "front"): "MIRROR_FRONT",
+            ("m", "back"): "MIRROR_BACK",
+        },
+    )
+
+    mirror = prescription.objects[0]
+    assert mirror["face_coatings"] == {
+        "1": "MIRROR_FRONT",
+        "2": "MIRROR_BACK",
+    }
 
 
 def test_each_mirror_volume_keeps_its_own_coating():
@@ -183,6 +215,8 @@ def test_each_mirror_volume_keeps_its_own_coating():
     )
 
     mirrors = {entry["comment"]: entry for entry in prescription.objects}
+    assert mirrors["m_a"].get("coating") is None
+    assert mirrors["m_b"].get("coating") is None
     assert mirrors["m_a"]["face_coatings"] == {"1": "COAT_A"}
     assert mirrors["m_b"]["face_coatings"] == {"1": "COAT_B"}
 

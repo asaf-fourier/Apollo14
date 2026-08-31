@@ -14,13 +14,18 @@ One call writes everything OpticStudio needs plus the two scripts that drive it:
 """
 
 import json
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
 from apollo14.export.agf import fit_sellmeier, format_glass_catalog
 from apollo14.export.coating import format_coating_file
 from apollo14.export.prescription import build_prescription
-from apollo14.export.zosapi_script import build_script_text, sweep_script_text
+from apollo14.export.zosapi_script import (
+    build_and_run_script_text,
+    build_script_text,
+    sweep_script_text,
+)
 
 DEFAULT_GLASS_CATALOG = "APOLLO14"
 DEFAULT_COATING_FILE = "APOLLO14_COATINGS.DAT"
@@ -66,12 +71,15 @@ def export_zemax_bundle(
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "out").mkdir(parents=True, exist_ok=True)
 
     glass_materials = list(glass_materials)
     resolved_glass_names = _resolve_glass_names(glass_materials, glass_names)
+    resolved_coating_names = _resolve_coating_names(
+        system, coating_blocks, coating_names)
     prescription = _build_prescription(
         system, chassis_pivot, chassis_tilt_deg, sources, trace_wavelengths,
-        resolved_glass_names, coating_names, face_coatings, detector_pixels,
+        resolved_glass_names, resolved_coating_names, face_coatings, detector_pixels,
         coating_file, glass_catalog, prescription_kwargs)
 
     _write_prescription(output_dir, prescription, notes)
@@ -94,6 +102,32 @@ def _resolve_glass_names(glass_materials, glass_names):
         resolved_glass_names.setdefault(material.name,
                                         zemax_glass_name(material.name))
     return resolved_glass_names
+
+
+def _resolve_coating_names(system, coating_blocks, coating_names):
+    """Resolve mirror names to coating names, defaulting to flat tables."""
+    resolved = dict(coating_names or {})
+    flat_names = {}
+    for block in coating_blocks:
+        match = re.fullmatch(r"FLAT_M(\d+)", block.name)
+        if match is not None:
+            flat_names[int(match.group(1))] = block.name
+
+    for element in system.elements:
+        name = getattr(element, "name", None)
+        if name is None or not name.startswith("mirror_"):
+            continue
+        if name in resolved:
+            continue
+        try:
+            mirror_index = int(name.split("_", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        coating_name = flat_names.get(mirror_index)
+        if coating_name is not None:
+            resolved[name] = coating_name
+
+    return resolved
 
 
 def _build_prescription(system, chassis_pivot, chassis_tilt_deg, sources,
@@ -167,6 +201,7 @@ def _write_generated_scripts(output_dir):
     """Write the two generated ZOS-API scripts."""
     (output_dir / "build_zemax_model.py").write_text(build_script_text())
     (output_dir / "run_fov_sweep.py").write_text(sweep_script_text())
+    (output_dir / "build_and_run.py").write_text(build_and_run_script_text())
 
 
 def _write_readme_file(output_dir, prescription, fits, glass_names,
@@ -347,8 +382,33 @@ def _object_rows(prescription):
     return "\n".join(
         f"| {entry['index']} | {entry['type']} | {entry['comment']} | "
         f"{entry.get('material') or '—'} | "
-        f"{entry.get('inside_of') or '—'} | {entry.get('coating') or '—'} |"
+        f"{entry.get('inside_of') or '—'} | {_display_coating(entry)} |"
         for entry in prescription.objects)
+
+
+def _display_coating(entry):
+    """Prefer the visible face coating when the top-level field is empty."""
+    coating = entry.get("coating")
+    if coating:
+        return coating
+
+    face_coatings = entry.get("face_coatings") or {}
+    if not face_coatings:
+        return "—"
+
+    return ", ".join(
+        f"{_face_label(face_number)}: {face_coating}"
+        for face_number, face_coating in sorted(
+            face_coatings.items(), key=lambda item: int(item[0])))
+
+
+def _face_label(face_number):
+    """Render Zemax face numbers in the mirror-side language used upstream."""
+    if str(face_number) == "1":
+        return "front"
+    if str(face_number) == "2":
+        return "back"
+    return f"face {face_number}"
 
 
 def _fit_rows(fits, glass_names):
