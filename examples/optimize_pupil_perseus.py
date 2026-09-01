@@ -242,10 +242,10 @@ EYEBOX_POINTS = planar_grid_points(
 # Exclude the 4 corner cells — geometric coverage there drops below what the
 # optimizer can equalize, so weighting them pulls the whole design down.
 _cell_mask_2d = jnp.ones((EYEBOX_NY, EYEBOX_NX))
-_cell_mask_2d = _cell_mask_2d.at[0, 0].set(0.0)
-_cell_mask_2d = _cell_mask_2d.at[0, -1].set(0.0)
-_cell_mask_2d = _cell_mask_2d.at[-1, 0].set(0.0)
-_cell_mask_2d = _cell_mask_2d.at[-1, -1].set(0.0)
+# _cell_mask_2d = _cell_mask_2d.at[0, 0].set(0.0)
+# _cell_mask_2d = _cell_mask_2d.at[0, -1].set(0.0)
+# _cell_mask_2d = _cell_mask_2d.at[-1, 0].set(0.0)
+# _cell_mask_2d = _cell_mask_2d.at[-1, -1].set(0.0)
 CELL_MASK = _cell_mask_2d.reshape(-1)
 
 
