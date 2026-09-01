@@ -33,7 +33,7 @@ import jax.numpy as jnp
 
 from apollo14.combiner import compensated_reflectances
 from apollo14.elements.aperture import RectangularAperture
-from apollo14.elements.glass_block import GlassBlock
+from apollo14.elements.glass_block import GlassBlock, validate_reflectance_table
 from apollo14.elements.partial_mirror import (
     DEFAULT_MIRROR_WAVELENGTHS,
     PartialMirror,
@@ -46,8 +46,9 @@ from apollo14.geometry import (
     rotate_vectors,
 )
 from apollo14.materials import agc_m074, air
+from apollo14.spectral import SpectralTable
 from apollo14.system import OpticalSystem
-from apollo14.units import deg, mm
+from apollo14.units import deg, mm, nm
 
 # ── Rotation axis / nominal beam ────────────────────────────────────────────
 
@@ -84,6 +85,9 @@ PERSEUS_MIRROR_Z_EXTENT = 1.2 * mm           # mirror core, centered in the dept
 PERSEUS_COMBINER_CENTER = jnp.array([7.0 * mm, 24.0 * mm, 1.6 * mm])
 PERSEUS_COMBINER_WIDTH = 14.0 * mm           # chassis x
 PERSEUS_COMBINER_HEIGHT = 12.0 * mm          # chassis y (holds the stack)
+PERSEUS_AR_REFLECTANCE = validate_reflectance_table(
+    SpectralTable.constant(
+        0.005, jnp.array([380.0, 780.0]) * nm))  # 0.5% residual per face
 PERSEUS_BASE_RATIO = 0.05 * 6 / PERSEUS_NUM_MIRRORS   # per-mirror pick-off
 
 # ── Beam-defining aperture (opaque frame with a clear opening) ──────────────
@@ -168,6 +172,7 @@ def build_perseus_geometry(
     light_position: jnp.ndarray = PERSEUS_LIGHT_POSITION,
     pantoscopic_tilt: float = PERSEUS_PANTOSCOPIC_TILT,
     projector_tilt: float = PERSEUS_PROJECTOR_TILT,
+    ar_reflectance: SpectralTable = PERSEUS_AR_REFLECTANCE,
 ) -> PerseusGeometry:
     """Place every Perseus element, reproducing the visualization exactly.
 
@@ -217,6 +222,7 @@ def build_perseus_geometry(
     chassis = GlassBlock.create_chassis(
         name="chassis", x=float(combiner_width), y=float(combiner_height),
         z=float(chassis_z), material=agc_m074, z_skew=z_skew,
+        coating_reflectance=ar_reflectance,
     ).translate(combiner_center)
 
     # Mirror centers: consecutive y-gaps from ``spacings``, the stack centered

@@ -1,7 +1,8 @@
 import jax.numpy as jnp
-from jax import grad
+import pytest
+from jax import grad, jit
 
-from apollo14.elements.glass_block import GlassBlock
+from apollo14.elements.glass_block import GlassBlock, validate_reflectance_table
 from apollo14.geometry import (
     compute_local_axes,
     normalize,
@@ -13,6 +14,7 @@ from apollo14.geometry import (
     snell_refract,
 )
 from apollo14.materials import agc_m074
+from apollo14.spectral import SpectralTable
 
 
 def test_normalize():
@@ -186,3 +188,44 @@ def test_chassis_faces_are_centered_on_their_vertex_polygons():
         ])
         assert jnp.allclose(face.half_extents, expected_half_extents,
                             atol=1e-6)
+
+
+def test_perseus_ar_coating_is_on_all_chassis_faces_and_survives_transforms():
+    from apollo14.perseus import (
+        PERSEUS_AR_REFLECTANCE,
+        PERSEUS_NUM_MIRRORS,
+        build_perseus_geometry,
+        spacings_for_count,
+    )
+
+    chassis = build_perseus_geometry(
+        spacings=spacings_for_count(PERSEUS_NUM_MIRRORS)).chassis
+
+    assert {face.name for face in chassis.faces} == {
+        "bottom", "top", "left", "right", "front", "back"}
+    for face in chassis.faces:
+        assert jnp.allclose(face.coating_reflectance.values,
+                            PERSEUS_AR_REFLECTANCE.values)
+
+    moved = chassis.translate(jnp.array([1.0, 2.0, 3.0]))
+    for original, transformed in zip(chassis.faces, moved.faces, strict=True):
+        assert jnp.array_equal(transformed.coating_reflectance.wavelengths,
+                               original.coating_reflectance.wavelengths)
+        assert jnp.array_equal(transformed.coating_reflectance.values,
+                               original.coating_reflectance.values)
+
+
+def test_chassis_coating_range_is_validated_outside_jit_but_is_jit_safe():
+    with pytest.raises(ValueError, match=r"within \[0, 1\]"):
+        validate_reflectance_table(SpectralTable.constant(
+            1.1, jnp.array([400.0, 700.0])))
+
+    @jit
+    def build_and_read(reflectance):
+        chassis = GlassBlock.create_chassis(
+            name="coated", x=1.0, y=1.0, z=1.0, material=agc_m074,
+            coating_reflectance=SpectralTable.constant(
+                reflectance, jnp.array([400.0, 700.0])))
+        return chassis.get_face("back").coating_reflectance.values
+
+    assert jnp.allclose(build_and_read(0.005), 0.005)

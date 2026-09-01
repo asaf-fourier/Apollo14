@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 
 from apollo14.elements.aperture import ApertureSeg, aperture_interact
-from apollo14.elements.glass_block import FaceSeg, face_interact
+from apollo14.elements.glass_block import FaceSeg, PreparedFaceSeg, face_interact
 from apollo14.elements.partial_mirror import (
     MirrorStackSeg,
     PreparedMirrorStackSeg,
@@ -50,10 +50,16 @@ def _interp_n(mat: MaterialData, wavelength):
     return jnp.interp(wavelength, mat.wavelengths, mat.n_values)
 
 
-def _resolve_face(seg: FaceSeg, wavelength) -> FaceSeg:
-    return seg._replace(
+def _resolve_face(seg: FaceSeg, wavelength) -> PreparedFaceSeg:
+    return PreparedFaceSeg(
+        position=seg.position,
+        normal=seg.normal,
+        local_x=seg.local_x,
+        local_y=seg.local_y,
+        half_extents=seg.half_extents,
         n1=_interp_n(seg.n1, wavelength),
         n2=_interp_n(seg.n2, wavelength),
+        coating_reflectance=seg.coating_reflectance.sample(wavelength),
     )
 
 
@@ -108,8 +114,7 @@ def trace(route: Route, ray: Ray) -> TraceResult:
     already be resolved by :func:`prepare_route`.
     """
     for seg in route.segments:
-        is_raw_face = isinstance(seg, FaceSeg) and isinstance(seg.n1, MaterialData)
-        if isinstance(seg, (MirrorStackSeg, ReflectMirrorSeg)) or is_raw_face:
+        if isinstance(seg, (FaceSeg, MirrorStackSeg, ReflectMirrorSeg)):
             raise TypeError(
                 "Route contains unprepared wavelength-dependent segments; "
                 "call prepare_route(route, wavelength) before tracing.")
@@ -126,7 +131,7 @@ def trace(route: Route, ray: Ray) -> TraceResult:
             ray, hit, valid = aperture_interact(seg, ray, 0.0)
             _push(hit, valid)
 
-        elif isinstance(seg, FaceSeg):
+        elif isinstance(seg, PreparedFaceSeg):
             ray, hit, valid = face_interact(seg, ray, 0.0)
             _push(hit, valid)
 

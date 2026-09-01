@@ -150,6 +150,11 @@ def _serialize_element(e) -> dict:
                     "position": _to_list(f.position),
                     "normal": _to_list(f.normal),
                     "vertices": _to_list(f.vertices),
+                    "coating_reflectance": {
+                        "wavelengths": _to_list(
+                            f.coating_reflectance.wavelengths),
+                        "values": _to_list(f.coating_reflectance.values),
+                    },
                 }
                 for f in e.faces
             ],
