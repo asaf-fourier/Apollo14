@@ -29,6 +29,7 @@ import numpy as np
 
 from apollo14.elements.pupil import RectangularPupil
 from apollo14.elements.partial_mirror import PartialMirror
+from apollo14.elements.glass_block import GlassBlock
 from apollo14.export import export_zemax_bundle
 from apollo14.export.coating import (
     flat_table_coating,
@@ -157,6 +158,77 @@ def build_eyebox_detector(system: OpticalSystem, eyebox: dict) -> RectangularPup
         width=2.0 * float(eyebox["half_x"]),
         height=2.0 * float(eyebox["half_y"]),
     )
+
+
+def build_ambient_detectors(system: OpticalSystem) -> list[RectangularPupil]:
+    """Build four ambient detectors around the chassis+pupil bounding box."""
+    offset_mm = 10.0
+    chassis = next(
+        element for element in system.elements if isinstance(element, GlassBlock)
+        and element.name == "chassis")
+    pupil = next(e for e in system.elements if isinstance(e, RectangularPupil))
+
+    points = []
+    for face in chassis.faces:
+        points.extend(np.asarray(face.vertices, dtype=float))
+
+    pupil_position = np.asarray(pupil.position, dtype=float)
+    pupil_local_x = np.asarray(pupil._local_x, dtype=float)
+    pupil_local_y = np.asarray(pupil._local_y, dtype=float)
+    pupil_half_extents = np.asarray(pupil.half_extents, dtype=float)
+    for sx in (-1.0, 1.0):
+        for sy in (-1.0, 1.0):
+            points.append(
+                pupil_position
+                + sx * pupil_half_extents[0] * pupil_local_x
+                + sy * pupil_half_extents[1] * pupil_local_y
+            )
+
+    bbox = np.asarray(points, dtype=float)
+    mins = bbox.min(axis=0)
+    maxs = bbox.max(axis=0)
+    center = 0.5 * (mins + maxs)
+    span_x = float(maxs[0] - mins[0])
+    span_y = float(maxs[1] - mins[1])
+    span_z = float(maxs[2] - mins[2])
+    span_y_with_margin = span_y + 2.0 * offset_mm
+    span_z_with_margin = span_z + 2.0 * offset_mm
+
+    ambient_detectors = [
+        RectangularPupil(
+            name="ambient_y_neg",
+            position=np.array(
+                [center[0], mins[1] - offset_mm, center[2]], dtype=float),
+            normal=np.array([0.0, -1.0, 0.0], dtype=float),
+            width=span_x,
+            height=span_z_with_margin,
+        ),
+        RectangularPupil(
+            name="ambient_y_pos",
+            position=np.array(
+                [center[0], maxs[1] + offset_mm, center[2]], dtype=float),
+            normal=np.array([0.0, 1.0, 0.0], dtype=float),
+            width=span_x,
+            height=span_z_with_margin,
+        ),
+        RectangularPupil(
+            name="ambient_z_neg",
+            position=np.array(
+                [center[0], center[1], mins[2] - offset_mm], dtype=float),
+            normal=np.array([0.0, 0.0, -1.0], dtype=float),
+            width=span_x,
+            height=span_y_with_margin,
+        ),
+        RectangularPupil(
+            name="ambient_z_pos",
+            position=np.array(
+                [center[0], center[1], maxs[2] + offset_mm], dtype=float),
+            normal=np.array([0.0, 0.0, 1.0], dtype=float),
+            width=span_x,
+            height=span_y_with_margin,
+        ),
+    ]
+    return ambient_detectors
 
 
 def load_coating_design(coating_dir: Path | None, report_dir: Path):
@@ -322,6 +394,7 @@ def main():
     coating_results = load_coating_design(coating_dir, report_dir)
     system = build_system(mirrors, spacings)
     eyebox_detector = build_eyebox_detector(system, eyebox)
+    ambient_detectors = build_ambient_detectors(system)
     pupil_pitch_x_mm = abs(float(pupil_x_mm[1] - pupil_x_mm[0]))
     pupil_pitch_y_mm = abs(float(pupil_y_mm[1] - pupil_y_mm[0]))
 
@@ -333,6 +406,12 @@ def main():
             float(eyebox_detector.width), float(eyebox_detector.height),
             pupil_pitch_x_mm, pupil_pitch_y_mm),
     }
+    detector_pixels_by_name.update({
+        detector.name: detector_pixels_for_size(
+            float(detector.width), float(detector.height),
+            pupil_pitch_x_mm, pupil_pitch_y_mm)
+        for detector in ambient_detectors
+    })
 
     projector = Projector.uniform(
         position=PERSEUS_LIGHT_POSITION,
@@ -354,8 +433,24 @@ def main():
     print(f"face coatings : {MIRROR_FACE_COATING_MODES}")
     print(f"front mode    : {FRONT_FACE_COATING_MODE}  "
           f"({len(coating_results)} Atlas designs available)")
+    print("ambient dets  : "
+          f"{', '.join(detector.name for detector in ambient_detectors)}")
     for note in coating_notes:
         print(f"  ! {note}")
+    chassis_material_name = next(
+        element.material.name
+        for element in system.elements
+        if isinstance(element, GlassBlock) and element.name == "chassis")
+    for mirror_index in range(len(mirrors)):
+        mirror_name = f"mirror_{mirror_index}"
+        selected_coating = face_coatings.get((mirror_name, "front"))
+        if mirror_index in coating_results:
+            status = "Atlas coating available"
+        else:
+            status = f"no Atlas coating, using {selected_coating}"
+        print(
+            f"  {mirror_name} | {chassis_material_name} | "
+            f"{selected_coating} | {status}")
     print(f"sources       : {len(sources)} FOV directions "
           f"({NUM_FOV_X}×{NUM_FOV_Y})")
 
@@ -374,7 +469,7 @@ def main():
         coating_blocks=blocks,
         face_coatings=face_coatings,
         detector_pixels_by_name=detector_pixels_by_name,
-        extra_pupils=[eyebox_detector],
+        extra_pupils=[eyebox_detector, *ambient_detectors],
         notes=(f"Perseus combiner, {len(mirrors)} mirrors, front face mode "
                f"`{FRONT_FACE_COATING_MODE}`.\n\n"
                f"- face coating modes: `{MIRROR_FACE_COATING_MODES}`\n"

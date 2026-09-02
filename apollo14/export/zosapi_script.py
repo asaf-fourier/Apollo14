@@ -895,13 +895,47 @@ def _apply_system_settings(ZOSAPI, system, settings):
         nonsequential = system.SystemData.NonSequentialData
         nonsequential.MaximumSegmentsPerRay = settings["max_segments"]
         nonsequential.MaximumIntersectionsPerRay = settings["max_intersections"]
-        nonsequential.MinimumRelativeRayIntensity = \
-            settings["min_relative_intensity"]
+
+        def _set_first_available_attribute(target, candidates, value):
+            for name in candidates:
+                if hasattr(target, name):
+                    setattr(target, name, value)
+                    return True
+            return False
+
+        def _set_setting(candidates, value, label):
+            if not _set_first_available_attribute(
+                    nonsequential, candidates, value):
+                raise AttributeError(
+                    f"No OpticStudio property matched {label}.")
+
+        _set_setting(
+            ("MaximumNestedTouchingObjects",
+             "MaximumNestedAndTouchingObjects"),
+            settings["max_nested_touching_objects"],
+            "Maximum Nested/Touching Objects")
+        _set_setting(
+            ("MinimumRelativeRayIntensity", "MinimumRelativeIntensity"),
+            settings["min_relative_intensity"],
+            "Minimum Relative Ray Intensity")
+        _set_setting(
+            ("MinimumAbsoluteRayIntensity", "MinimumAbsoluteIntensity"),
+            settings["min_absolute_intensity"],
+            "Minimum Absolute Ray Intensity")
 
     configure(
-        "ray-splitting limits (max segments / intersections / min intensity) — "
-        "a cascade of partial mirrors needs these well above stock",
+        "ray-splitting limits (max segments / intersections / nested objects / "
+        "minimum relative / minimum absolute intensity) — a cascade of partial "
+        "mirrors needs these well above stock",
         apply_nonsequential_limits)
+
+
+def _prime_ray_trace_defaults(system):
+    """Set the NSC ray-trace defaults that should survive into the saved model."""
+    ray_trace = system.Tools.OpenNSCRayTrace()
+    ray_trace.SplitNSCRays = True
+    ray_trace.UsePolarization = True
+    ray_trace.Close()
 
 
 def _populate_objects(ZOSAPI, nce_types, editor, objects, prescription_directory):
@@ -930,7 +964,8 @@ def _print_build_result(output_path):
     print("  1. 3D Layout shows the mirror stack inside the chassis, not "
           "intersecting its faces.")
     print("  2. Each mirror's 'Inside Of' column points at the chassis object.")
-    print("  3. Ray Splitting is ticked in the NSC ray trace dialog.")
+    print("  3. Ray Splitting and Use Polarization are ticked in the NSC "
+          "ray trace dialog.")
     print("  4. The off-axis sources tilt the way their comments say "
           "(the on-axis source needs only one tilt and is unambiguous).")
 
@@ -952,6 +987,7 @@ def build(prescription_path, output_path):
     system.MakeNonSequential()
 
     _apply_system_settings(ZOSAPI, system, settings)
+    _prime_ray_trace_defaults(system)
     editor = system.NCE
     _populate_objects(ZOSAPI, nce_types, editor, prescription["objects"],
                       prescription_directory)
@@ -1433,7 +1469,7 @@ def set_only_active_source(editor, sources, active_index):
 
 
 def trace(system):
-    """Run one non-sequential ray trace with splitting on."""
+    """Run one non-sequential ray trace with splitting and polarization on."""
     ray_trace = system.Tools.OpenNSCRayTrace()
     ray_trace.SplitNSCRays = True
     ray_trace.ScatterNSCRays = False

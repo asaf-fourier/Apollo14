@@ -37,9 +37,11 @@ from apollo14.units import nm
 # Ray-splitting defaults. A cascade of M partial mirrors branches into 2^M
 # paths, so OpticStudio's stock limits (which assume a handful of splits) cull
 # exactly the light this model exists to measure.
-DEFAULT_MAX_SEGMENTS = 4000
-DEFAULT_MAX_INTERSECTIONS = 400
-DEFAULT_MIN_RELATIVE_INTENSITY = 1e-9
+DEFAULT_MAX_SEGMENTS = 400000
+DEFAULT_MAX_INTERSECTIONS = 40000
+DEFAULT_MAX_NESTED_TOUCHING_OBJECTS = 100
+DEFAULT_MIN_RELATIVE_INTENSITY = 1e-5
+DEFAULT_MIN_ABSOLUTE_INTENSITY = 1e-5
 PARTIAL_MIRROR_THICKNESS_MM = 0.001
 
 
@@ -99,7 +101,9 @@ def build_prescription(
     glass_catalog: str | None = None,
     max_segments: int = DEFAULT_MAX_SEGMENTS,
     max_intersections: int = DEFAULT_MAX_INTERSECTIONS,
+    max_nested_touching_objects: int = DEFAULT_MAX_NESTED_TOUCHING_OBJECTS,
     min_relative_intensity: float = DEFAULT_MIN_RELATIVE_INTENSITY,
+    min_absolute_intensity: float = DEFAULT_MIN_ABSOLUTE_INTENSITY,
 ) -> Prescription:
     """Build the prescription for ``system``.
 
@@ -128,6 +132,7 @@ def build_prescription(
     """
     coating_names = coating_names or {}
     face_coatings = face_coatings or {}
+    chassis_material_name = _resolve_chassis_material_name(system, glass_names)
 
     objects: list[dict] = []
     polygon_files: dict[str, str] = {}
@@ -144,8 +149,8 @@ def build_prescription(
             entry, polygon_text, file_name = _export_aperture(element)
             polygon_files[file_name] = polygon_text
         elif isinstance(element, PartialMirror):
-            entry = _export_partial_mirror(element, coating_names,
-                                           face_coatings)
+            entry = _export_partial_mirror(
+                element, coating_names, face_coatings, chassis_material_name)
         elif isinstance(element, RectangularPupil):
             entry = _export_pupil(element, detector_pixels)
         else:
@@ -176,13 +181,29 @@ def build_prescription(
             "ray_splitting": True,
             "max_segments": int(max_segments),
             "max_intersections": int(max_intersections),
+            "max_nested_touching_objects": int(max_nested_touching_objects),
             "min_relative_intensity": float(min_relative_intensity),
+            "min_absolute_intensity": float(min_absolute_intensity),
             "glass_catalog": glass_catalog,
             "coating_file": coating_file,
         },
         "objects": objects,
     }
     return Prescription(document=document, polygon_files=polygon_files)
+
+
+def _resolve_chassis_material_name(system, glass_names):
+    """Return the Zemax glass name for the chassis material, if any."""
+    for element in system.elements:
+        if not isinstance(element, GlassBlock):
+            continue
+        material_name = glass_names.get(element.material.name)
+        if material_name is None:
+            raise KeyError(
+                f"No Zemax glass name given for chassis material "
+                f"{element.material.name!r}; pass one via glass_names.")
+        return material_name
+    return None
 
 
 def _export_glass_block(block, pivot, tilt_deg, glass_names, face_coatings):
@@ -236,7 +257,9 @@ def _export_aperture(aperture):
     return entry, polygon_text, file_name
 
 
-def _export_partial_mirror(mirror, coating_names, face_coatings):
+def _export_partial_mirror(
+    mirror, coating_names, face_coatings, chassis_material_name
+):
     half_x, half_y = half_extents_in_zemax_frame(mirror, mirror.name)
     placement = planar_placement(mirror, mirror.name)
 
@@ -245,7 +268,7 @@ def _export_partial_mirror(mirror, coating_names, face_coatings):
         "comment": mirror.name,
         "position": [float(v) for v in placement.position],
         "tilt_deg": [float(v) for v in placement.tilt_deg],
-        "material": "",
+        "material": chassis_material_name or "",
         "inside_of": 0,
         "data": {
             "x1_half_width": half_x,
