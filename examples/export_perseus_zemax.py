@@ -60,10 +60,13 @@ OPTIMIZE_RUNS_ROOT = Path("examples/reports/optimize_pupil_perseus")
 COATING_RUNS_ROOT = Path("examples/reports/design_perseus_mirror_coating")
 REPORT_DIR: Path | None = None
 COATING_DIR: Path | None = None
+DETECTOR_SCAN_PIXELS = 200
+MIN_RELATIVE_INTENSITY = 1.0e-8
+MIN_ABSOLUTE_INTENSITY = 1.0e-8
 
-# Default rung for the mirror front face. Change this value to move the front
-# face to a different fidelity rung without touching the exporter internals.
-FRONT_FACE_COATING_MODE = "flat"
+# Default rung for the mirror faces. Change this value to move the coating
+# policy without touching the exporter internals.
+FRONT_FACE_COATING_MODE = "atlas"
 BACK_FACE_COATING_MODE = None
 MIRROR_FACE_COATING_MODES = {
     "front": FRONT_FACE_COATING_MODE,
@@ -483,7 +486,7 @@ def main():
     print(f"mirrors       : {len(mirrors)}  spacings "
           f"{np.round(spacings, 4).tolist()}")
     print(f"face coatings : {MIRROR_FACE_COATING_MODES}")
-    print(f"front mode    : {FRONT_FACE_COATING_MODE}  "
+    print(f"mirror mode   : {FRONT_FACE_COATING_MODE}  "
           f"({len(coating_results)} Atlas designs available)")
     print("ambient dets  : "
           f"{', '.join(detector.name for detector in ambient_detectors)}")
@@ -522,7 +525,9 @@ def main():
         face_coatings=face_coatings,
         detector_pixels_by_name=detector_pixels_by_name,
         extra_pupils=[eyebox_detector, *ambient_detectors],
-        notes=(f"Perseus combiner, {len(mirrors)} mirrors, front face mode "
+        min_relative_intensity=MIN_RELATIVE_INTENSITY,
+        min_absolute_intensity=MIN_ABSOLUTE_INTENSITY,
+        notes=(f"Perseus combiner, {len(mirrors)} mirrors, mirror face mode "
                f"`{FRONT_FACE_COATING_MODE}`.\n\n"
                f"- face coating modes: `{MIRROR_FACE_COATING_MODES}`\n"
                f"- detector pixels: `{detector_pixels_by_name}`\n"
