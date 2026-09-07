@@ -21,12 +21,12 @@ from pathlib import Path
 from apollo14.export.agf import fit_sellmeier, format_glass_catalog
 from apollo14.export.coating import format_coating_file
 from apollo14.export.prescription import build_prescription
-from apollo14.system import OpticalSystem
 from apollo14.export.zosapi_script import (
     build_and_run_script_text,
     build_script_text,
     sweep_script_text,
 )
+from apollo14.system import OpticalSystem
 
 DEFAULT_GLASS_CATALOG = "APOLLO14"
 DEFAULT_COATING_FILE = "APOLLO14_COATINGS.DAT"
@@ -278,11 +278,8 @@ def _readme_header(notes):
         "polygon objects rather than imported CAD parts, the sources are analytic rather",
         "than measured rayfiles, and the sweep script disables scattering.",
         "",
-        "The build script opens a standalone OpticStudio session, which takes a licence",
-        "seat. If none is free — usually because OpticStudio is already open — it falls",
-        "back to attaching to that running instance, which needs Programming →",
-        "Interactive Extension enabled there first. It will not close a session it did",
-        "not start.",
+        "The build script starts a standalone OpticStudio session. It will not close",
+        "a session it did not start.",
     ])
 
 
@@ -408,7 +405,6 @@ def _readme_expected_bias():
         "A *shape* mismatch across the pupil is a different matter and worth chasing.",
     ])
 
-    
 def _object_rows(prescription):
     """Render the exported object table rows."""
     return "\n".join(

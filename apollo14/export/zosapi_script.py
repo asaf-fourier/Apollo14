@@ -35,6 +35,7 @@ import sys
 import ctypes
 import shutil
 import time
+import tempfile
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 
@@ -99,6 +100,11 @@ def _tee_console(log_path):
         with redirect_stdout(_Tee(sys.stdout, handle)):
             with redirect_stderr(_Tee(sys.stderr, handle)):
                 yield
+
+
+def _log_startup(message):
+    """Emit a consistent startup diagnostic line."""
+    print(f"[OpticStudio startup] {message}")
 
 
 def _extend_candidates(candidates, *items):
@@ -255,8 +261,11 @@ def _candidate_net_helper_paths():
 
 
 def _find_net_helper():
+    _log_startup("Searching for ZOSAPI_NetHelper.dll")
     for candidate in _candidate_net_helper_paths():
+        _log_startup(f"Checking helper path: {candidate}")
         if os.path.exists(candidate):
+            _log_startup(f"Using helper path: {candidate}")
             return candidate
     raise RuntimeError(
         "ZOSAPI_NetHelper.dll not found. Set one of "
@@ -267,37 +276,52 @@ def _find_net_helper():
 
 def _load_zosapi_runtime(helper):
     """Load the .NET assemblies required to talk to OpticStudio."""
+    _log_startup(f"Loading ZOS-API runtime from helper: {helper}")
     clr.AddReference(helper)
     import ZOSAPI_NetHelper
 
     ZOSAPI_NetHelper.ZOSAPI_Initializer.Initialize()
     zemax_directory = ZOSAPI_NetHelper.ZOSAPI_Initializer.GetZemaxDirectory()
+    _log_startup(f"Zemax directory resolved to: {zemax_directory}")
     for dll_name in ZOSAPI_DLL_NAMES:
+        _log_startup(f"Loading assembly: {dll_name}")
         clr.AddReference(os.path.join(zemax_directory, dll_name))
     import ZOSAPI
     return ZOSAPI
 
 
 def _open_application(ZOSAPI):
-    """Try a standalone session first, then fall back to an attached one."""
+    """Start a standalone OpticStudio session."""
     connection = ZOSAPI.ZOSAPI_Connection()
 
-    application = connection.CreateNewApplication()
+    _log_startup("Trying CreateNewApplication() for a standalone OpticStudio")
+    try:
+        application = connection.CreateNewApplication()
+    except Exception as error:  # noqa: BLE001
+        _log_startup(
+            "CreateNewApplication() raised "
+            f"{type(error).__name__}: {error!r}")
+        application = None
+    else:
+        if application is None:
+            _log_startup("CreateNewApplication() returned no application")
+        else:
+            _log_startup("CreateNewApplication() succeeded")
+
     mode = "standalone application"
-    if application is None:
-        application = connection.ConnectAsExtension(0)
-        mode = "interactive extension"
     return application, mode
 
 
 def _validate_application(application, ZOSAPI):
     """Reject connections that cannot legally use the API."""
     if application is None:
+        _log_startup(
+            "No OpticStudio application is available after startup")
         raise RuntimeError(
             "Could not open OpticStudio. Either no licence seat is free for a "
-            "standalone application, or no running instance has Interactive "
-            "Extension enabled (Programming → Interactive Extension).")
-    print(f"OpticStudio license status: {describe_license(application, ZOSAPI)}")
+            "standalone application.")
+    license_description = describe_license(application, ZOSAPI)
+    _log_startup(f"OpticStudio license status: {license_description}")
     if not application.IsValidLicenseForAPI:
         raise RuntimeError(
             "This OpticStudio licence does not permit ZOS-API use. ZOS-API is "
@@ -307,26 +331,20 @@ def _validate_application(application, ZOSAPI):
 def connect():
     """Open an OpticStudio session and return ``(ZOSAPI, application, system)``.
 
-    Tries a standalone application first, which launches its own headless
-    OpticStudio and therefore needs a free licence seat. If none is free —
-    typically because OpticStudio is already open on this machine — it falls
-    back to attaching to that running instance as an Interactive Extension.
-    For the fallback, enable it in OpticStudio under Programming → Interactive
-    Extension before running this script.
+    Starts a standalone headless OpticStudio session.
 
     Edition requirements: non-sequential mode and ZOS-API are both included from
     the Professional edition upward, and every licence issued from 2023 R1
     onward has non-sequential ray tracing. Only a legacy pre-2023-R1 Standard
     licence, which was sequential-only, cannot run this model at all.
     """
+    _log_startup("Beginning OpticStudio connection")
     helper = _find_net_helper()
     ZOSAPI = _load_zosapi_runtime(helper)
     application, mode = _open_application(ZOSAPI)
     _validate_application(application, ZOSAPI)
 
-    global CONNECTION_MODE
-    CONNECTION_MODE = mode
-    print(f"Connected to OpticStudio ({mode}).")
+    _log_startup(f"Connected to OpticStudio ({mode})")
     return ZOSAPI, application, application.PrimarySystem
 
 
@@ -349,18 +367,9 @@ def describe_license(application, ZOSAPI):
     return f"{license_status!r}"
 
 
-CONNECTION_MODE = None
-
-
 def disconnect(application):
-    """Close a standalone session; leave an attached GUI session alone.
-
-    ``CloseApplication`` on an interactive extension would shut down the user's
-    own OpticStudio window, so it is only called for a session this script
-    started itself.
-    """
-    if CONNECTION_MODE == "standalone application":
-        application.CloseApplication()
+    """Close the standalone OpticStudio session started by this script."""
+    application.CloseApplication()
 
 
 def _candidate_coating_folders():
@@ -655,6 +664,37 @@ SOURCE_RAY_COUNT_ATTRIBUTE_CANDIDATES = {
     "analysis": ["NumberOfAnalysisRays", "NumberOfAnalysisRaysUsed",
                   "AnalysisRays"],
 }
+RAY_TRACE_SPLIT_ATTRIBUTE_CANDIDATES = (
+    "SplitNSCRays", "SplitRays", "RaySplitting", "RaySplit")
+RAY_TRACE_SCATTER_ATTRIBUTE_CANDIDATES = (
+    "ScatterNSCRays", "ScatterRays", "Scatter")
+RAY_TRACE_POLARIZATION_ATTRIBUTE_CANDIDATES = (
+    "UsePolarization", "UsePolarisation")
+NSC3D_LAYOUT_BOOLEAN_ATTRIBUTE_CANDIDATES = {
+    "auto_apply": ("AutoApply", "Auto_Apply", "AutoUpdate"),
+    "fletch_rays": ("FletchRays",),
+    "split_rays": RAY_TRACE_SPLIT_ATTRIBUTE_CANDIDATES,
+    "scatter_rays": RAY_TRACE_SCATTER_ATTRIBUTE_CANDIDATES,
+    "use_polarization": RAY_TRACE_POLARIZATION_ATTRIBUTE_CANDIDATES,
+}
+NSC3D_LAYOUT_MODIFY_SETTING_CANDIDATES = {
+    "auto_apply": ("AUTOAPPLY", "AUTO_APPLY", "AUTOUPDATE", "AUTO_UPDATE"),
+    "fletch_rays": ("FLETCHRAYS", "FLETCH_RAYS", "FLETCH"),
+    "split_rays": ("SPLITRAYS", "SPLIT_RAYS", "SPLITNSCRAYS",
+                    "SPLIT_NSC_RAYS", "RAYSPLIT"),
+    "scatter_rays": ("SCATTERRAYS", "SCATTER_RAYS", "SCATTERNSCRAYS",
+                     "SCATTER_NSC_RAYS", "SCATTER"),
+    "use_polarization": ("USEPOLARIZATION", "USE_POLARIZATION",
+                         "USEPOLARISATION", "USE_POLARISATION",
+                         "POLARIZATION", "POLARISATION"),
+}
+NSC3D_LAYOUT_CHECKBOX_SPECS = (
+    ("auto-apply", "auto_apply", True),
+    ("fletch rays", "fletch_rays", False),
+    ("split NSC rays", "split_rays", True),
+    ("scatter NSC rays", "scatter_rays", False),
+    ("use polarization", "use_polarization", True),
+)
 COATING_ATTRIBUTE_CANDIDATES = ["Coating", "CoatingName", "CoatName"]
 COAT_SCATTER_ATTRIBUTE_CANDIDATES = [
     "CoatScatterData",
@@ -695,6 +735,14 @@ NESTED_TARGET_ATTRIBUTE_CANDIDATES = (
     "ScatterToData",
     "CoatScatterData",
     "DiffractionData",
+    "Settings",
+    "AnalysisSettings",
+    "AnalysisSpecificSettings",
+    "DisplaySettings",
+    "ViewSettings",
+    "LayoutSettings",
+    "WindowSettings",
+    "ControlSettings",
     "Metadata",
 )
 
@@ -930,12 +978,145 @@ def _apply_system_settings(ZOSAPI, system, settings):
         apply_nonsequential_limits)
 
 
+def _prime_nsc_system_defaults(system):
+    """Set the persistent NSC defaults that the GUI should reopen with."""
+    # These are the persistent system-level defaults that should be visible
+    # when the NSC dialogs are reopened in the same OpticStudio session.
+    def apply_nsc_defaults():
+        nonsequential = system.SystemData.NonSequentialData
+        set_first_available(
+            [nonsequential], ("FletchRays", "Fletch"), False,
+            "NSC defaults: fletch rays")
+        set_first_available(
+            [nonsequential], ("SplitNSCRays", "SplitRays", "RaySplitting",
+                               "RaySplit"), True,
+            "NSC defaults: split NSC rays")
+        set_first_available(
+            [nonsequential], ("ScatterNSCRays", "ScatterRays", "Scatter"),
+            False,
+            "NSC defaults: scatter NSC rays")
+        set_first_available(
+            [nonsequential], ("UsePolarization", "UsePolarisation"), True,
+            "NSC defaults: use polarization")
+
+    configure("persistent NSC defaults", apply_nsc_defaults)
+
+
 def _prime_ray_trace_defaults(system):
     """Set the NSC ray-trace defaults that should survive into the saved model."""
-    ray_trace = system.Tools.OpenNSCRayTrace()
-    ray_trace.SplitNSCRays = True
-    ray_trace.UsePolarization = True
-    ray_trace.Close()
+    def apply_ray_trace_defaults():
+        ray_trace = None
+        try:
+            ray_trace = system.Tools.OpenNSCRayTrace()
+            set_first_available(
+                [ray_trace], RAY_TRACE_SPLIT_ATTRIBUTE_CANDIDATES, True,
+                "NSC ray trace: split NSC rays")
+            set_first_available(
+                [ray_trace], RAY_TRACE_SCATTER_ATTRIBUTE_CANDIDATES, False,
+                "NSC ray trace: scatter NSC rays")
+            set_first_available(
+                [ray_trace], RAY_TRACE_POLARIZATION_ATTRIBUTE_CANDIDATES,
+                True,
+                "NSC ray trace: use polarization")
+        finally:
+            if ray_trace is not None:
+                ray_trace.Close()
+
+    configure("NSC ray trace defaults", apply_ray_trace_defaults)
+
+
+def _modify_analysis_settings_boolean(settings, label, key_candidates, value):
+    """Patch a non-fully-implemented analysis settings file in place."""
+    cfg_path = None
+    try:
+        # ModifySettings works on a saved .cfg snapshot, so edit a temporary
+        # copy and load it back after the change.
+        fd, cfg_path = tempfile.mkstemp(prefix="apollo14_nsc3d_", suffix=".cfg")
+        os.close(fd)
+        settings.SaveTo(cfg_path)
+        for key in key_candidates:
+            for text_value in (
+                    "1" if value else "0",
+                    "True" if value else "False",
+                    "1.0" if value else "0.0"):
+                try:
+                    _log_startup(
+                        f"NSC 3D Layout ModifySettings {key}={text_value}")
+                    settings.ModifySettings(cfg_path, key, text_value)
+                    settings.LoadFrom(cfg_path)
+                    _log_startup(
+                        f"NSC 3D Layout applied {label} via "
+                        f"ModifySettings({key}={text_value})")
+                    return True
+                except Exception as error:  # noqa: BLE001
+                    _log_startup(
+                        f"NSC 3D Layout ModifySettings {key}={text_value} "
+                        f"failed: {type(error).__name__}: {error!r}")
+        return False
+    finally:
+        if cfg_path and os.path.exists(cfg_path):
+            try:
+                os.remove(cfg_path)
+            except OSError:
+                pass
+
+
+def _apply_nsc3d_layout_checkbox(layout, settings, label, candidates,
+                                 modify_key_candidates, value,
+                                 has_specific_settings):
+    """Set one NSC 3D Layout checkbox through the best available path."""
+    if has_specific_settings:
+        applied = set_first_available(
+            [settings, layout], candidates, value,
+            f"NSC 3D Layout: {label}")
+        if applied:
+            return True
+    if (hasattr(settings, "ModifySettings") and hasattr(settings, "SaveTo")
+            and hasattr(settings, "LoadFrom")):
+        if _modify_analysis_settings_boolean(
+                settings, label, modify_key_candidates, value):
+            return True
+    DEFERRED_TO_USER.append(
+        f"NSC 3D Layout: {label} could not be applied automatically; set it "
+        f"by hand (value {value!r})")
+    return False
+
+
+def _prime_nsc3d_layout_defaults(ZOSAPI, system):
+    """Set the NSC 3D Layout checkboxes to match the ray-trace defaults."""
+    def apply_layout_defaults():
+        layout = None
+        try:
+            # This is the actual analysis window whose checkboxes the GUI shows.
+            layout = system.Analyses.New_Analysis(
+                ZOSAPI.Analysis.AnalysisIDM.NSC3DLayout)
+            has_specific_settings = bool(
+                getattr(layout, "HasAnalysisSpecificSettings", False))
+            _log_startup(
+                f"NSC 3D Layout HasAnalysisSpecificSettings = "
+                f"{has_specific_settings}")
+            settings = layout.GetSettings()
+            attempted = []
+            for label, spec_key, value in NSC3D_LAYOUT_CHECKBOX_SPECS:
+                applied = _apply_nsc3d_layout_checkbox(
+                    layout, settings, label,
+                    NSC3D_LAYOUT_BOOLEAN_ATTRIBUTE_CANDIDATES[spec_key],
+                    NSC3D_LAYOUT_MODIFY_SETTING_CANDIDATES[spec_key], value,
+                    has_specific_settings)
+                attempted.append((label, applied))
+            if hasattr(layout, "ApplyAndWaitForCompletion"):
+                layout.ApplyAndWaitForCompletion()
+            if not all(applied for _, applied in attempted):
+                _dump_member_inventory("NSC 3D Layout analysis", layout)
+                _dump_member_inventory("NSC 3D Layout settings", settings)
+        finally:
+            if layout is not None:
+                try:
+                    layout.Close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    configure("NSC 3D Layout defaults", apply_layout_defaults)
 
 
 def _populate_objects(ZOSAPI, nce_types, editor, objects, prescription_directory):
@@ -961,12 +1142,13 @@ def _print_build_result(output_path):
         print("\nAll settings applied.")
 
     print("\nBefore trusting the model, confirm in OpticStudio:")
-    print("  1. 3D Layout shows the mirror stack inside the chassis, not "
+    print("  1. NSC 3D Layout has Split NSC Rays and Use Polarization checked.")
+    print("  2. 3D Layout shows the mirror stack inside the chassis, not "
           "intersecting its faces.")
-    print("  2. Each mirror's 'Inside Of' column points at the chassis object.")
-    print("  3. Ray Splitting and Use Polarization are ticked in the NSC "
+    print("  3. Each mirror's 'Inside Of' column points at the chassis object.")
+    print("  4. Ray Splitting and Use Polarization are ticked in the NSC "
           "ray trace dialog.")
-    print("  4. The off-axis sources tilt the way their comments say "
+    print("  5. The off-axis sources tilt the way their comments say "
           "(the on-axis source needs only one tilt and is unambiguous).")
 
 
@@ -987,7 +1169,9 @@ def build(prescription_path, output_path):
     system.MakeNonSequential()
 
     _apply_system_settings(ZOSAPI, system, settings)
+    _prime_nsc_system_defaults(system)
     _prime_ray_trace_defaults(system)
+    _prime_nsc3d_layout_defaults(ZOSAPI, system)
     editor = system.NCE
     _populate_objects(ZOSAPI, nce_types, editor, prescription["objects"],
                       prescription_directory)

@@ -3,25 +3,26 @@
 import jax.numpy as jnp
 import numpy as np
 
-from examples import export_perseus_zemax
-from apollo14.elements.pupil import RectangularPupil
 from apollo14.elements.glass_block import GlassBlock
-from apollo14.materials import agc_m074
-from apollo14.export.bundle import zemax_glass_name
+from apollo14.elements.pupil import RectangularPupil
 from apollo14.export.bundle import (
     _apply_detector_pixel_overrides,
     _clone_system_with_extra_pupils,
+    _display_coating,
+    _readme_header,
+    zemax_glass_name,
 )
 from apollo14.export.prescription import build_prescription
-from apollo14.export.zosapi_script import sweep_script_text
+from apollo14.export.zosapi_script import build_script_text, sweep_script_text
+from apollo14.materials import agc_m074
 from apollo14.perseus import (
     PERSEUS_COMBINER_CENTER,
     PERSEUS_PANTOSCOPIC_TILT,
 )
 from apollo14.units import deg, nm
+from examples import export_perseus_zemax
 from helios.combiner_params import CombinerParams
 from helios.perseus_params import build_parametrized_perseus
-from apollo14.export.bundle import _display_coating
 
 
 def test_perseus_export_defaults_to_flat_coatings():
@@ -166,3 +167,37 @@ def test_generated_sweep_script_handles_multiple_detectors():
     assert "detectors = [entry for entry in prescription[\"objects\"]" in text
     assert "for detector in detectors:" in text
     assert "_run_source_sweep(system, sources, detector, output_directory)" in text
+
+
+def test_generated_build_script_sets_layout_checkboxes_tolerantly():
+    text = build_script_text()
+    assert "RAY_TRACE_SPLIT_ATTRIBUTE_CANDIDATES" in text
+    assert "NSC3D_LAYOUT_BOOLEAN_ATTRIBUTE_CANDIDATES" in text
+    assert '_log_startup("Beginning OpticStudio connection")' in text
+    assert "UsePolarization" in text
+
+
+def test_generated_build_script_logs_opticstudio_startup_attempts():
+    text = build_script_text()
+    assert "Beginning OpticStudio connection" in text
+    assert "Trying CreateNewApplication() for a standalone OpticStudio" in text
+    assert "CreateNewApplication() succeeded" in text
+    assert "persistent NSC defaults" in text
+    assert "FletchRays" in text
+    assert "UsePolarization" in text
+
+
+def test_bundle_readme_mentions_manual_gui_start_for_notauthorized_sessions():
+    text = _readme_header("")
+    assert "starts a standalone OpticStudio session" in text
+    assert "will not close" in text
+    assert "a session it did not start" in text
+
+
+def test_generated_build_script_dumps_layout_inventory_on_missing_settings():
+    text = build_script_text()
+    assert "HasAnalysisSpecificSettings" in text
+    assert "NSC 3D Layout analysis" in text
+    assert "NSC 3D Layout settings" in text
+    assert "ModifySettings" in text
+    assert "USEPOLARIZATION" in text

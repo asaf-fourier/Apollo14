@@ -27,9 +27,9 @@ from pathlib import Path
 
 import numpy as np
 
-from apollo14.elements.pupil import RectangularPupil
-from apollo14.elements.partial_mirror import PartialMirror
 from apollo14.elements.glass_block import GlassBlock
+from apollo14.elements.partial_mirror import PartialMirror
+from apollo14.elements.pupil import RectangularPupil
 from apollo14.export import export_zemax_bundle
 from apollo14.export.coating import (
     flat_table_coating,
@@ -86,6 +86,7 @@ SOURCE_ANALYSIS_RAYS = 20_000
 TRACE_WAVELENGTHS_NM = (460.0, 525.0, 630.0)
 
 OUTPUT_ROOT = Path("examples/reports/export_perseus_zemax")
+DETECTOR_SCAN_PIXELS = 200
 
 
 # ── Load the optimizer output ───────────────────────────────────────────────
@@ -95,6 +96,29 @@ def latest_run(root: Path, file_name: str) -> Path:
     if not candidates:
         raise FileNotFoundError(f"No {file_name} under {root}.")
     return candidates[-1].parent
+
+
+def latest_matching_coating_run(
+        coating_root: Path, report_dir: Path) -> Path | None:
+    """Return the newest coating run built from ``report_dir`` if present."""
+    matches: list[Path] = []
+    for design_path in coating_root.glob("*/coating_design.json"):
+        try:
+            design = json.loads(design_path.read_text())
+        except json.JSONDecodeError:
+            continue
+        source_report = str(design.get("source_report", "")).rstrip("/")
+        if source_report == str(report_dir):
+            matches.append(design_path.parent)
+    if not matches:
+        return None
+    return max(matches, key=lambda path: (path / "coating_design.json").stat().st_mtime)
+
+
+def coating_source_report(coating_dir: Path) -> str:
+    """Read the optimizer report path baked into a coating design."""
+    design = json.loads((coating_dir / "coating_design.json").read_text())
+    return str(design.get("source_report", "")).rstrip("/")
 
 
 def load_optimizer_report(report_dir: Path):
@@ -134,22 +158,21 @@ def load_detector_axes(report_dir: Path) -> tuple[np.ndarray, np.ndarray]:
 
 
 def detector_pixels_for_axis(axis: np.ndarray) -> int:
-    """Return the pixel count implied by one saved detector axis."""
+    """Return the exported detector pixel count for one axis."""
     if axis.size < 2:
         raise ValueError("Detector axis must have at least two samples.")
-    return int(axis.size)
+    return DETECTOR_SCAN_PIXELS
 
 
 def detector_pixels_for_size(width_mm: float, height_mm: float,
                              pitch_x_mm: float, pitch_y_mm: float
                              ) -> tuple[int, int]:
     """Return detector pixels for a rectangle at the saved axis pitch."""
-    return (int(round(width_mm / pitch_x_mm)),
-            int(round(height_mm / pitch_y_mm)))
+    return (DETECTOR_SCAN_PIXELS, DETECTOR_SCAN_PIXELS)
 
 
 def build_eyebox_detector(system: OpticalSystem, eyebox: dict) -> RectangularPupil:
-    """Build the exported 8×8 eyebox detector on the physical pupil plane."""
+    """Build the exported eyebox detector on the physical pupil plane."""
     pupil = next(e for e in system.elements if isinstance(e, RectangularPupil))
     return RectangularPupil(
         name="eyebox",
@@ -242,14 +265,28 @@ def load_coating_design(coating_dir: Path | None, report_dir: Path):
     if coating_dir is None:
         return {}
     design = json.loads((coating_dir / "coating_design.json").read_text())
-
     source_report = str(design.get("source_report", "")).rstrip("/")
     if source_report != str(report_dir):
+        candidates = sorted(COATING_RUNS_ROOT.glob("*/coating_design.json"))
+        matching = [
+            str(path.parent)
+            for path in candidates
+            if str(json.loads(path.read_text()).get("source_report", "")).rstrip("/")
+            == str(report_dir)
+        ]
+        suggestion = (
+            f"Matching coating run(s) for {str(report_dir)!r}: "
+            f"{', '.join(matching)}."
+            if matching else
+            f"No coating_design.json under {COATING_RUNS_ROOT} was built from "
+            f"{str(report_dir)!r}."
+        )
         raise ValueError(
             f"Coating design in {coating_dir} was built from "
             f"{source_report!r}, but this export uses {str(report_dir)!r}. "
-            "Re-run examples/design_perseus_mirror_coating.py against the "
-            "current optimizer output, or set COATING_DIR explicitly.")
+            f"{suggestion} Re-run examples/design_perseus_mirror_coating.py "
+            "against the current optimizer output, or set COATING_DIR "
+            "explicitly.")
 
     return {record["index"]: record["result"] for record in design["mirrors"]}
 
@@ -383,11 +420,26 @@ def build_sources(projector: Projector) -> list[SourceSpec]:
 def main():
     report_dir = REPORT_DIR or latest_run(OPTIMIZE_RUNS_ROOT,
                                           "optimization_report.json")
+    report_dir_was_auto_selected = REPORT_DIR is None
     try:
-        coating_dir = COATING_DIR or latest_run(COATING_RUNS_ROOT,
-                                                "coating_design.json")
+        if COATING_DIR is not None:
+            coating_dir = COATING_DIR
+        else:
+            coating_dir = latest_matching_coating_run(COATING_RUNS_ROOT, report_dir)
+            if coating_dir is None:
+                coating_dir = latest_run(COATING_RUNS_ROOT, "coating_design.json")
     except FileNotFoundError:
         coating_dir = None
+
+    if coating_dir is not None and report_dir_was_auto_selected:
+        source_report = coating_source_report(coating_dir)
+        if source_report != str(report_dir):
+            matching = latest_matching_coating_run(COATING_RUNS_ROOT, report_dir)
+            if matching is None:
+                print(
+                    "warning: no coating design matches the newest optimizer run; "
+                    f"falling back to coating source report {source_report}.")
+                report_dir = Path(source_report)
 
     mirrors, spacings, eyebox = load_optimizer_report(report_dir)
     pupil_x_mm, pupil_y_mm = load_detector_axes(report_dir)
