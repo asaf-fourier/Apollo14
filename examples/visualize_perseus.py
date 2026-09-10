@@ -119,9 +119,7 @@ COMBINER_PANTOSCOPIC_TILT = 7.0 * deg          # CCW about world-x (normal tilt)
 COMBINER_NUM_MIRRORS = PERSEUS_NUM_MIRRORS      # the single count knob (in the library)
 COMBINER_PRISM_ANGLE = 10.578 * deg            # top-side wedge (chassis z-skew)
 MIRROR_TO_COMBINER_NORMAL_ANGLE = (90 - 50.289) * deg  # mirror normal vs combiner normal
-# Per-mirror gap derived so the stack fills a fixed y-extent regardless of count
-# (PERSEUS_MIRROR_STACK_SPAN, shared with the library) — change PERSEUS_NUM_MIRRORS
-# and the mirrors repack the same region (more mirrors ⇒ smaller gaps).
+# Per-mirror gap derived from the shared manufactured-wafer stack span.
 MIRROR_Y_SPACING = PERSEUS_MIRROR_STACK_SPAN / (COMBINER_NUM_MIRRORS - 1)
 COMBINER_DEPTH = 3.0 * mm                      # full chassis thickness (z)
 MIRROR_Z_EXTENT = 1.2 * mm                     # mirror core, centered in the depth

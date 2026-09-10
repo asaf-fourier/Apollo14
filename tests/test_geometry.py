@@ -244,6 +244,17 @@ def test_perseus_adds_five_mm_of_glass_only_on_projector_side():
     assert jnp.allclose(aperture_shift, entry_shift, atol=1e-6)
 
 
+def test_perseus_mirror_spacing_follows_the_wafer_pitch():
+    from apollo14.perseus import (
+        PERSEUS_MIRROR_Y_SPACING,
+        PERSEUS_WAFER_ANGLE,
+        PERSEUS_WAFER_THICKNESS,
+    )
+
+    expected = PERSEUS_WAFER_THICKNESS / jnp.sin(PERSEUS_WAFER_ANGLE)
+    assert jnp.isclose(PERSEUS_MIRROR_Y_SPACING, expected, atol=1e-6)
+
+
 def test_chassis_coating_range_is_validated_outside_jit_but_is_jit_safe():
     with pytest.raises(ValueError, match=r"within \[0, 1\]"):
         validate_reflectance_table(SpectralTable.constant(

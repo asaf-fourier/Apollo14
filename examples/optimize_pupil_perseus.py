@@ -8,9 +8,8 @@ rather than the flat/Talos cascade:
 - **Tilted mirror stack** inside a 3.0 mm chassis, with the Perseus rigid-body
   tilts baked into the builder (pantoscopic tilt about the combiner center,
   projector leaning ``PERSEUS_PROJECTOR_TILT`` ≈ 13.4° into it). The library
-  geometry matches ``examples/visualize_perseus.py`` exactly. ``NUM_MIRRORS`` is
-  a single layout knob — the per-mirror gap is re-derived so the stack always
-  fills the same y-extent (``PERSEUS_MIRROR_STACK_SPAN``).
+  geometry matches ``examples/visualize_perseus.py`` exactly. Mirror spacing
+  follows the 0.75 mm wafer pitch projected at the 39.7° cut angle.
 - **Reflectance model** — ``CURVE_MODE`` selects ``"rgb"`` (per-mirror 5-band
   :class:`~apollo14.spectral.SumOfGaussiansCurve`, two phases, white-balanced)
   or ``"flat"`` (one wavelength-uniform
@@ -82,12 +81,10 @@ enable_jax_compilation_cache()
 # num_mirrors, chassis depth and mirror spacing come from the Perseus library
 # constants, so this driver optimizes exactly the system build_perseus_system
 # builds — which now matches examples/visualize_perseus.py element-for-element.
-# NUM_MIRRORS is the single layout knob — change it and the per-mirror gap is
-# re-derived so the stack still fills PERSEUS_MIRROR_STACK_SPAN (more mirrors ⇒
-# smaller gaps). Spacings are frozen (not optimized).
+# Spacing follows the manufactured wafer pitch and is frozen (not optimized).
 NUM_MIRRORS = PERSEUS_NUM_MIRRORS          # ← tune the mirror count here
 CHASSIS_Z = PERSEUS_CHASSIS_Z              # 3.0 mm full combiner depth
-FROZEN_SPACINGS = spacings_for_count(NUM_MIRRORS)   # (M-1,) span-constant gaps
+FROZEN_SPACINGS = spacings_for_count(NUM_MIRRORS)   # (M-1,) wafer-pitch gaps
 SEED_SPACING = PERSEUS_MIRROR_STACK_SPAN / (NUM_MIRRORS - 1)   # per-mirror gap
 
 # Spacings are NOT a design variable here — only the reflectance curves are.
