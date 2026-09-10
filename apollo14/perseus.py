@@ -57,7 +57,7 @@ STRAIGHT_DOWN = jnp.array([0.0, -1.0, 0.0])  # untilted projector direction
 
 # ── Projector ───────────────────────────────────────────────────────────────
 
-PERSEUS_LIGHT_POSITION = jnp.array([7.0 * mm, 31.0 * mm, 0.6 * mm])
+PERSEUS_BASE_LIGHT_POSITION = jnp.array([7.0 * mm, 31.0 * mm, 0.6 * mm])
 PERSEUS_PROJECTOR_TILT = 13.422 * deg        # CCW about world-x from straight down
 PERSEUS_BEAM_WIDTH = 10.0 * mm
 PERSEUS_BEAM_HEIGHT = 2.0 * mm
@@ -85,6 +85,18 @@ PERSEUS_MIRROR_Z_EXTENT = 1.2 * mm           # mirror core, centered in the dept
 PERSEUS_COMBINER_CENTER = jnp.array([7.0 * mm, 24.0 * mm, 1.6 * mm])
 PERSEUS_COMBINER_WIDTH = 14.0 * mm           # chassis x
 PERSEUS_COMBINER_HEIGHT = 12.0 * mm          # chassis y (holds the stack)
+# Extra index-matched glass ahead of the mirror region, toward the projector.
+# The mirror stack and the downstream chassis face stay fixed; only the entry
+# side of the chassis is extended.
+PERSEUS_PROJECTOR_GLASS_LENGTH = 5.0 * mm
+# The projector and its attached aperture move with the extended entry side,
+# retaining exactly the same air clearance they had before the chassis resize.
+PERSEUS_PROJECTOR_SIDE_EXTENSION = rotate_vectors(
+    jnp.array([0.0, PERSEUS_PROJECTOR_GLASS_LENGTH, 0.0]),
+    X_AXIS, -PERSEUS_PANTOSCOPIC_TILT,
+)
+PERSEUS_LIGHT_POSITION = (
+    PERSEUS_BASE_LIGHT_POSITION + PERSEUS_PROJECTOR_SIDE_EXTENSION)
 PERSEUS_AR_REFLECTANCE = validate_reflectance_table(
     SpectralTable.constant(
         0.005, jnp.array([380.0, 780.0]) * nm))  # 0.5% residual per face
@@ -157,6 +169,7 @@ def build_perseus_geometry(
     combiner_center: jnp.ndarray = PERSEUS_COMBINER_CENTER,
     combiner_width: float = PERSEUS_COMBINER_WIDTH,
     combiner_height: float = PERSEUS_COMBINER_HEIGHT,
+    projector_glass_length: float = PERSEUS_PROJECTOR_GLASS_LENGTH,
     chassis_z: float = PERSEUS_CHASSIS_Z,
     prism_angle: float = PERSEUS_PRISM_ANGLE,
     eye_relief: float = PERSEUS_EYE_RELIEF,
@@ -216,14 +229,19 @@ def build_perseus_geometry(
     mirror_width = float(combiner_width)
     mirror_height = float(mirror_z_extent / math.sin(angle))
 
-    # Chassis with the top-side prism baked in as a z-skew wedge, placed at the
-    # combiner center in the untilted frame.
+    # Chassis with the top-side prism baked in as a z-skew wedge.  Its original
+    # mirror-holding region remains centered on ``combiner_center``; the extra
+    # length is added only on the +y (projector/entry) side so none of the
+    # mirrors or downstream eye geometry move.
     z_skew = float(chassis_z * math.tan(float(prism_angle)))
+    chassis_height = float(combiner_height + projector_glass_length)
+    chassis_center = (combiner_center
+                      + jnp.array([0.0, projector_glass_length / 2.0, 0.0]))
     chassis = GlassBlock.create_chassis(
-        name="chassis", x=float(combiner_width), y=float(combiner_height),
+        name="chassis", x=float(combiner_width), y=chassis_height,
         z=float(chassis_z), material=agc_m074, z_skew=z_skew,
         coating_reflectance=ar_reflectance,
-    ).translate(combiner_center)
+    ).translate(chassis_center)
 
     # Mirror centers: consecutive y-gaps from ``spacings``, the stack centered
     # on the combiner center; all share the combiner x/z center (step only in y).

@@ -54,17 +54,20 @@ from apollo14.elements.aperture import RectangularAperture
 from apollo14.elements.glass_block import GlassBlock
 from apollo14.elements.partial_mirror import PartialMirror
 from apollo14.elements.pupil import RectangularPupil
-from apollo14.geometry import (
-    compute_local_axes, normalize, rotate_points, rotate_vectors)
+from apollo14.geometry import compute_local_axes, normalize, rotate_points, rotate_vectors
 from apollo14.materials import agc_m074, air
-from apollo14.perseus import PERSEUS_MIRROR_STACK_SPAN, PERSEUS_NUM_MIRRORS
+from apollo14.perseus import (
+    PERSEUS_LIGHT_POSITION,
+    PERSEUS_MIRROR_STACK_SPAN,
+    PERSEUS_NUM_MIRRORS,
+    PERSEUS_PROJECTOR_GLASS_LENGTH,
+)
 from apollo14.projector import FovGrid, PlayNitrideLed
 from apollo14.route import combiner_main_path
 from apollo14.system import OpticalSystem
 from apollo14.trace import prepare_route, trace_rays
 from apollo14.units import deg, mm, nm
 from apollo14.visualizer import eyebox_overlay_traces, plot_system
-
 from helios.merit import build_combiner_branch_routes
 
 # One JIT compile per distinct route structure (main + one per mirror branch),
@@ -73,7 +76,7 @@ _trace_rays_jit = jax.jit(trace_rays)
 
 # ── PARAMS ───────────────────────────────────────────────────────────────────
 # Projector placement & orientation
-PROJECTOR_POSITION = jnp.array([7.0 * mm, 31.0 * mm, 0.6 * mm])
+PROJECTOR_POSITION = PERSEUS_LIGHT_POSITION
 PROJECTOR_TILT = 13.422 * deg    # CCW tilt about world-x from straight down
 
 # Emitted beam
@@ -130,6 +133,7 @@ COMBINER_MATERIAL = agc_m074                   # glass; env outside is air
 COMBINER_CENTER = jnp.array([7.0 * mm, 24.0 * mm, 1.6 * mm])
 COMBINER_WIDTH = 14.0 * mm                     # chassis x
 COMBINER_HEIGHT = 12.0 * mm                    # chassis y (holds the stack)
+PROJECTOR_GLASS_LENGTH = PERSEUS_PROJECTOR_GLASS_LENGTH
 
 # Target pupil (eyebox detector) — the plane where the eye samples the image.
 # z is the EYE_RELIEF measured from the combiner's (untilted) eye-side edge:
@@ -255,12 +259,16 @@ def build_combiner() -> tuple[GlassBlock, list[PartialMirror]]:
     mirror_width = float(COMBINER_WIDTH)
     mirror_height = float(MIRROR_Z_EXTENT / math.sin(angle))
 
-    # Chassis with the top-side prism baked in as a z-skew wedge.
+    # Keep the mirror-holding region centered at COMBINER_CENTER and extend
+    # only the projector-facing (+y) side with the shared Perseus input glass.
     z_skew = float(COMBINER_DEPTH * math.tan(float(COMBINER_PRISM_ANGLE)))
+    chassis_center = (COMBINER_CENTER
+                      + jnp.array([0.0, PROJECTOR_GLASS_LENGTH / 2.0, 0.0]))
     chassis = GlassBlock.create_chassis(
-        name="combiner", x=float(COMBINER_WIDTH), y=float(COMBINER_HEIGHT),
+        name="combiner", x=float(COMBINER_WIDTH),
+        y=float(COMBINER_HEIGHT + PROJECTOR_GLASS_LENGTH),
         z=float(COMBINER_DEPTH), material=COMBINER_MATERIAL, z_skew=z_skew,
-    ).translate(COMBINER_CENTER)
+    ).translate(chassis_center)
 
     # Mirror centers: equal MIRROR_Y_SPACING gaps in y, stack centered on the
     # chassis; all share the chassis x/z center (they only step down in y).
@@ -397,6 +405,7 @@ def main():
           f"depth {COMBINER_DEPTH / mm:.2f} mm (mirror core {MIRROR_Z_EXTENT / mm:.2f} mm, "
           f"cover {(COMBINER_DEPTH - MIRROR_Z_EXTENT) / 2 / mm:.2f} mm/side)  "
           f"material {COMBINER_MATERIAL.name}")
+    print(f"input glass: {PROJECTOR_GLASS_LENGTH / mm:.1f} mm added toward projector")
     print(f"mirror normal: {np.round(np.asarray(mirrors[0].normal), 4)}  "
           f"size {float(mirrors[0].width) / mm:.1f} x {float(mirrors[0].height) / mm:.2f} mm")
 

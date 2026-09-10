@@ -215,6 +215,35 @@ def test_perseus_ar_coating_is_on_all_chassis_faces_and_survives_transforms():
                                original.coating_reflectance.values)
 
 
+def test_perseus_adds_five_mm_of_glass_only_on_projector_side():
+    from apollo14.perseus import (
+        PERSEUS_BASE_LIGHT_POSITION,
+        PERSEUS_NUM_MIRRORS,
+        PERSEUS_PROJECTOR_GLASS_LENGTH,
+        build_perseus_geometry,
+        spacings_for_count,
+    )
+
+    spacings = spacings_for_count(PERSEUS_NUM_MIRRORS)
+    baseline = build_perseus_geometry(
+        spacings=spacings, projector_glass_length=0.0,
+        light_position=PERSEUS_BASE_LIGHT_POSITION)
+    extended = build_perseus_geometry(spacings=spacings)
+
+    assert jnp.allclose(extended.mirror_positions, baseline.mirror_positions)
+    entry_shift = (extended.chassis.get_face("back").position
+                   - baseline.chassis.get_face("back").position)
+    assert jnp.isclose(jnp.linalg.norm(entry_shift),
+                       PERSEUS_PROJECTOR_GLASS_LENGTH, atol=1e-6)
+    assert jnp.allclose(extended.chassis.get_face("front").position,
+                        baseline.chassis.get_face("front").position, atol=1e-6)
+    projector_shift = extended.light_position - PERSEUS_BASE_LIGHT_POSITION
+    assert jnp.allclose(projector_shift, entry_shift, atol=1e-6)
+    aperture_shift = (extended.aperture.position
+                      - baseline.aperture.position)
+    assert jnp.allclose(aperture_shift, entry_shift, atol=1e-6)
+
+
 def test_chassis_coating_range_is_validated_outside_jit_but_is_jit_safe():
     with pytest.raises(ValueError, match=r"within \[0, 1\]"):
         validate_reflectance_table(SpectralTable.constant(
