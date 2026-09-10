@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import NamedTuple
 
 import jax.numpy as jnp
+import numpy as np
 
 from apollo14.geometry import (
     compute_local_axes,
@@ -15,6 +16,24 @@ from apollo14.geometry import (
 )
 from apollo14.materials import Material, air
 from apollo14.ray import Ray
+from apollo14.spectral import SpectralTable
+
+
+def validate_reflectance_table(table: SpectralTable) -> SpectralTable:
+    """Validate a reflectance table at an eager configuration boundary.
+
+    This function intentionally uses NumPy/Python and must not be called from
+    a JAX-transformed trace. Keeping physical-domain validation here lets the
+    general :class:`SpectralTable` remain valid for unbounded quantities.
+    """
+    if not isinstance(table, SpectralTable):
+        raise TypeError("reflectance must be a SpectralTable")
+    values = np.asarray(table.values)
+    if not np.all(np.isfinite(values)):
+        raise ValueError("reflectance values must be finite")
+    if np.any((values < 0.0) | (values > 1.0)):
+        raise ValueError("reflectance values must be within [0, 1]")
+    return table
 
 
 class FaceSeg(NamedTuple):
@@ -30,6 +49,19 @@ class FaceSeg(NamedTuple):
     half_extents: jnp.ndarray
     n1: jnp.ndarray
     n2: jnp.ndarray
+    coating_reflectance: SpectralTable
+
+
+class PreparedFaceSeg(NamedTuple):
+    """Wavelength-resolved refracting face consumed by the trace kernel."""
+    position: jnp.ndarray
+    normal: jnp.ndarray
+    local_x: jnp.ndarray
+    local_y: jnp.ndarray
+    half_extents: jnp.ndarray
+    n1: jnp.ndarray
+    n2: jnp.ndarray
+    coating_reflectance: jnp.ndarray
 
 
 @dataclass
@@ -45,6 +77,7 @@ class GlassFace:
     position: jnp.ndarray
     normal: jnp.ndarray
     vertices: jnp.ndarray
+    coating_reflectance: SpectralTable | None = None
 
     def __post_init__(self):
         self.normal = normalize(self.normal)
@@ -55,6 +88,11 @@ class GlassFace:
         self._verts_x = jnp.array([jnp.dot(d, local_x) for d in deltas])
         self._verts_y = jnp.array([jnp.dot(d, local_y) for d in deltas])
         self._block_material: Material = None  # wired by GlassBlock
+        if self.coating_reflectance is None:
+            self.coating_reflectance = SpectralTable.constant(
+                0.0, jnp.array([0.0, 1.0]))
+        if not isinstance(self.coating_reflectance, SpectralTable):
+            raise TypeError("coating_reflectance must be a SpectralTable")
 
     @property
     def half_extents(self) -> jnp.ndarray:
@@ -82,11 +120,12 @@ class GlassFace:
             half_extents=self.half_extents,
             n1=incoming.data,
             n2=outgoing.data,
+            coating_reflectance=self.coating_reflectance,
         )
         return seg, outgoing
 
 
-def face_interact(seg: FaceSeg, ray: Ray, wavelength):
+def face_interact(seg: PreparedFaceSeg, ray: Ray, wavelength):
     """Refract through a glass face using Snell's law.
 
     ``seg.n1`` and ``seg.n2`` must be scalar arrays — callers use
@@ -101,7 +140,8 @@ def face_interact(seg: FaceSeg, ray: Ray, wavelength):
     refracted, is_tir = snell_refract(ray.dir, facing, seg.n1, seg.n2)
 
     valid = in_bounds & ~is_tir & alive_in
-    out_intensity = jnp.where(valid, ray.intensity, 0.0)
+    out_intensity = jnp.where(
+        valid, ray.intensity * (1.0 - seg.coating_reflectance), 0.0)
     out_pos = jnp.where(valid, hit, ray.pos)
     out_dir = jnp.where(valid, refracted, ray.dir)
     return Ray(pos=out_pos, dir=out_dir, intensity=out_intensity), hit, valid
@@ -127,8 +167,14 @@ class GlassBlock:
                        f"Available: {[f.name for f in self.faces]}")
 
     @classmethod
-    def create_chassis(cls, name, x, y, z, material, z_skew=0.0):
-        """Create an axis-aligned glass block (optionally skewed in z)."""
+    def create_chassis(cls, name, x, y, z, material, z_skew=0.0,
+                       coating_reflectance=None):
+        """Create an axis-aligned glass block (optionally skewed in z).
+
+        ``coating_reflectance`` is a :class:`SpectralTable` containing the
+        residual power reflectance applied to every face. ``None`` means an
+        ideal, lossless interface as in the original tracer.
+        """
         hx, hy, hz = x / 2.0, y / 2.0, z / 2.0
 
         b_lf = jnp.array([-hx, -hy, -hz])
@@ -143,17 +189,19 @@ class GlassBlock:
 
         def _face(name, normal, verts):
             vertices = jnp.stack(verts)
-            return GlassFace(name=name, position=jnp.mean(vertices, axis=0),
-                             normal=jnp.array(normal, dtype=float),
-                             vertices=vertices)
+            return GlassFace(
+                name=name, position=jnp.mean(vertices, axis=0),
+                normal=jnp.array(normal, dtype=float), vertices=vertices,
+                coating_reflectance=coating_reflectance)
 
         def _face_from_edges(name, verts):
             vertices = jnp.stack(verts)
             e1 = normalize(verts[1] - verts[0])
             e2 = normalize(verts[3] - verts[0])
             n = normalize(jnp.cross(e1, e2))
-            return GlassFace(name=name, position=jnp.mean(vertices, axis=0),
-                             normal=n, vertices=vertices)
+            return GlassFace(
+                name=name, position=jnp.mean(vertices, axis=0), normal=n,
+                vertices=vertices, coating_reflectance=coating_reflectance)
 
         faces = [
             _face("bottom", [0, 0, -1], [b_lf, b_rf, b_rb, b_lb]),
@@ -180,6 +228,7 @@ class GlassBlock:
                 position=f.position + offset,
                 normal=f.normal,
                 vertices=f.vertices + offset,
+                coating_reflectance=f.coating_reflectance,
             )
             for f in self.faces
         ]
@@ -204,6 +253,7 @@ class GlassBlock:
                 position=rotate_points(f.position, axis, angle, pivot),
                 normal=rotate_vectors(f.normal, axis, angle),
                 vertices=rotate_points(f.vertices, axis, angle, pivot),
+                coating_reflectance=f.coating_reflectance,
             )
             for f in self.faces
         ]

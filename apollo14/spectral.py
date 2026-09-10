@@ -1,4 +1,4 @@
-"""Parametric spectral curves for partial-mirror reflectance.
+"""Sampled and parametric wavelength-dependent scalar functions.
 
 A spectral curve carries its own design variables (Gaussian amplitudes,
 B-spline coefficients, raw samples — whatever parametrization fits) and
@@ -15,6 +15,41 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+
+
+class SpectralTable(NamedTuple):
+    """A scalar quantity tabulated on a wavelength grid.
+
+    The values deliberately carry no physical semantics or bounds: the same
+    type can represent reflectance, refractive index, detector efficiency,
+    source power, or any other wavelength-dependent scalar. Domain owners are
+    responsible for constraints such as reflectance lying in ``[0, 1]``.
+    """
+    wavelengths: jnp.ndarray
+    values: jnp.ndarray
+
+    @classmethod
+    def from_samples(cls, wavelengths, values) -> SpectralTable:
+        wavelengths = jnp.atleast_1d(jnp.asarray(wavelengths, dtype=float))
+        values = jnp.asarray(values, dtype=float)
+        if values.ndim == 0:
+            values = jnp.full_like(wavelengths, values)
+        if wavelengths.ndim != 1 or values.ndim != 1:
+            raise ValueError("SpectralTable wavelengths and values must be 1-D")
+        if wavelengths.shape != values.shape:
+            raise ValueError("SpectralTable wavelengths and values must match")
+        if wavelengths.shape[0] < 2:
+            raise ValueError("SpectralTable requires at least two samples")
+        return cls(wavelengths=wavelengths, values=values)
+
+    @classmethod
+    def constant(cls, value, wavelengths) -> SpectralTable:
+        """Create a wavelength-flat table over ``wavelengths``."""
+        return cls.from_samples(wavelengths, value)
+
+    def sample(self, wavelength):
+        """Linearly interpolate the value at one or more wavelengths."""
+        return jnp.interp(wavelength, self.wavelengths, self.values)
 
 
 class SumOfGaussiansCurve(NamedTuple):
@@ -56,7 +91,7 @@ class SumOfGaussiansCurve(NamedTuple):
         amplitude: float = 0.05,
         sigma: float = 20.0,
         num_mirrors: int | None = None,
-    ) -> "SumOfGaussiansCurve":
+    ) -> SumOfGaussiansCurve:
         """Construct a curve with uniform amplitude/sigma over all bases.
 
         If ``num_mirrors`` is given, the result is batched to shape
@@ -81,7 +116,7 @@ class SumOfGaussiansCurve(NamedTuple):
                                       (num_mirrors, num_basis)).copy(),
         )
 
-    def at(self, idx) -> "SumOfGaussiansCurve":
+    def at(self, idx) -> SumOfGaussiansCurve:
         """Index a single curve out of an ``(M, B)`` batched curve.
 
         Equivalent to ``jax.tree.map(lambda x: x[idx], curve)`` but
@@ -131,7 +166,7 @@ class ConstantCurve(NamedTuple):
         cls,
         amplitude: float = 0.05,
         num_mirrors: int | None = None,
-    ) -> "ConstantCurve":
+    ) -> ConstantCurve:
         """Construct a flat curve with the same reflectance everywhere.
 
         If ``num_mirrors`` is given, the result is batched to shape
@@ -143,6 +178,6 @@ class ConstantCurve(NamedTuple):
         return cls(amplitude=jnp.full((num_mirrors,), amplitude,
                                        dtype=jnp.float32))
 
-    def at(self, idx) -> "ConstantCurve":
+    def at(self, idx) -> ConstantCurve:
         """Index a single flat curve out of an ``(M,)`` batched curve."""
         return ConstantCurve(amplitude=self.amplitude[idx])

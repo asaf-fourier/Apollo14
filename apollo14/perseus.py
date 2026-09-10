@@ -33,7 +33,7 @@ import jax.numpy as jnp
 
 from apollo14.combiner import compensated_reflectances
 from apollo14.elements.aperture import RectangularAperture
-from apollo14.elements.glass_block import GlassBlock
+from apollo14.elements.glass_block import GlassBlock, validate_reflectance_table
 from apollo14.elements.partial_mirror import (
     DEFAULT_MIRROR_WAVELENGTHS,
     PartialMirror,
@@ -46,8 +46,9 @@ from apollo14.geometry import (
     rotate_vectors,
 )
 from apollo14.materials import agc_m074, air
+from apollo14.spectral import SpectralTable
 from apollo14.system import OpticalSystem
-from apollo14.units import deg, mm
+from apollo14.units import deg, mm, nm
 
 # ── Rotation axis / nominal beam ────────────────────────────────────────────
 
@@ -56,7 +57,7 @@ STRAIGHT_DOWN = jnp.array([0.0, -1.0, 0.0])  # untilted projector direction
 
 # ── Projector ───────────────────────────────────────────────────────────────
 
-PERSEUS_LIGHT_POSITION = jnp.array([7.0 * mm, 31.0 * mm, 0.6 * mm])
+PERSEUS_BASE_LIGHT_POSITION = jnp.array([7.0 * mm, 31.0 * mm, 0.6 * mm])
 PERSEUS_PROJECTOR_TILT = 13.422 * deg        # CCW about world-x from straight down
 PERSEUS_BEAM_WIDTH = 10.0 * mm
 PERSEUS_BEAM_HEIGHT = 2.0 * mm
@@ -73,17 +74,34 @@ PERSEUS_PRISM_ANGLE = 10.578 * deg           # top-side wedge (chassis z-skew)
 # Mirror plane normal sits this far off the (untilted) combiner normal +z; the
 # equivalent mirror tilt from horizontal is 90° − this = 50.289°.
 PERSEUS_MIRROR_NORMAL_ANGLE = (90.0 - 50.289) * deg
-# The mirror stack fills a fixed y-extent; the per-mirror gap is derived from it
-# and the mirror count, so changing the count repacks the same region (more
-# mirrors ⇒ smaller gaps). See spacings_for_count().
-PERSEUS_MIRROR_STACK_SPAN = 9.8 * mm         # y-extent the mirror-center stack fills
-PERSEUS_MIRROR_Y_SPACING = (                 # per-mirror gap at the default count
-    PERSEUS_MIRROR_STACK_SPAN / (PERSEUS_NUM_MIRRORS - 1))
+# The combiner is manufactured from 0.75 mm wafers cut at the mirror angle.
+# Projecting the wafer-normal pitch onto world y gives the mirror-center gap.
+PERSEUS_WAFER_THICKNESS = 0.75 * mm
+PERSEUS_WAFER_ANGLE = 39.7 * deg
+PERSEUS_MIRROR_Y_SPACING = (
+    PERSEUS_WAFER_THICKNESS / math.sin(float(PERSEUS_WAFER_ANGLE)))
+PERSEUS_MIRROR_STACK_SPAN = (
+    (PERSEUS_NUM_MIRRORS - 1) * PERSEUS_MIRROR_Y_SPACING)
 PERSEUS_CHASSIS_Z = 3.0 * mm                 # full chassis depth (z) — "COMBINER_DEPTH"
 PERSEUS_MIRROR_Z_EXTENT = 1.2 * mm           # mirror core, centered in the depth
 PERSEUS_COMBINER_CENTER = jnp.array([7.0 * mm, 24.0 * mm, 1.6 * mm])
 PERSEUS_COMBINER_WIDTH = 14.0 * mm           # chassis x
 PERSEUS_COMBINER_HEIGHT = 12.0 * mm          # chassis y (holds the stack)
+# Extra index-matched glass ahead of the mirror region, toward the projector.
+# The mirror stack and the downstream chassis face stay fixed; only the entry
+# side of the chassis is extended.
+PERSEUS_PROJECTOR_GLASS_LENGTH = 5.0 * mm
+# The projector and its attached aperture move with the extended entry side,
+# retaining exactly the same air clearance they had before the chassis resize.
+PERSEUS_PROJECTOR_SIDE_EXTENSION = rotate_vectors(
+    jnp.array([0.0, PERSEUS_PROJECTOR_GLASS_LENGTH, 0.0]),
+    X_AXIS, -PERSEUS_PANTOSCOPIC_TILT,
+)
+PERSEUS_LIGHT_POSITION = (
+    PERSEUS_BASE_LIGHT_POSITION + PERSEUS_PROJECTOR_SIDE_EXTENSION)
+PERSEUS_AR_REFLECTANCE = validate_reflectance_table(
+    SpectralTable.constant(
+        0.005, jnp.array([380.0, 780.0]) * nm))  # 0.5% residual per face
 PERSEUS_BASE_RATIO = 0.05 * 6 / PERSEUS_NUM_MIRRORS   # per-mirror pick-off
 
 # ── Beam-defining aperture (opaque frame with a clear opening) ──────────────
@@ -115,14 +133,16 @@ PERSEUS_FOV_AROUND_PROJECTOR_Y = 12.0 * deg
 
 
 def spacings_for_count(num_mirrors: int,
-                       stack_span: float = PERSEUS_MIRROR_STACK_SPAN
+                       stack_span: float | None = None,
                        ) -> jnp.ndarray:
-    """``(num_mirrors - 1,)`` equal mirror-center y-gaps summing to ``stack_span``.
+    """Return equal mirror-center gaps for the manufactured wafer pitch.
 
-    Changing ``num_mirrors`` keeps the stack's total y-extent fixed at
-    ``stack_span`` and just repacks the mirrors — more mirrors ⇒ smaller gaps —
-    so a single count knob controls the whole layout.
+    By default every gap is ``PERSEUS_MIRROR_Y_SPACING``. Supplying an explicit
+    ``stack_span`` retains the option to repack a chosen number of mirrors into
+    a fixed total extent.
     """
+    if stack_span is None:
+        stack_span = PERSEUS_MIRROR_Y_SPACING * (num_mirrors - 1)
     return jnp.full((num_mirrors - 1,), stack_span / (num_mirrors - 1))
 
 
@@ -153,6 +173,7 @@ def build_perseus_geometry(
     combiner_center: jnp.ndarray = PERSEUS_COMBINER_CENTER,
     combiner_width: float = PERSEUS_COMBINER_WIDTH,
     combiner_height: float = PERSEUS_COMBINER_HEIGHT,
+    projector_glass_length: float = PERSEUS_PROJECTOR_GLASS_LENGTH,
     chassis_z: float = PERSEUS_CHASSIS_Z,
     prism_angle: float = PERSEUS_PRISM_ANGLE,
     eye_relief: float = PERSEUS_EYE_RELIEF,
@@ -168,6 +189,7 @@ def build_perseus_geometry(
     light_position: jnp.ndarray = PERSEUS_LIGHT_POSITION,
     pantoscopic_tilt: float = PERSEUS_PANTOSCOPIC_TILT,
     projector_tilt: float = PERSEUS_PROJECTOR_TILT,
+    ar_reflectance: SpectralTable = PERSEUS_AR_REFLECTANCE,
 ) -> PerseusGeometry:
     """Place every Perseus element, reproducing the visualization exactly.
 
@@ -211,13 +233,19 @@ def build_perseus_geometry(
     mirror_width = float(combiner_width)
     mirror_height = float(mirror_z_extent / math.sin(angle))
 
-    # Chassis with the top-side prism baked in as a z-skew wedge, placed at the
-    # combiner center in the untilted frame.
+    # Chassis with the top-side prism baked in as a z-skew wedge.  Its original
+    # mirror-holding region remains centered on ``combiner_center``; the extra
+    # length is added only on the +y (projector/entry) side so none of the
+    # mirrors or downstream eye geometry move.
     z_skew = float(chassis_z * math.tan(float(prism_angle)))
+    chassis_height = float(combiner_height + projector_glass_length)
+    chassis_center = (combiner_center
+                      + jnp.array([0.0, projector_glass_length / 2.0, 0.0]))
     chassis = GlassBlock.create_chassis(
-        name="chassis", x=float(combiner_width), y=float(combiner_height),
+        name="chassis", x=float(combiner_width), y=chassis_height,
         z=float(chassis_z), material=agc_m074, z_skew=z_skew,
-    ).translate(combiner_center)
+        coating_reflectance=ar_reflectance,
+    ).translate(chassis_center)
 
     # Mirror centers: consecutive y-gaps from ``spacings``, the stack centered
     # on the combiner center; all share the combiner x/z center (step only in y).
@@ -264,7 +292,7 @@ def build_perseus_geometry(
 def build_perseus_system(
     *,
     num_mirrors: int = PERSEUS_NUM_MIRRORS,
-    stack_span: float = PERSEUS_MIRROR_STACK_SPAN,
+    stack_span: float | None = None,
     base_ratio: float = PERSEUS_BASE_RATIO,
     pantoscopic_tilt: float = PERSEUS_PANTOSCOPIC_TILT,
     projector_tilt: float = PERSEUS_PROJECTOR_TILT,
@@ -273,9 +301,9 @@ def build_perseus_system(
 ) -> OpticalSystem:
     """Build the Perseus reference system with baked flat reflectances.
 
-    ``num_mirrors`` is the single layout knob: the mirror-center gaps are
-    derived so the stack always fills ``stack_span`` (see
-    :func:`spacings_for_count`). Each mirror gets a wavelength-flat,
+    Mirror-center gaps follow the manufactured wafer pitch unless an explicit
+    ``stack_span`` is supplied (see :func:`spacings_for_count`). Each mirror
+    gets a wavelength-flat,
     Talos-compensated reflectance (``base_ratio / (1 - i·base_ratio)``). Extra
     ``geometry_kwargs`` pass straight through to :func:`build_perseus_geometry`.
     """

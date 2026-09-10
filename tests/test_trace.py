@@ -11,14 +11,14 @@ from apollo14.combiner import (
     build_default_system,
 )
 from apollo14.elements.aperture import ApertureSeg
-from apollo14.elements.glass_block import FaceSeg
+from apollo14.elements.glass_block import FaceSeg, GlassBlock, PreparedFaceSeg
 from apollo14.elements.partial_mirror import (
     MirrorStackSeg,
     PartialMirror,
     PreparedMirrorStackSeg,
 )
 from apollo14.elements.pupil import PupilSeg
-from apollo14.materials import air
+from apollo14.materials import agc_m074, air
 from apollo14.ray import Ray
 from apollo14.route import (
     TRANSMIT,
@@ -27,6 +27,8 @@ from apollo14.route import (
     build_route,
     combiner_main_path,
 )
+from apollo14.spectral import SpectralTable
+from apollo14.system import OpticalSystem
 from apollo14.trace import prepare_route, trace, trace_rays
 from apollo14.units import nm
 
@@ -99,7 +101,7 @@ class TestPrepareRoute:
         system = build_default_system()
         route = combiner_main_path(system)
         prepared = prepare_route(route, DEFAULT_WAVELENGTH)
-        faces = [s for s in prepared.segments if isinstance(s, FaceSeg)]
+        faces = [s for s in prepared.segments if isinstance(s, PreparedFaceSeg)]
         assert faces[0].n1.shape == ()
         assert faces[0].n2.shape == ()
 
@@ -146,6 +148,26 @@ class TestPrepareRoute:
 
 
 class TestTraceRay:
+
+    def test_ar_coating_attenuates_each_glass_crossing(self):
+        chassis = GlassBlock.create_chassis(
+            name="coated", x=10.0, y=10.0, z=2.0, material=agc_m074,
+            coating_reflectance=SpectralTable.constant(
+                0.005, jnp.array([400.0, 700.0]) * nm))
+        system = OpticalSystem(env_material=air)
+        system.add(chassis)
+        route = build_route(system, [("coated", "bottom"),
+                                     ("coated", "top")])
+        prepared = prepare_route(route, 550.0 * nm)
+        faces = [seg for seg in prepared.segments
+                 if isinstance(seg, PreparedFaceSeg)]
+        assert all(seg.coating_reflectance.shape == () for seg in faces)
+
+        ray = Ray(pos=jnp.array([0.0, 0.0, -2.0]),
+                  dir=jnp.array([0.0, 0.0, 1.0]),
+                  intensity=jnp.asarray(1.0))
+        result = trace(prepared, ray)
+        assert jnp.isclose(result.final_intensity, 0.995 ** 2, atol=1e-6)
 
     def test_unprepared_route_is_rejected(self):
         system = build_default_system()

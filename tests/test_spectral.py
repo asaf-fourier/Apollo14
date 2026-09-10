@@ -2,9 +2,37 @@
 
 import jax
 import jax.numpy as jnp
+import pytest
 
-from apollo14.spectral import ConstantCurve
+from apollo14.spectral import ConstantCurve, SpectralTable
 from apollo14.units import nm
+
+
+class TestSpectralTable:
+
+    def test_scalar_value_builds_a_flat_table_and_interpolates(self):
+        table = SpectralTable.constant(
+            0.005, jnp.array([400.0, 700.0]) * nm)
+        assert table.values.shape == (2,)
+        assert jnp.isclose(table.sample(550.0 * nm), 0.005)
+
+    def test_rejects_mismatched_samples(self):
+        with pytest.raises(ValueError, match="must match"):
+            SpectralTable.from_samples(
+                jnp.array([400.0, 500.0, 600.0]) * nm,
+                jnp.array([1.0, 2.0]))
+
+    def test_is_jit_and_gradient_compatible(self):
+        wavelengths = jnp.array([400.0, 700.0]) * nm
+
+        @jax.jit
+        def sampled_sum(values):
+            table = SpectralTable.from_samples(wavelengths, values)
+            return table.sample(550.0 * nm)
+
+        values = jnp.array([0.0, 1.0])
+        assert jnp.isclose(sampled_sum(values), 0.5)
+        assert jnp.allclose(jax.grad(sampled_sum)(values), 0.5)
 
 
 # ── ConstantCurve (wavelength-flat reflectance) ─────────────────────────────
