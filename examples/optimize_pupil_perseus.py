@@ -131,8 +131,8 @@ PROJECTOR = PlayNitrideLed.create_broadband(
 # Span W's above-threshold band uniformly. Threshold 0.10 gives a clean
 # three-peak envelope without splitting any LED's measured spectrum.
 
-SPECTRAL_THRESHOLD = 0.10
-SPECTRAL_SAMPLES = 100
+SPECTRAL_THRESHOLD = 0.02
+SPECTRAL_SAMPLES = 400
 
 _w_lo, _w_hi = PROJECTOR.spectral_band(threshold=SPECTRAL_THRESHOLD)
 TRACE_WAVELENGTHS = jnp.linspace(_w_lo, _w_hi, SPECTRAL_SAMPLES)
@@ -154,12 +154,8 @@ LUMINANCE_TRACE_WEIGHTS = photopic_luminance_weights(TRACE_WAVELENGTHS)
 # ── Per-cell brightness target ─────────────────────────────────────────────
 
 NUM_EYEBOX_CELLS = EYEBOX_NX * EYEBOX_NY
-# The merit excludes the 4 corner cells (see ``CELL_MASK``); dividing the eyebox
-# budget by the *active* count keeps the achieved eyebox total at EYEBOX_TARGET.
-NUM_EXCLUDED_CORNER_CELLS = 4
-NUM_ACTIVE_EYEBOX_CELLS = NUM_EYEBOX_CELLS - NUM_EXCLUDED_CORNER_CELLS
 EYEBOX_TARGET = 0.07
-PER_CELL_TARGET = EYEBOX_TARGET / NUM_ACTIVE_EYEBOX_CELLS
+PER_CELL_TARGET = EYEBOX_TARGET / NUM_EYEBOX_CELLS
 
 
 # ── Merit & tracer configuration ────────────────────────────────────────────
@@ -236,13 +232,7 @@ EYEBOX_POINTS = planar_grid_points(
     SAMPLE_HALF_X, SAMPLE_HALF_Y, SAMPLE_NX, SAMPLE_NY,
     cell_centered=True,
 )   # (SAMPLE_NX * SAMPLE_NY, 3)
-# Exclude the 4 corner cells — geometric coverage there drops below what the
-# optimizer can equalize, so weighting them pulls the whole design down.
 _cell_mask_2d = jnp.ones((EYEBOX_NY, EYEBOX_NX))
-# _cell_mask_2d = _cell_mask_2d.at[0, 0].set(0.0)
-# _cell_mask_2d = _cell_mask_2d.at[0, -1].set(0.0)
-# _cell_mask_2d = _cell_mask_2d.at[-1, 0].set(0.0)
-# _cell_mask_2d = _cell_mask_2d.at[-1, -1].set(0.0)
 CELL_MASK = _cell_mask_2d.reshape(-1)
 
 
@@ -357,8 +347,8 @@ def _clip(params: CombinerParams) -> CombinerParams:
 
 # ── Adam optimizer ──────────────────────────────────────────────────────────
 
-PHASE1_STEPS = 100
-PHASE2_STEPS = 100
+PHASE1_STEPS = 1000
+PHASE2_STEPS = 1000
 
 adam_cfg_phase1 = AdamConfig(peak_lr=3e-3, warmup_steps=20, num_steps=PHASE1_STEPS)
 # Phase 2 polishes the shape term in a flat region; drop the LR so Adam's
