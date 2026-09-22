@@ -73,7 +73,7 @@ MIRROR_INDICES: list[int] | None = None
 
 # ── Coating design knobs (fed to Atlas) ─────────────────────────────────────
 REFERENCE_WAVELENGTH_NM = 550.0     # glass index / QWOT seed reference
-POLARIZATION = "both"               # combiner light is effectively unpolarized
+POLARIZATION = "s"                  # 100% s input; incident p power is zero
 NUM_WAVELENGTHS = 120               # target sample points across the band
 SPECTRUM_NM = (440, 670)
 NUM_ANGLES = 5                      # AOI samples across the swept range
@@ -90,7 +90,7 @@ N_TOLERANCE = 0.005
 
 # Optimizer budget PER MIRROR. Modest defaults so a full stack runs in minutes;
 # bump for production recipes (BH max_iterations→100+, local_maxiter→500).
-BH_MAX_ITERATIONS = 400
+BH_MAX_ITERATIONS = 10
 BH_LOCAL_MAXITER = 400
 BH_STEPSIZE = 0.2
 BH_TEMPERATURE = 0.01
@@ -287,8 +287,16 @@ def design_mirror(mirror_index, target_wavelengths_nm, target_reflectance,
         local_maxiter=BH_LOCAL_MAXITER, callback=hop_progress)
 
     refined = [result_bh.layers[0]] + result_bh.film_layers + [result_bh.layers[-1]]
-    return OpticalDesigner(layers=refined, target=target).optimize(
+    polished_designer = OpticalDesigner(layers=refined, target=target)
+    result = polished_designer.optimize(
         method="lbfgs", max_iterations=POLISH_MAX_ITERATIONS)
+    result.p_reflectance = polished_designer.evaluate(
+        layers=result.layers,
+        wavelengths=result.wavelengths_nm,
+        angles=result.angles_deg,
+        polarization="p",
+    )
+    return result
 
 
 # ── Serialize one Atlas result ───────────────────────────────────────────────
@@ -323,25 +331,32 @@ def save_mirror_plot_html(result, path: Path, config_text: str) -> None:
     """
     wavelengths_nm = np.asarray(result.wavelengths_nm)
     target = np.asarray(result.target_reflectance)
-    achieved = np.asarray(result.reflectance)
-    if achieved.ndim == 1:
-        achieved = achieved[:, np.newaxis]
+    achieved_s = np.asarray(result.reflectance)
+    achieved_p = np.asarray(result.p_reflectance)
+    if achieved_s.ndim == 1:
+        achieved_s = achieved_s[:, np.newaxis]
+        achieved_p = achieved_p[:, np.newaxis]
     angles_deg = np.asarray(result.angles_deg)
 
     figure = go.Figure()
     # One trace per angle of incidence, coloured across the swept range.
     colors = sample_colorscale(
         "Viridis",
-        np.linspace(0.1, 0.9, achieved.shape[1]).tolist())
+        np.linspace(0.1, 0.9, achieved_s.shape[1]).tolist())
     for angle_idx, (angle, color) in enumerate(zip(angles_deg, colors)):
         figure.add_trace(go.Scatter(
-            x=wavelengths_nm, y=achieved[:, angle_idx],
-            mode="lines", name=f"{float(angle):.1f}°",
+            x=wavelengths_nm, y=achieved_s[:, angle_idx],
+            mode="lines", name=f"S · {float(angle):.1f}°",
             line=dict(color=color, width=1.5),
+            hovertemplate="%{x:.1f} nm<br>R=%{y:.4f}<extra>%{fullData.name}</extra>"))
+        figure.add_trace(go.Scatter(
+            x=wavelengths_nm, y=achieved_p[:, angle_idx],
+            mode="lines", name=f"P · {float(angle):.1f}°",
+            line=dict(color=color, width=1.5, dash="dot"),
             hovertemplate="%{x:.1f} nm<br>R=%{y:.4f}<extra>%{fullData.name}</extra>"))
     # Target last so it draws on top of the achieved family.
     figure.add_trace(go.Scatter(
-        x=wavelengths_nm, y=target, mode="lines", name="Target",
+        x=wavelengths_nm, y=target, mode="lines", name="S target",
         line=dict(color="black", width=2.5, dash="dash"),
         hovertemplate="%{x:.1f} nm<br>target R=%{y:.4f}<extra>Target</extra>"))
 
@@ -352,7 +367,7 @@ def save_mirror_plot_html(result, path: Path, config_text: str) -> None:
         angle_span = f"{float(angles_deg[0]):.1f}°"
 
     figure.update_layout(
-        title=(f"Target vs achieved reflectance — angles {angle_span}, "
+        title=(f"S/P reflectance vs target — angles {angle_span}, "
                f"merit={result.merit:.3e}"),
         xaxis_title="Wavelength (nm)",
         yaxis_title="Reflectance",
@@ -384,7 +399,9 @@ def _result_to_dict(result) -> dict:
         "achieved_reflectance": {
             "wavelengths_nm": np.asarray(result.wavelengths_nm).tolist(),
             "angles_deg": np.asarray(result.angles_deg).tolist(),
-            "values": np.asarray(result.reflectance).tolist(),   # (W, A)
+            "values": np.asarray(result.reflectance).tolist(),   # Rs legacy key
+            "s_values": np.asarray(result.reflectance).tolist(),
+            "p_values": np.asarray(result.p_reflectance).tolist(),
         },
     }
 
