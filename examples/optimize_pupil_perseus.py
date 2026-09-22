@@ -129,14 +129,21 @@ PROJECTOR = PlayNitrideLed.create_broadband(
 )
 
 # ── Wavelength sampling ─────────────────────────────────────────────────────
-# Cover the complete measured panel spectrum so efficiency is relative to the
-# panel's full photometric output, not only its above-threshold emission band.
+# Optimize the specified useful projector band. Efficiency is therefore an
+# in-band (420–680 nm) photometric efficiency; panel power outside this band is
+# intentionally excluded from both the delivered flux and input-flux denominator.
 
 SPECTRAL_THRESHOLD = None
 SPECTRAL_SAMPLES = 400
+TARGET_WAVELENGTH_MIN_NM = 420.0
+TARGET_WAVELENGTH_MAX_NM = 680.0
 
 _spec_wls, _spec_rad = PROJECTOR.spectrum
-_w_lo, _w_hi = float(_spec_wls[0]), float(_spec_wls[-1])
+_w_lo = TARGET_WAVELENGTH_MIN_NM * nm
+_w_hi = TARGET_WAVELENGTH_MAX_NM * nm
+if _w_lo < float(_spec_wls[0]) or _w_hi > float(_spec_wls[-1]):
+    raise ValueError(
+        "Target wavelength interval must lie inside the measured panel spectrum")
 TRACE_WAVELENGTHS = jnp.linspace(_w_lo, _w_hi, SPECTRAL_SAMPLES)
 
 # ── Spectrum-preserving shape target ───────────────────────────────────────
@@ -555,7 +562,7 @@ def main():
           f"{FOV_GRID.num_x}×{FOV_GRID.num_y} samples")
     print(f"Spectrum:  {SPECTRAL_SAMPLES} uniform samples, "
           f"{float(_w_lo)/nm:.0f}–{float(_w_hi)/nm:.0f} nm "
-          "(full measured band)")
+          "(target band; efficiency is normalized to in-band input)")
     if not is_flat:
         print("Shape target: projector W spectrum (preserve panel's D65 white)")
     print(f"I_in:      {INPUT_FLUX:.1f}  "
@@ -725,7 +732,9 @@ def main():
     optimizer_config.update({
         "spectral_threshold": SPECTRAL_THRESHOLD,
         "spectral_samples": SPECTRAL_SAMPLES,
-        "spectral_range": "full measured panel spectrum",
+        "spectral_range_nm": [TARGET_WAVELENGTH_MIN_NM,
+                              TARGET_WAVELENGTH_MAX_NM],
+        "efficiency_normalization": "photometric input within target band",
         "num_mirrors": NUM_MIRRORS,
         "optimize_spacings": OPTIMIZE_SPACINGS,
         "curve_mode": CURVE_MODE,
@@ -737,7 +746,8 @@ def main():
             "angular_steps_x": VALIDATION_ANGULAR_STEPS_X,
             "angular_steps_y": VALIDATION_ANGULAR_STEPS_Y,
             "spectral_samples": VALIDATION_SPECTRAL_SAMPLES,
-            "spectral_range": "full measured panel spectrum",
+            "spectral_range_nm": [TARGET_WAVELENGTH_MIN_NM,
+                                  TARGET_WAVELENGTH_MAX_NM],
             "breakdown": {k: float(v) for k, v in validation_breakdown.items()},
         },
     })
