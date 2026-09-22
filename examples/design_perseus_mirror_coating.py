@@ -47,10 +47,12 @@ from pathlib import Path
 from atlas import Layer, Materials, OpticalDesigner, Target, example_output_dir
 from atlas.core.stack import Stack
 from atlas.core.tmm import _precompute_fixed_nk_data, compute_rt_polarized
+import jax
 import jax.numpy as jnp
 import numpy as np
 import plotly.graph_objects as go
 from plotly.colors import sample_colorscale
+from scipy.stats import norm, qmc
 
 from apollo14.geometry import snell_refract
 from apollo14.materials import agc_m074
@@ -87,12 +89,21 @@ TIO2_N_BOUNDS = (2.0, 2.525)        # PLD_TiO2 tunable index range
 AL2O3_N_BOUNDS = (1.47, 1.65)       # PLD_Al2O3 tunable index range
 SEED_N_HIGH = 2.50                  # QWOT seed indices (max Δn)
 SEED_N_LOW = 1.47
-THICKNESS_TOLERANCE_NM = 2
+# Manufacturing thickness (height) tolerance is a hard ±2 nm specification.
+# Atlas expresses tolerances as Gaussian 1σ values, so map the hard limit to
+# three sigma for any future robust-optimization or tolerance analysis.
+THICKNESS_TOLERANCE_PLUS_MINUS_NM = 2.0
+ATLAS_THICKNESS_TOLERANCE_SIGMA_NM = THICKNESS_TOLERANCE_PLUS_MINUS_NM / 3.0
 N_TOLERANCE = 0.005
+ROBUST_OPTIMIZATION_SAMPLES = 256
+TOLERANCE_VALIDATION_SAMPLES = 4096
+TOLERANCE_VALIDATION_BATCH_SIZE = 256
+TOLERANCE_MAX_RS_ERROR = 0.01
+TOLERANCE_RANDOM_SEED = 42
 
 # Optimizer budget PER MIRROR. Modest defaults so a full stack runs in minutes;
 # bump for production recipes (BH max_iterations→100+, local_maxiter→500).
-BH_MAX_ITERATIONS = 10
+BH_MAX_ITERATIONS = 3
 BH_LOCAL_MAXITER = 400
 BH_STEPSIZE = 0.2
 BH_TEMPERATURE = 0.01
@@ -245,7 +256,7 @@ def _seed_layers(glass, seed_thickness_high, seed_thickness_low) -> list:
             refractive_index=SEED_N_HIGH if is_high else SEED_N_LOW,
             vary_thickness=True, vary_n=True,
             thickness_bounds=THICKNESS_BOUNDS_NM,
-            thickness_tolerance=THICKNESS_TOLERANCE_NM,
+            thickness_tolerance=ATLAS_THICKNESS_TOLERANCE_SIGMA_NM,
             n_tolerance=N_TOLERANCE,
             n_bounds=TIO2_N_BOUNDS if is_high else AL2O3_N_BOUNDS,
         ))
@@ -267,7 +278,7 @@ def _seed_moveon_layers(moveon, seed_thickness_high, seed_thickness_low) -> list
             thickness=seed_thickness_high if is_tio2 else seed_thickness_low,
             vary_thickness=True,
             thickness_bounds=THICKNESS_BOUNDS_NM,
-            thickness_tolerance=THICKNESS_TOLERANCE_NM,
+            thickness_tolerance=ATLAS_THICKNESS_TOLERANCE_SIGMA_NM,
         ))
     layers.append(Layer(material=moveon.MR10))
 
@@ -308,14 +319,16 @@ def design_mirror(mirror_index, target_wavelengths_nm, target_reflectance,
               f" merit={merit:.4e} best={hop_state['best']:.4e} {marker}", flush=True)
 
     result_bh = designer.optimize(
-        method="basin_hopping", max_iterations=BH_MAX_ITERATIONS, robust=False,
+        method="basin_hopping", max_iterations=BH_MAX_ITERATIONS,
+        robust=True, num_samples=ROBUST_OPTIMIZATION_SAMPLES,
         stepsize=BH_STEPSIZE, temperature=BH_TEMPERATURE,
         local_maxiter=BH_LOCAL_MAXITER, callback=hop_progress)
 
     refined = [result_bh.layers[0], *result_bh.film_layers, result_bh.layers[-1]]
     polished_designer = OpticalDesigner(layers=refined, target=target)
     result_polished = polished_designer.optimize(
-        method="lbfgs", max_iterations=POLISH_MAX_ITERATIONS)
+        method="lbfgs", max_iterations=POLISH_MAX_ITERATIONS,
+        robust=True, num_samples=ROBUST_OPTIMIZATION_SAMPLES)
     result = result_polished if result_polished.merit <= result_bh.merit else result_bh
     result.selected_stage = "polish" if result is result_polished else "basin_hopping"
     result.basin_merit = float(result_bh.merit)
@@ -488,6 +501,94 @@ def _validation_metrics(result) -> dict:
     }
 
 
+def validate_manufacturing_tolerance(result, *, seed: int) -> dict:
+    """Evaluate bounded thickness and Gaussian index manufacturing errors."""
+    if TOLERANCE_VALIDATION_SAMPLES <= 0 or (
+        TOLERANCE_VALIDATION_SAMPLES & (TOLERANCE_VALIDATION_SAMPLES - 1)
+    ):
+        raise ValueError("TOLERANCE_VALIDATION_SAMPLES must be a positive power of two")
+    if TOLERANCE_VALIDATION_BATCH_SIZE <= 0:
+        raise ValueError("TOLERANCE_VALIDATION_BATCH_SIZE must be positive")
+
+    stack = Stack(layers=result.layers)
+    base_thicknesses = np.asarray(stack.get_thickness_array())
+    base_indices = np.asarray(stack.get_tunable_n_array())
+    num_thicknesses = base_thicknesses.size
+    num_indices = base_indices.size
+    dimension = num_thicknesses + num_indices
+
+    sampler = qmc.Sobol(d=dimension, scramble=True, seed=seed)
+    unit_samples = sampler.random_base2(
+        m=int(np.log2(TOLERANCE_VALIDATION_SAMPLES)))
+    thickness_error = (
+        2.0 * unit_samples[:, :num_thicknesses] - 1.0
+    ) * THICKNESS_TOLERANCE_PLUS_MINUS_NM
+    thickness_samples = base_thicknesses[None, :] + thickness_error
+
+    if num_indices:
+        # Convert the remaining Sobol coordinates to a zero-mean Gaussian for
+        # Atlas's refractive-index 1σ tolerance. Clipping avoids norm.ppf(0/1).
+        index_unit = np.clip(
+            unit_samples[:, num_thicknesses:], 1e-12, 1.0 - 1e-12)
+        index_error = norm.ppf(index_unit) * N_TOLERANCE
+        index_samples = base_indices[None, :] + index_error
+    else:
+        index_samples = np.empty((TOLERANCE_VALIDATION_SAMPLES, 0))
+
+    wavelengths = jnp.asarray(result.wavelengths_nm) * 1e-9
+    angles = jnp.deg2rad(jnp.asarray(result.angles_deg))
+    fixed_nk_data = _precompute_fixed_nk_data(stack)
+    target = np.asarray(result.target_reflectance)[:, None]
+
+    def evaluate_one(thicknesses, indices):
+        reflectance, _ = compute_rt_polarized(
+            stack, wavelengths, angles, thicknesses, indices, fixed_nk_data)
+        return reflectance
+
+    evaluate_batch = jax.jit(jax.vmap(evaluate_one))
+    sample_rmse = []
+    sample_max_error = []
+    sample_p_max = []
+    for start in range(0, TOLERANCE_VALIDATION_SAMPLES,
+                       TOLERANCE_VALIDATION_BATCH_SIZE):
+        stop = min(start + TOLERANCE_VALIDATION_BATCH_SIZE,
+                   TOLERANCE_VALIDATION_SAMPLES)
+        reflectance = np.asarray(evaluate_batch(
+            jnp.asarray(thickness_samples[start:stop]),
+            jnp.asarray(index_samples[start:stop])))
+        s_error = reflectance[..., 0] - target[None, :, :]
+        sample_rmse.append(np.sqrt(np.mean(np.square(s_error), axis=(1, 2))))
+        sample_max_error.append(np.max(np.abs(s_error), axis=(1, 2)))
+        sample_p_max.append(np.max(reflectance[..., 1], axis=(1, 2)))
+
+    sample_rmse = np.concatenate(sample_rmse)
+    sample_max_error = np.concatenate(sample_max_error)
+    sample_p_max = np.concatenate(sample_p_max)
+    percentiles = [50, 90, 95, 99, 100]
+
+    return {
+        "samples": TOLERANCE_VALIDATION_SAMPLES,
+        "sampling": "scrambled Sobol",
+        "seed": seed,
+        "thickness_error_distribution": "uniform bounded",
+        "thickness_plus_minus_nm": THICKNESS_TOLERANCE_PLUS_MINUS_NM,
+        "index_error_distribution": "Gaussian",
+        "index_sigma": N_TOLERANCE,
+        "max_rs_error_limit": TOLERANCE_MAX_RS_ERROR,
+        "yield_fraction": float(np.mean(
+            sample_max_error <= TOLERANCE_MAX_RS_ERROR)),
+        "rs_rmse_percentiles": {
+            str(p): float(np.percentile(sample_rmse, p)) for p in percentiles
+        },
+        "rs_max_abs_error_percentiles": {
+            str(p): float(np.percentile(sample_max_error, p)) for p in percentiles
+        },
+        "rp_max_percentiles": {
+            str(p): float(np.percentile(sample_p_max, p)) for p in percentiles
+        },
+    }
+
+
 def _result_to_dict(result) -> dict:
     return {
         "merit": float(result.merit),
@@ -513,6 +614,7 @@ def _result_to_dict(result) -> dict:
             "p_values": np.asarray(result.p_transmittance).tolist(),
         },
         "validation": _validation_metrics(result),
+        "tolerance_validation": result.tolerance_validation,
     }
 
 
@@ -584,6 +686,12 @@ def main():
               f"worst={validation['s_target_max_abs_error']:.4e}, "
               f"Rp mean/max={validation['p_mean_reflectance']:.4f}/"
               f"{validation['p_max_reflectance']:.4f}")
+        print(f"    tolerance validation: {TOLERANCE_VALIDATION_SAMPLES} samples")
+        result.tolerance_validation = validate_manufacturing_tolerance(
+            result, seed=TOLERANCE_RANDOM_SEED + mirror_index)
+        print(f"    → tolerance yield="
+              f"{result.tolerance_validation['yield_fraction']:.1%} "
+              f"at max |Rs-target| ≤ {TOLERANCE_MAX_RS_ERROR:.3f}")
 
         if SAVE_PER_MIRROR_PLOTS:
             save_mirror_plot_html(
@@ -647,7 +755,15 @@ def main():
                 "design_aoi_deg": aoi_design,
             },
             "thickness_bounds_nm": list(THICKNESS_BOUNDS_NM),
-            "tolerances": {"thickness_nm": THICKNESS_TOLERANCE_NM, "n": N_TOLERANCE},
+            "tolerances": {
+                "thickness_plus_minus_nm": THICKNESS_TOLERANCE_PLUS_MINUS_NM,
+                "atlas_thickness_sigma_nm": ATLAS_THICKNESS_TOLERANCE_SIGMA_NM,
+                "n_sigma": N_TOLERANCE,
+                "robust_optimization_samples": ROBUST_OPTIMIZATION_SAMPLES,
+                "validation_samples": TOLERANCE_VALIDATION_SAMPLES,
+                "validation_sampling": "scrambled Sobol",
+                "validation_max_rs_error": TOLERANCE_MAX_RS_ERROR,
+            },
             "basin_hopping": {
                 "max_iterations": BH_MAX_ITERATIONS,
                 "local_maxiter": BH_LOCAL_MAXITER,
