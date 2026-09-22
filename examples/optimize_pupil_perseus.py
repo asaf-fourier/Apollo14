@@ -34,6 +34,7 @@ Run::
     python examples/optimize_pupil_perseus.py
 """
 
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -347,8 +348,8 @@ def _clip(params: CombinerParams) -> CombinerParams:
 
 # ── Adam optimizer ──────────────────────────────────────────────────────────
 
-PHASE1_STEPS = 1000
-PHASE2_STEPS = 1000
+PHASE1_STEPS = 50
+PHASE2_STEPS = 50
 
 adam_cfg_phase1 = AdamConfig(peak_lr=3e-3, warmup_steps=20, num_steps=PHASE1_STEPS)
 # Phase 2 polishes the shape term in a flat region; drop the LR so Adam's
@@ -460,6 +461,33 @@ def _print_breakdown(label, bd):
 RUNS_ROOT = Path("examples/reports/optimize_pupil_perseus")
 
 
+def _save_best_result(run_dir: Path, phase: str, step: int, loss: float,
+                      params: CombinerParams) -> Path:
+    """Atomically update a phase's best-parameter checkpoint."""
+    curve = {
+        "type": type(params.curves).__name__,
+        "amplitude": jnp.asarray(params.curves.amplitude).tolist(),
+    }
+    if isinstance(params.curves, SumOfGaussiansCurve):
+        curve.update({
+            "sigma_nm": jnp.asarray(params.curves.sigma / nm).tolist(),
+            "centers_nm": jnp.asarray(params.curves.centers / nm).tolist(),
+        })
+    result = {
+        "phase": phase,
+        "step": step,
+        "loss": loss,
+        "curve_mode": CURVE_MODE,
+        "spacings_mm": jnp.asarray(params.spacings / mm).tolist(),
+        "curve": curve,
+    }
+    path = run_dir / f"best_{phase}.json"
+    temporary_path = path.with_suffix(".json.tmp")
+    temporary_path.write_text(json.dumps(result, indent=2) + "\n")
+    temporary_path.replace(path)
+    return path
+
+
 def main():
     run_dir = RUNS_ROOT / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -509,17 +537,33 @@ def main():
     _print_breakdown("Initial merit (phase 1 weights)", initial_breakdown)
 
     loss_history = []
+    best_phase1_loss = float(initial_breakdown["total"])
+    best_path = _save_best_result(
+        run_dir, "phase1", 0, best_phase1_loss, params)
+    print(f"Saved initial best result: {best_path}")
 
     print("\n── Phase 1: target-focused (drive every cell to target) ──")
     for step in range(PHASE1_STEPS):
         loss, grad = value_and_grad_phase1(params)
+        loss_value = float(loss)
+        if loss_value < best_phase1_loss:
+            best_phase1_loss = loss_value
+            best_path = _save_best_result(
+                run_dir, "phase1", step, loss_value, params)
+            print(f"  new best: {loss_value:.8f} → {best_path}")
         params, state = adam_step(params, _freeze_spacings(grad), state,
                                   adam_cfg_phase1)
         params = _clip(params)
-        loss_history.append(float(loss))
-        print(f"step {step+1:4d}/{PHASE1_STEPS}  loss={float(loss):.8f}")
+        loss_history.append(loss_value)
+        print(f"step {step+1:4d}/{PHASE1_STEPS}  loss={loss_value:.8f}")
 
     phase1_breakdown = breakdown_fn(params, merit_cfg_phase1)
+    phase1_final_loss = float(phase1_breakdown["total"])
+    if phase1_final_loss < best_phase1_loss:
+        best_phase1_loss = phase1_final_loss
+        best_path = _save_best_result(
+            run_dir, "phase1", PHASE1_STEPS, phase1_final_loss, params)
+        print(f"  new best: {phase1_final_loss:.8f} → {best_path}")
     _print_breakdown("Phase 1 result", phase1_breakdown)
 
     # Phase 2 (RGB only): polish spectrum-preservation. A flat mirror preserves
@@ -530,15 +574,28 @@ def main():
     else:
         print("\n── Phase 2: target + spectrum-preserving shape ──")
         state = adam_init(params)
+        best_phase2_loss = float("inf")
         for step in range(PHASE2_STEPS):
             loss, grad = value_and_grad_phase2(params)
+            loss_value = float(loss)
+            if loss_value < best_phase2_loss:
+                best_phase2_loss = loss_value
+                best_path = _save_best_result(
+                    run_dir, "phase2", step, loss_value, params)
+                print(f"  new best: {loss_value:.8f} → {best_path}")
             params, state = adam_step(params, _freeze_spacings(grad), state,
                                       adam_cfg_phase2)
             params = _clip(params)
-            loss_history.append(float(loss))
-            print(f"step {step+1:4d}/{PHASE2_STEPS}  loss={float(loss):.8f}")
+            loss_history.append(loss_value)
+            print(f"step {step+1:4d}/{PHASE2_STEPS}  loss={loss_value:.8f}")
         final_merit_cfg = merit_cfg_phase2
         final_breakdown = breakdown_fn(params, final_merit_cfg)
+        phase2_final_loss = float(final_breakdown["total"])
+        if phase2_final_loss < best_phase2_loss:
+            best_phase2_loss = phase2_final_loss
+            best_path = _save_best_result(
+                run_dir, "phase2", PHASE2_STEPS, phase2_final_loss, params)
+            print(f"  new best: {phase2_final_loss:.8f} → {best_path}")
 
     _print_breakdown("Final merit", final_breakdown)
 
