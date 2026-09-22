@@ -35,34 +35,37 @@ Run::
     python examples/design_perseus_mirror_coating.py
 """
 
-# Import atlas BEFORE jax so its XLA multi-core flag takes effect (see
-# atlas/__init__.py). apollo14 (which imports jax) is imported after.
-from atlas import OpticalDesigner, Materials, Layer, Target, example_output_dir
-
+# Atlas must precede JAX here, so this intentionally differs from isort order.
+# ruff: noqa: I001
 import json
 import time
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 from pathlib import Path
 
-import numpy as np
+# Import atlas BEFORE jax so its XLA multi-core flag takes effect (see
+# atlas/__init__.py). apollo14 (which imports jax) is imported after.
+from atlas import Layer, Materials, OpticalDesigner, Target, example_output_dir
+from atlas.core.stack import Stack
+from atlas.core.tmm import _precompute_fixed_nk_data, compute_rt_polarized
 import jax.numpy as jnp
+import numpy as np
 import plotly.graph_objects as go
 from plotly.colors import sample_colorscale
 
-from apollo14.units import nm, mm
-from apollo14.materials import agc_m074
 from apollo14.geometry import snell_refract
+from apollo14.materials import agc_m074
 from apollo14.perseus import (
-    PERSEUS_PROJECTOR_DIRECTION,
-    PERSEUS_LIGHT_POSITION,
-    PERSEUS_BEAM_WIDTH,
     PERSEUS_BEAM_HEIGHT,
-    PERSEUS_FOV_AROUND_X,
+    PERSEUS_BEAM_WIDTH,
     PERSEUS_FOV_AROUND_PROJECTOR_Y,
+    PERSEUS_FOV_AROUND_X,
+    PERSEUS_LIGHT_POSITION,
+    PERSEUS_PROJECTOR_DIRECTION,
     build_perseus_geometry,
     spacings_for_count,
 )
-from apollo14.projector import PlayNitrideLed, FovGrid
+from apollo14.projector import FovGrid, PlayNitrideLed
+from apollo14.units import mm, nm
 
 # ── Which optimizer output, which mirrors ───────────────────────────────────
 # REPORT_DIR = None → auto-pick the newest optimize_pupil_perseus run.
@@ -75,7 +78,6 @@ MIRROR_INDICES: list[int] | None = None
 REFERENCE_WAVELENGTH_NM = 550.0     # glass index / QWOT seed reference
 POLARIZATION = "s"                  # 100% s input; incident p power is zero
 NUM_WAVELENGTHS = 120               # target sample points across the band
-SPECTRUM_NM = (440, 670)
 NUM_ANGLES = 5                      # AOI samples across the swept range
 
 # Alternating high/low-index films (DBR-style contrast) in AGC M-074 glass.
@@ -122,14 +124,38 @@ def load_report(report_dir: Path):
     report = json.loads((report_dir / "optimization_report.json").read_text())
     elements = [e for e in report["system"]["elements"]
                 if e["type"] == "PartialMirror"]
+    if not elements:
+        raise ValueError(f"No PartialMirror elements in {report_dir}")
     elements.sort(key=lambda e: int(e["name"].split("_")[1]))
 
     mirrors = []
     for mirror_index, element in enumerate(elements):
+        element_index = int(element["name"].split("_")[1])
+        if element_index != mirror_index:
+            raise ValueError(
+                f"Mirror indices must be contiguous from zero; found {element['name']}")
         wavelengths_nm = np.asarray(element["wavelengths"]) / float(nm)
         reflectance = np.asarray(element["reflectance"])
+        if wavelengths_nm.shape != reflectance.shape:
+            raise ValueError(
+                f"{element['name']} wavelength/reflectance shapes differ: "
+                f"{wavelengths_nm.shape} vs {reflectance.shape}")
+        if (not np.all(np.isfinite(wavelengths_nm))
+                or not np.all(np.isfinite(reflectance))):
+            raise ValueError(f"{element['name']} contains non-finite coating data")
+        if np.any((reflectance < 0.0) | (reflectance > 1.0)):
+            raise ValueError(f"{element['name']} reflectance lies outside [0, 1]")
         order = np.argsort(wavelengths_nm)
-        mirrors.append((mirror_index, wavelengths_nm[order], reflectance[order]))
+        wavelengths_nm = wavelengths_nm[order]
+        if np.any(np.diff(wavelengths_nm) <= 0.0):
+            raise ValueError(f"{element['name']} wavelengths are not unique")
+        mirrors.append((mirror_index, wavelengths_nm, reflectance[order]))
+
+    reference_wavelengths = mirrors[0][1]
+    if any(wavelengths.shape != reference_wavelengths.shape
+           or not np.allclose(wavelengths, reference_wavelengths)
+           for _, wavelengths, _ in mirrors[1:]):
+        raise ValueError("All mirrors must use the same wavelength grid")
 
     size_wh_mm = (float(elements[0]["width"]) / mm,
                   float(elements[0]["height"]) / mm)
@@ -268,7 +294,7 @@ def design_mirror(mirror_index, target_wavelengths_nm, target_reflectance,
     )
 
     designer = OpticalDesigner(
-        layers=_seed_layers(Materials.moveon.MR10, seed_thickness_high, seed_thickness_low),
+        layers=_seed_layers(glass, seed_thickness_high, seed_thickness_low),
         # layers=_seed_moveon_layers(Materials.moveon, seed_thickness_high, seed_thickness_low),
         target=target)
     hop_state = {"hop": 0, "best": float("inf")}
@@ -286,16 +312,31 @@ def design_mirror(mirror_index, target_wavelengths_nm, target_reflectance,
         stepsize=BH_STEPSIZE, temperature=BH_TEMPERATURE,
         local_maxiter=BH_LOCAL_MAXITER, callback=hop_progress)
 
-    refined = [result_bh.layers[0]] + result_bh.film_layers + [result_bh.layers[-1]]
+    refined = [result_bh.layers[0], *result_bh.film_layers, result_bh.layers[-1]]
     polished_designer = OpticalDesigner(layers=refined, target=target)
-    result = polished_designer.optimize(
+    result_polished = polished_designer.optimize(
         method="lbfgs", max_iterations=POLISH_MAX_ITERATIONS)
-    result.p_reflectance = polished_designer.evaluate(
-        layers=result.layers,
-        wavelengths=result.wavelengths_nm,
-        angles=result.angles_deg,
-        polarization="p",
+    result = result_polished if result_polished.merit <= result_bh.merit else result_bh
+    result.selected_stage = "polish" if result is result_polished else "basin_hopping"
+    result.basin_merit = float(result_bh.merit)
+    result.polish_merit = float(result_polished.merit)
+    if result is result_bh:
+        print(f"    polish merit {result_polished.merit:.4e} is worse than "
+              f"basin best {result_bh.merit:.4e}; retaining basin result")
+
+    stack = Stack(layers=result.layers)
+    reflectance, transmittance = compute_rt_polarized(
+        stack,
+        jnp.asarray(result.wavelengths_nm) * 1e-9,
+        jnp.deg2rad(jnp.asarray(result.angles_deg)),
+        stack.get_thickness_array(),
+        stack.get_tunable_n_array(),
+        _precompute_fixed_nk_data(stack),
     )
+    result.reflectance = reflectance[..., 0]
+    result.p_reflectance = reflectance[..., 1]
+    result.s_transmittance = transmittance[..., 0]
+    result.p_transmittance = transmittance[..., 1]
     return result
 
 
@@ -343,7 +384,8 @@ def save_mirror_plot_html(result, path: Path, config_text: str) -> None:
     colors = sample_colorscale(
         "Viridis",
         np.linspace(0.1, 0.9, achieved_s.shape[1]).tolist())
-    for angle_idx, (angle, color) in enumerate(zip(angles_deg, colors)):
+    for angle_idx, (angle, color) in enumerate(
+            zip(angles_deg, colors, strict=True)):
         figure.add_trace(go.Scatter(
             x=wavelengths_nm, y=achieved_s[:, angle_idx],
             mode="lines", name=f"S · {float(angle):.1f}°",
@@ -388,13 +430,76 @@ def save_mirror_plot_html(result, path: Path, config_text: str) -> None:
     figure.write_html(str(path), include_plotlyjs="cdn")
 
 
+def _validation_metrics(result) -> dict:
+    """Summarize polarization, angular error, and power conservation."""
+    target = np.asarray(result.target_reflectance)[:, np.newaxis]
+    angles = np.asarray(result.angles_deg)
+    rs = np.asarray(result.reflectance)
+    rp = np.asarray(result.p_reflectance)
+    ts = np.asarray(result.s_transmittance)
+    tp = np.asarray(result.p_transmittance)
+    if rs.ndim == 1:
+        rs = rs[:, np.newaxis]
+        rp = rp[:, np.newaxis]
+        ts = ts[:, np.newaxis]
+        tp = tp[:, np.newaxis]
+
+    s_error = rs - target
+    absorption_s = 1.0 - rs - ts
+    absorption_p = 1.0 - rp - tp
+    rms_by_angle = np.sqrt(np.mean(np.square(s_error), axis=0))
+    worst_angle_idx = int(np.argmax(rms_by_angle))
+
+    per_angle = []
+    for angle_idx, angle_deg in enumerate(angles):
+        angle_error = s_error[:, angle_idx]
+        per_angle.append({
+            "angle_deg": float(angle_deg),
+            "s_rmse": float(np.sqrt(np.mean(np.square(angle_error)))),
+            "s_max_abs_error": float(np.max(np.abs(angle_error))),
+            "s_mean_reflectance": float(np.mean(rs[:, angle_idx])),
+            "p_mean_reflectance": float(np.mean(rp[:, angle_idx])),
+            "p_max_reflectance": float(np.max(rp[:, angle_idx])),
+            "s_mean_transmittance": float(np.mean(ts[:, angle_idx])),
+            "p_mean_transmittance": float(np.mean(tp[:, angle_idx])),
+            "s_mean_absorption": float(np.mean(absorption_s[:, angle_idx])),
+            "p_mean_absorption": float(np.mean(absorption_p[:, angle_idx])),
+        })
+
+    return {
+        "s_target_rmse": float(np.sqrt(np.mean(np.square(s_error)))),
+        "s_target_mean_abs_error": float(np.mean(np.abs(s_error))),
+        "s_target_max_abs_error": float(np.max(np.abs(s_error))),
+        "worst_angle_deg": float(angles[worst_angle_idx]),
+        "worst_angle_s_rmse": float(rms_by_angle[worst_angle_idx]),
+        "p_mean_reflectance": float(np.mean(rp)),
+        "p_max_reflectance": float(np.max(rp)),
+        "s_mean_transmittance": float(np.mean(ts)),
+        "p_mean_transmittance": float(np.mean(tp)),
+        "s_absorption_mean": float(np.mean(absorption_s)),
+        "s_absorption_max": float(np.max(absorption_s)),
+        "p_absorption_mean": float(np.mean(absorption_p)),
+        "p_absorption_max": float(np.max(absorption_p)),
+        "s_reflectance_plus_transmittance_min": float(np.min(rs + ts)),
+        "s_reflectance_plus_transmittance_max": float(np.max(rs + ts)),
+        "p_reflectance_plus_transmittance_min": float(np.min(rp + tp)),
+        "p_reflectance_plus_transmittance_max": float(np.max(rp + tp)),
+        "per_angle": per_angle,
+    }
+
+
 def _result_to_dict(result) -> dict:
     return {
         "merit": float(result.merit),
+        "selected_stage": result.selected_stage,
+        "basin_merit": result.basin_merit,
+        "polish_merit": result.polish_merit,
         "nominal_merit": (None if result.nominal_merit is None
                           else float(result.nominal_merit)),
         "converged": bool(result.converged),
         "num_films": len(result.film_layers),
+        "incident_medium": result.layers[0].material.name,
+        "substrate": result.layers[-1].material.name,
         "layers": [_layer_to_dict(layer) for layer in result.film_layers],
         "achieved_reflectance": {
             "wavelengths_nm": np.asarray(result.wavelengths_nm).tolist(),
@@ -403,6 +508,11 @@ def _result_to_dict(result) -> dict:
             "s_values": np.asarray(result.reflectance).tolist(),
             "p_values": np.asarray(result.p_reflectance).tolist(),
         },
+        "achieved_transmittance": {
+            "s_values": np.asarray(result.s_transmittance).tolist(),
+            "p_values": np.asarray(result.p_transmittance).tolist(),
+        },
+        "validation": _validation_metrics(result),
     }
 
 
@@ -415,6 +525,12 @@ def main():
 
     indices = (list(range(num_mirrors)) if MIRROR_INDICES is None
                else MIRROR_INDICES)
+    invalid_indices = [index for index in indices
+                       if index < 0 or index >= num_mirrors]
+    if invalid_indices:
+        raise ValueError(
+            f"MIRROR_INDICES contains invalid entries {invalid_indices}; "
+            f"valid range is 0..{num_mirrors - 1}")
 
     # Geometry / spectrum shared by the whole stack (mirrors share one normal).
     glass_index = float(jnp.interp(REFERENCE_WAVELENGTH_NM * nm,
@@ -454,7 +570,6 @@ def main():
     run_start = time.perf_counter()
     for design_position, mirror_index in enumerate(indices):
         _, wavelengths_nm, reflectance = mirrors[mirror_index]
-        wavelengths_nm = np.linspace(SPECTRUM_NM[0], SPECTRUM_NM[1], len(wavelengths_nm))
         print(f"[{design_position + 1}/{len(indices)}] mirror {mirror_index}: "
               f"target R {reflectance.min():.3f}..{reflectance.max():.3f}")
         print("    target R(λ): " + "  ".join(
@@ -463,7 +578,12 @@ def main():
         result = design_mirror(
             mirror_index, wavelengths_nm, reflectance, (aoi_min, aoi_max),
             weights, glass, seed_thickness_high, seed_thickness_low)
-        print(f"    → merit {result.merit:.4e}, {len(result.film_layers)} films")
+        validation = _validation_metrics(result)
+        print(f"    → merit {result.merit:.4e}, {len(result.film_layers)} films, "
+              f"Rs RMSE={validation['s_target_rmse']:.4e}, "
+              f"worst={validation['s_target_max_abs_error']:.4e}, "
+              f"Rp mean/max={validation['p_mean_reflectance']:.4f}/"
+              f"{validation['p_max_reflectance']:.4f}")
 
         if SAVE_PER_MIRROR_PLOTS:
             save_mirror_plot_html(
