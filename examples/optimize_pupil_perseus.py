@@ -41,7 +41,6 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 
-from apollo14.units import mm, nm, deg
 from apollo14.combiner import compensated_reflectances
 from apollo14.elements.pupil import RectangularPupil
 from apollo14.geometry import planar_grid_points
@@ -58,20 +57,20 @@ from apollo14.perseus import (
     PERSEUS_PROJECTOR_DIRECTION,
     spacings_for_count,
 )
-from apollo14.projector import PlayNitrideLed, FovGrid
+from apollo14.projector import FovGrid, PlayNitrideLed
 from apollo14.spectral import ConstantCurve, SumOfGaussiansCurve
-
-from helios.combiner_params import CombinerParams, ParamBounds, fwhm_to_sigma
-from helios.perseus_params import build_parametrized_perseus
 from apollo14.trace import prepare_route
-from helios.merit import build_combiner_branch_routes
-from helios.eyebox import trace_branch_over_fov
-from helios.photometry import luminance_weights as photopic_luminance_weights
-from helios.pupil_merit import PupilMeritConfig, pupil_merit, merit_breakdown
+from apollo14.units import deg, mm, nm
 from helios.adam import AdamConfig, adam_init, adam_step
-from helios.io import save_optimization_report, save_run, ScanConfig
-from helios.reports.pupil_report import render_pupil_report
+from helios.combiner_params import CombinerParams, ParamBounds, fwhm_to_sigma
+from helios.eyebox import trace_branch_over_fov
+from helios.io import ScanConfig, save_optimization_report, save_run
 from helios.jax_cache import enable_jax_compilation_cache
+from helios.merit import build_combiner_branch_routes
+from helios.perseus_params import build_parametrized_perseus
+from helios.photometry import luminance_weights as photopic_luminance_weights
+from helios.pupil_merit import PupilMeritConfig, merit_breakdown, pupil_merit
+from helios.reports.pupil_report import render_pupil_report
 
 # Persistent JIT cache survives across runs so successive optimizations
 # skip the multi-second compile. Cache dir auto-detects from
@@ -129,13 +128,14 @@ PROJECTOR = PlayNitrideLed.create_broadband(
 )
 
 # ── Wavelength sampling ─────────────────────────────────────────────────────
-# Span W's above-threshold band uniformly. Threshold 0.10 gives a clean
-# three-peak envelope without splitting any LED's measured spectrum.
+# Cover the complete measured panel spectrum so efficiency is relative to the
+# panel's full photometric output, not only its above-threshold emission band.
 
-SPECTRAL_THRESHOLD = 0.02
+SPECTRAL_THRESHOLD = None
 SPECTRAL_SAMPLES = 400
 
-_w_lo, _w_hi = PROJECTOR.spectral_band(threshold=SPECTRAL_THRESHOLD)
+_spec_wls, _spec_rad = PROJECTOR.spectrum
+_w_lo, _w_hi = float(_spec_wls[0]), float(_spec_wls[-1])
 TRACE_WAVELENGTHS = jnp.linspace(_w_lo, _w_hi, SPECTRAL_SAMPLES)
 
 # ── Spectrum-preserving shape target ───────────────────────────────────────
@@ -144,7 +144,6 @@ TRACE_WAVELENGTHS = jnp.linspace(_w_lo, _w_hi, SPECTRAL_SAMPLES)
 # chasing a continuous D65 SPD. At valley wavelengths both response and target
 # are small, so the shape residual stays bounded.
 
-_spec_wls, _spec_rad = PROJECTOR.spectrum
 _W_AT_TRACE = jnp.interp(TRACE_WAVELENGTHS, _spec_wls, _spec_rad)
 SHAPE_TARGET = _W_AT_TRACE / _W_AT_TRACE.sum()
 
@@ -201,6 +200,33 @@ else:
 
 NUM_RAYS = PROJECTOR_NX * PROJECTOR_NY
 INPUT_FLUX = float(NUM_RAYS * jnp.sum(_W_AT_TRACE * LUMINANCE_TRACE_WEIGHTS))
+
+# Denser, independent sampling used only after optimization. This catches
+# designs that overfit the coarser optimization grids without multiplying the
+# cost of every gradient step.
+VALIDATION_PROJECTOR_NX, VALIDATION_PROJECTOR_NY = 41, 9
+VALIDATION_ANGULAR_STEPS_X, VALIDATION_ANGULAR_STEPS_Y = 12, 12
+VALIDATION_SPECTRAL_SAMPLES = 800
+
+VALIDATION_PROJECTOR = PlayNitrideLed.create_broadband(
+    position=PERSEUS_LIGHT_POSITION, direction=PROJECTOR_DIRECTION,
+    beam_width=PERSEUS_BEAM_WIDTH, beam_height=PERSEUS_BEAM_HEIGHT,
+    nx=VALIDATION_PROJECTOR_NX, ny=VALIDATION_PROJECTOR_NY,
+)
+VALIDATION_FOV_GRID = FovGrid(
+    PROJECTOR_DIRECTION, X_FOV, Y_FOV,
+    num_x=VALIDATION_ANGULAR_STEPS_X, num_y=VALIDATION_ANGULAR_STEPS_Y,
+)
+VALIDATION_WAVELENGTHS = jnp.linspace(
+    _w_lo, _w_hi, VALIDATION_SPECTRAL_SAMPLES)
+_W_AT_VALIDATION = jnp.interp(
+    VALIDATION_WAVELENGTHS, _spec_wls, _spec_rad)
+VALIDATION_LUMINANCE_WEIGHTS = photopic_luminance_weights(
+    VALIDATION_WAVELENGTHS)
+VALIDATION_INPUT_FLUX = float(
+    VALIDATION_PROJECTOR_NX * VALIDATION_PROJECTOR_NY
+    * jnp.sum(_W_AT_VALIDATION * VALIDATION_LUMINANCE_WEIGHTS))
+VALIDATION_SHAPE_TARGET = _W_AT_VALIDATION / _W_AT_VALIDATION.sum()
 
 # ── Eye-pupil moving-window aggregation ───────────────────────────────────
 # Each merit cell represents what a ~3 mm eye-pupil would see at that eyebox
@@ -268,27 +294,30 @@ def _window_mean(arr: jnp.ndarray, ny: int, nx: int,
 # ── Loss function ───────────────────────────────────────────────────────────
 
 
-def _compute_spectral_response(params: CombinerParams) -> jnp.ndarray:
-    """Trace the W projector at each wavelength, scanned over wavelengths.
+def _compute_spectral_response_for(
+    params: CombinerParams,
+    projector,
+    directions: jnp.ndarray,
+    wavelengths: jnp.ndarray,
+) -> jnp.ndarray:
+    """Trace a projector over an explicit direction/wavelength grid.
 
     Returns ``(S, A, N)`` per-wavelength radiance — the shape the merit and
     report both expect. Spacings are frozen, so hard nearest-neighbor binning
     (``sigma=None``, ``lattice=None``) is used.
     """
     system = build_parametrized_perseus(
-        params, probe_wavelengths=TRACE_WAVELENGTHS,
+        params, probe_wavelengths=wavelengths,
         chassis_z=CHASSIS_Z)
     branch_routes = build_combiner_branch_routes(
         system, num_mirrors=NUM_MIRRORS,
     )
-    directions = FOV_GRID.flat_directions  # (A, 3)
-
     def trace_one_wavelength(_, wavelength):
         binned = jnp.zeros((directions.shape[0], EYEBOX_POINTS.shape[0]))
         for route in branch_routes:
             prepared = prepare_route(route, wavelength)
             binned = binned + trace_branch_over_fov(
-                prepared, PROJECTOR, EYEBOX_POINTS, wavelength,
+                prepared, projector, EYEBOX_POINTS, wavelength,
                 directions,
                 sigma=None,  # spacings frozen → hard nearest-neighbor binning
                 vmap_directions=True)  # (A, S_sample); A=64 fits comfortably
@@ -302,8 +331,14 @@ def _compute_spectral_response(params: CombinerParams) -> jnp.ndarray:
     # backward instead of saving the full per-(wavelength, direction, ray,
     # cell) activation tape.
     _, all_responses = jax.lax.scan(
-        jax.checkpoint(trace_one_wavelength), None, TRACE_WAVELENGTHS)  # (N, S_eyebox, A)
+        jax.checkpoint(trace_one_wavelength), None, wavelengths)  # (N, S_eyebox, A)
     return jnp.transpose(all_responses, (1, 2, 0))  # (S_eyebox, A, N)
+
+
+def _compute_spectral_response(params: CombinerParams) -> jnp.ndarray:
+    """Trace on the optimization sampling grid."""
+    return _compute_spectral_response_for(
+        params, PROJECTOR, FOV_GRID.flat_directions, TRACE_WAVELENGTHS)
 
 
 def loss_fn_phase1(params: CombinerParams) -> jnp.ndarray:
@@ -348,8 +383,8 @@ def _clip(params: CombinerParams) -> CombinerParams:
 
 # ── Adam optimizer ──────────────────────────────────────────────────────────
 
-PHASE1_STEPS = 150
-PHASE2_STEPS = 150
+PHASE1_STEPS = 100
+PHASE2_STEPS = 100
 
 adam_cfg_phase1 = AdamConfig(peak_lr=3e-3, warmup_steps=20, num_steps=PHASE1_STEPS)
 # Phase 2 polishes the shape term in a flat region; drop the LR so Adam's
@@ -439,7 +474,7 @@ def _print_final_curves(params: CombinerParams) -> None:
     sigma_max = fwhm_to_sigma(bounds.fwhm_max_nm * nm)
     amp_pegged = int(jnp.sum(params.curves.amplitude >= bounds.amplitude_max - 1e-4))
     sigma_pegged = int(jnp.sum(params.curves.sigma >= sigma_max - 1e-4))
-    print(f"\nParameters at upper bound:")
+    print("\nParameters at upper bound:")
     print(f"  amplitudes: {amp_pegged} / {params.curves.amplitude.size} "
           f"(at {bounds.amplitude_max})")
     print(f"  sigmas:     {sigma_pegged} / {params.curves.sigma.size} "
@@ -516,9 +551,9 @@ def main():
           f"{FOV_GRID.num_x}×{FOV_GRID.num_y} samples")
     print(f"Spectrum:  {SPECTRAL_SAMPLES} uniform samples, "
           f"{float(_w_lo)/nm:.0f}–{float(_w_hi)/nm:.0f} nm "
-          f"(W > {SPECTRAL_THRESHOLD:.0%} of peak)")
+          "(full measured band)")
     if not is_flat:
-        print(f"Shape target: projector W spectrum (preserve panel's D65 white)")
+        print("Shape target: projector W spectrum (preserve panel's D65 white)")
     print(f"I_in:      {INPUT_FLUX:.1f}  "
           f"(target_relative={merit_cfg_phase1.target_relative})")
 
@@ -538,6 +573,8 @@ def main():
 
     loss_history = []
     best_phase1_loss = float(initial_breakdown["total"])
+    best_phase1_step = 0
+    best_phase1_params = params
     best_path = _save_best_result(
         run_dir, "phase1", 0, best_phase1_loss, params)
     print(f"Saved initial best result: {best_path}")
@@ -548,6 +585,8 @@ def main():
         loss_value = float(loss)
         if loss_value < best_phase1_loss:
             best_phase1_loss = loss_value
+            best_phase1_step = step
+            best_phase1_params = params
             best_path = _save_best_result(
                 run_dir, "phase1", step, loss_value, params)
             print(f"  new best: {loss_value:.8f} → {best_path}")
@@ -561,10 +600,16 @@ def main():
     phase1_final_loss = float(phase1_breakdown["total"])
     if phase1_final_loss < best_phase1_loss:
         best_phase1_loss = phase1_final_loss
+        best_phase1_step = PHASE1_STEPS
+        best_phase1_params = params
         best_path = _save_best_result(
             run_dir, "phase1", PHASE1_STEPS, phase1_final_loss, params)
         print(f"  new best: {phase1_final_loss:.8f} → {best_path}")
-    _print_breakdown("Phase 1 result", phase1_breakdown)
+    # Continue and report from the best evaluated phase-1 design, not merely
+    # Adam's final update (which may have stepped away from the minimum).
+    params = best_phase1_params
+    phase1_breakdown = breakdown_fn(params, merit_cfg_phase1)
+    _print_breakdown("Best phase 1 result", phase1_breakdown)
 
     # Phase 2 (RGB only): polish spectrum-preservation. A flat mirror preserves
     # the panel spectrum by construction, so a shape phase has nothing to do.
@@ -575,11 +620,15 @@ def main():
         print("\n── Phase 2: target + spectrum-preserving shape ──")
         state = adam_init(params)
         best_phase2_loss = float("inf")
+        best_phase2_step = 0
+        best_phase2_params = params
         for step in range(PHASE2_STEPS):
             loss, grad = value_and_grad_phase2(params)
             loss_value = float(loss)
             if loss_value < best_phase2_loss:
                 best_phase2_loss = loss_value
+                best_phase2_step = step
+                best_phase2_params = params
                 best_path = _save_best_result(
                     run_dir, "phase2", step, loss_value, params)
                 print(f"  new best: {loss_value:.8f} → {best_path}")
@@ -593,9 +642,13 @@ def main():
         phase2_final_loss = float(final_breakdown["total"])
         if phase2_final_loss < best_phase2_loss:
             best_phase2_loss = phase2_final_loss
+            best_phase2_step = PHASE2_STEPS
+            best_phase2_params = params
             best_path = _save_best_result(
                 run_dir, "phase2", PHASE2_STEPS, phase2_final_loss, params)
             print(f"  new best: {phase2_final_loss:.8f} → {best_path}")
+        params = best_phase2_params
+        final_breakdown = breakdown_fn(params, final_merit_cfg)
 
     _print_breakdown("Final merit", final_breakdown)
 
@@ -603,11 +656,27 @@ def main():
           [f"{float(spacing)/mm:.3f}" for spacing in params.spacings])
     _print_final_curves(params)
 
-    response = _compute_spectral_response(params)
+    print("\n── Dense post-optimization validation ──")
+    response = _compute_spectral_response_for(
+        params, VALIDATION_PROJECTOR, VALIDATION_FOV_GRID.flat_directions,
+        VALIDATION_WAVELENGTHS)
+    validation_merit_cfg = PupilMeritConfig(
+        target_relative=PER_CELL_TARGET,
+        d65_weights=VALIDATION_SHAPE_TARGET,
+        luminance_weights=VALIDATION_LUMINANCE_WEIGHTS,
+        weight_target=final_merit_cfg.weight_target,
+        weight_shape=final_merit_cfg.weight_shape,
+        asymmetric_target=final_merit_cfg.asymmetric_target,
+    )
+    validation_breakdown = merit_breakdown(
+        response, VALIDATION_INPUT_FLUX, validation_merit_cfg,
+        cell_mask=CELL_MASK)
+    _print_breakdown("Dense validation merit", validation_breakdown)
+
     luminance_per_angle = jnp.sum(
-        response * LUMINANCE_TRACE_WEIGHTS.reshape(1, 1, -1), axis=-1)  # (S, A)
+        response * VALIDATION_LUMINANCE_WEIGHTS.reshape(1, 1, -1), axis=-1)
     mean_luminance = jnp.mean(luminance_per_angle, axis=-1)             # (S,)
-    relative_brightness = mean_luminance / INPUT_FLUX
+    relative_brightness = mean_luminance / VALIDATION_INPUT_FLUX
 
     grid = relative_brightness.reshape(EYEBOX_NY, EYEBOX_NX)
     print(f"\nEyebox brightness map (relative to input flux, target={PER_CELL_TARGET}):")
@@ -618,7 +687,7 @@ def main():
           f"std={float(relative_brightness.std()):.5f}")
 
     final_system = build_parametrized_perseus(
-        params, probe_wavelengths=TRACE_WAVELENGTHS,
+        params, probe_wavelengths=VALIDATION_WAVELENGTHS,
         chassis_z=CHASSIS_Z)
 
     if is_flat:
@@ -627,6 +696,8 @@ def main():
             "steps": PHASE1_STEPS,
             "peak_lr": adam_cfg_phase1.peak_lr,
             "warmup_steps": adam_cfg_phase1.warmup_steps,
+            "best_step": best_phase1_step,
+            "best_loss": best_phase1_loss,
             "focus": "target (flat reflectance, fixed spacing)",
             "curve": "ConstantCurve (wavelength-flat)",
         }
@@ -634,9 +705,14 @@ def main():
         optimizer_config = {
             "algorithm": "adam_two_phase",
             "phase1": {"steps": PHASE1_STEPS, "peak_lr": adam_cfg_phase1.peak_lr,
-                       "warmup_steps": adam_cfg_phase1.warmup_steps, "focus": "target"},
+                       "warmup_steps": adam_cfg_phase1.warmup_steps,
+                       "best_step": best_phase1_step,
+                       "best_loss": best_phase1_loss,
+                       "focus": "target"},
             "phase2": {"steps": PHASE2_STEPS, "peak_lr": adam_cfg_phase2.peak_lr,
                        "warmup_steps": adam_cfg_phase2.warmup_steps,
+                       "best_step": best_phase2_step,
+                       "best_loss": best_phase2_loss,
                        "focus": "target+shape (spectrum-preserving)"},
             "schedule": "warmup_cosine_decay",
             "total_steps": PHASE1_STEPS + PHASE2_STEPS,
@@ -645,10 +721,21 @@ def main():
     optimizer_config.update({
         "spectral_threshold": SPECTRAL_THRESHOLD,
         "spectral_samples": SPECTRAL_SAMPLES,
+        "spectral_range": "full measured panel spectrum",
         "num_mirrors": NUM_MIRRORS,
         "optimize_spacings": OPTIMIZE_SPACINGS,
         "curve_mode": CURVE_MODE,
-        "geometry": "perseus (tilted 10-mirror, build_parametrized_perseus)",
+        "geometry": (f"perseus (tilted {NUM_MIRRORS}-mirror, "
+                     "build_parametrized_perseus)"),
+        "validation": {
+            "projector_nx": VALIDATION_PROJECTOR_NX,
+            "projector_ny": VALIDATION_PROJECTOR_NY,
+            "angular_steps_x": VALIDATION_ANGULAR_STEPS_X,
+            "angular_steps_y": VALIDATION_ANGULAR_STEPS_Y,
+            "spectral_samples": VALIDATION_SPECTRAL_SAMPLES,
+            "spectral_range": "full measured panel spectrum",
+            "breakdown": {k: float(v) for k, v in validation_breakdown.items()},
+        },
     })
 
     report_path = save_optimization_report(
@@ -687,16 +774,16 @@ def main():
     scan_cfg = ScanConfig(
         base_direction=PROJECTOR_DIRECTION,
         x_fov=float(X_FOV), y_fov=float(Y_FOV),
-        num_x=FOV_GRID.num_x, num_y=FOV_GRID.num_y,
+        num_x=VALIDATION_FOV_GRID.num_x, num_y=VALIDATION_FOV_GRID.num_y,
     )
     save_run(
         run_dir,
-        final_system, PROJECTOR, scan_cfg,
+        final_system, VALIDATION_PROJECTOR, scan_cfg,
         response=response,
         pupil_x_mm=pupil_x_mm,
         pupil_y_mm=pupil_y_mm,
-        scan_angles=FOV_GRID.angles_grid,
-        wavelengths_nm=TRACE_WAVELENGTHS / nm,
+        scan_angles=VALIDATION_FOV_GRID.angles_grid,
+        wavelengths_nm=VALIDATION_WAVELENGTHS / nm,
     )
     print(f"Saved run inputs + response to: {run_dir}")
 
