@@ -12,6 +12,7 @@ from apollo14.binning import (
     bin_hits_bilinear,
     bin_hits_soft,
     bin_hits_to_nearest,
+    bin_hits_to_nearest_bounded,
 )
 from apollo14.geometry import planar_grid_points
 from apollo14.trace import trace_rays
@@ -28,6 +29,7 @@ def eyebox_grid_points(center, normal, radius, nx, ny):
 
 def trace_branch_over_fov(route, projector, eyebox_points, wavelength,
                           directions, sigma=None, lattice=None,
+                          bounded_lattice=None,
                           *, vmap_directions: bool = False):
     """Trace one branch route across all FOV directions.
 
@@ -43,6 +45,9 @@ def trace_branch_over_fov(route, projector, eyebox_points, wavelength,
       Preferred over ``sigma`` — see :func:`apollo14.binning.bin_hits_bilinear`.
     * ``sigma`` — legacy softmax soft binning (``bin_hits_soft``). Kept for
       back-compat; over-credits rays landing outside ``eyebox_points``.
+    * ``bounded_lattice`` — hard nearest-cell binning within the lattice's
+      physical rectangle. Rays outside it contribute zero. Use this when
+      geometry is frozen and position gradients are unnecessary.
     * neither — hard nearest-neighbor binning with ``stop_gradient``.
 
     Iteration over directions is configurable:
@@ -69,6 +74,8 @@ def trace_branch_over_fov(route, projector, eyebox_points, wavelength,
             return bin_hits_bilinear(traced, lattice)
         if sigma is not None:
             return bin_hits_soft(traced, eyebox_points, sigma)
+        if bounded_lattice is not None:
+            return bin_hits_to_nearest_bounded(traced, bounded_lattice)
         return bin_hits_to_nearest(traced, eyebox_points, stop_grad=True)
 
     if vmap_directions:

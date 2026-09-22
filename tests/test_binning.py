@@ -13,6 +13,7 @@ from apollo14.binning import (
     bin_hits_bilinear,
     bin_hits_soft,
     bin_hits_to_nearest,
+    bin_hits_to_nearest_bounded,
     make_sample_lattice,
 )
 from apollo14.trace import TraceResult
@@ -77,6 +78,25 @@ def test_soft_binning_gradient_flows_through_position():
 LATTICE = make_sample_lattice(
     center=jnp.zeros(3), normal=jnp.array([0.0, 0.0, 1.0]),
     half_x=2.0, half_y=2.0, nx=4, ny=4)
+
+
+def test_bounded_nearest_in_grid_ray_conserves_intensity():
+    result = _result([[0.3, -0.7, 0.0]], [1.25], [True])
+    binned = bin_hits_to_nearest_bounded(result, LATTICE)
+    assert jnp.allclose(jnp.sum(binned), 1.25, atol=1e-6)
+
+
+def test_bounded_nearest_out_of_grid_ray_deposits_nothing():
+    result = _result([[2.01, 0.0, 0.0], [0.0, -2.01, 0.0]],
+                     [1.0, 2.0], [True, True])
+    binned = bin_hits_to_nearest_bounded(result, LATTICE)
+    assert jnp.allclose(jnp.sum(binned), 0.0, atol=1e-6)
+
+
+def test_bounded_nearest_dead_ray_contributes_zero():
+    result = _result([[0.0, 0.0, 0.0]], [1.0], [False])
+    binned = bin_hits_to_nearest_bounded(result, LATTICE)
+    assert jnp.allclose(jnp.sum(binned), 0.0, atol=1e-6)
 
 
 def test_bilinear_in_grid_ray_conserves_intensity():

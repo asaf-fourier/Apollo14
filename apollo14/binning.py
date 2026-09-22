@@ -113,6 +113,41 @@ def make_sample_lattice(center, normal, half_x, half_y, nx, ny) -> SampleLattice
         half_x=float(half_x), half_y=float(half_y), nx=int(nx), ny=int(ny))
 
 
+def bin_hits_to_nearest_bounded(
+    trace_result: TraceResult,
+    lattice: SampleLattice,
+    stop_grad: bool = True,
+) -> jnp.ndarray:
+    """Deposit each in-bounds hit into its nearest lattice cell.
+
+    Unlike :func:`bin_hits_to_nearest`, this uses the lattice's physical
+    half-extents as a hard aperture: valid rays outside the sampled rectangle
+    contribute zero instead of being snapped to an outermost cell.
+    """
+    pts_flat, ints_flat, valid_flat = _ray_final(trace_result)
+    delta = pts_flat - lattice.center[None, :]
+    coord_x = delta @ lattice.local_x
+    coord_y = delta @ lattice.local_y
+
+    pitch_x = 2.0 * lattice.half_x / lattice.nx
+    pitch_y = 2.0 * lattice.half_y / lattice.ny
+    cell_x = jnp.floor((coord_x + lattice.half_x) / pitch_x).astype(jnp.int32)
+    cell_y = jnp.floor((coord_y + lattice.half_y) / pitch_y).astype(jnp.int32)
+    inside = ((coord_x >= -lattice.half_x) & (coord_x < lattice.half_x)
+              & (coord_y >= -lattice.half_y) & (coord_y < lattice.half_y))
+
+    cell_x = jnp.clip(cell_x, 0, lattice.nx - 1)
+    cell_y = jnp.clip(cell_y, 0, lattice.ny - 1)
+    flat_index = cell_y * lattice.nx + cell_x
+    if stop_grad:
+        flat_index = jax.lax.stop_gradient(flat_index)
+
+    one_hot = jax.nn.one_hot(flat_index, lattice.nx * lattice.ny)
+    weighted = jnp.where(
+        (valid_flat & inside)[:, None], ints_flat[:, None] * one_hot, 0.0)
+    return jnp.sum(weighted, axis=0)
+
+
 def bin_hits_bilinear(trace_result: TraceResult,
                       lattice: SampleLattice) -> jnp.ndarray:
     """Bilinear (tent-kernel) splat of ray exit hits onto ``lattice``.
