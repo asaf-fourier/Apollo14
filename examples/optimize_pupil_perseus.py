@@ -155,7 +155,7 @@ LUMINANCE_TRACE_WEIGHTS = photopic_luminance_weights(TRACE_WAVELENGTHS)
 # ── Per-cell brightness target ─────────────────────────────────────────────
 
 NUM_EYEBOX_CELLS = EYEBOX_NX * EYEBOX_NY
-EYEBOX_TARGET = 0.07
+EYEBOX_TARGET = 0.14
 PER_CELL_TARGET = EYEBOX_TARGET / NUM_EYEBOX_CELLS
 
 
@@ -348,8 +348,8 @@ def _clip(params: CombinerParams) -> CombinerParams:
 
 # ── Adam optimizer ──────────────────────────────────────────────────────────
 
-PHASE1_STEPS = 50
-PHASE2_STEPS = 50
+PHASE1_STEPS = 150
+PHASE2_STEPS = 150
 
 adam_cfg_phase1 = AdamConfig(peak_lr=3e-3, warmup_steps=20, num_steps=PHASE1_STEPS)
 # Phase 2 polishes the shape term in a flat region; drop the LR so Adam's
