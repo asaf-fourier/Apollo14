@@ -41,6 +41,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 
+from apollo14.binning import make_sample_lattice
 from apollo14.combiner import compensated_reflectances
 from apollo14.elements.pupil import RectangularPupil
 from apollo14.geometry import planar_grid_points
@@ -259,6 +260,9 @@ EYEBOX_POINTS = planar_grid_points(
     SAMPLE_HALF_X, SAMPLE_HALF_Y, SAMPLE_NX, SAMPLE_NY,
     cell_centered=True,
 )   # (SAMPLE_NX * SAMPLE_NY, 3)
+EYEBOX_LATTICE = make_sample_lattice(
+    _pupil.position, _pupil.normal,
+    SAMPLE_HALF_X, SAMPLE_HALF_Y, SAMPLE_NX, SAMPLE_NY)
 _cell_mask_2d = jnp.ones((EYEBOX_NY, EYEBOX_NX))
 CELL_MASK = _cell_mask_2d.reshape(-1)
 
@@ -303,8 +307,8 @@ def _compute_spectral_response_for(
     """Trace a projector over an explicit direction/wavelength grid.
 
     Returns ``(S, A, N)`` per-wavelength radiance — the shape the merit and
-    report both expect. Spacings are frozen, so hard nearest-neighbor binning
-    (``sigma=None``, ``lattice=None``) is used.
+    report both expect. Spacings are frozen, so bounded hard nearest-neighbor
+    binning is used: hits beyond the padded sample grid contribute zero.
     """
     system = build_parametrized_perseus(
         params, probe_wavelengths=wavelengths,
@@ -319,7 +323,7 @@ def _compute_spectral_response_for(
             binned = binned + trace_branch_over_fov(
                 prepared, projector, EYEBOX_POINTS, wavelength,
                 directions,
-                sigma=None,  # spacings frozen → hard nearest-neighbor binning
+                bounded_lattice=EYEBOX_LATTICE,
                 vmap_directions=True)  # (A, S_sample); A=64 fits comfortably
         # (S_sample, A) → moving-window mean → (S_eyebox, A). Windowing inside
         # the scan body keeps the per-iteration activation tape at eyebox size.
@@ -383,7 +387,7 @@ def _clip(params: CombinerParams) -> CombinerParams:
 
 # ── Adam optimizer ──────────────────────────────────────────────────────────
 
-PHASE1_STEPS = 100
+PHASE1_STEPS = 50
 PHASE2_STEPS = 100
 
 adam_cfg_phase1 = AdamConfig(peak_lr=3e-3, warmup_steps=20, num_steps=PHASE1_STEPS)
