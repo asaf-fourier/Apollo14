@@ -33,6 +33,7 @@ import json
 import os
 import sys
 import ctypes
+import filecmp
 import shutil
 import time
 import tempfile
@@ -454,6 +455,54 @@ def _install_coating_file(source_directory, coating_file):
     print(f"Installed coating file to {target_path}")
 
 
+def _find_zemax_polygon_objects_folder(application):
+    """Return the active Zemax folder for Polygon Object files."""
+    for env_var in POLYGON_OBJECT_INSTALL_ENV_VARS:
+        value = os.environ.get(env_var)
+        if value:
+            return os.path.normpath(value)
+
+    samples_directory = getattr(application, "SamplesDir", None)
+    if samples_directory:
+        data_directory = os.path.dirname(
+            os.path.normpath(str(samples_directory)))
+        return os.path.join(data_directory, "Objects", "Polygon Objects")
+
+    return os.path.join(
+        str(Path.home()), "Documents", "Zemax", "Objects", "Polygon Objects")
+
+
+def _install_polygon_files(source_directory, objects, application):
+    """Install the bundle's POB files byte-for-byte before Zemax loads them."""
+    polygon_files = []
+    for entry in objects:
+        polygon_file = entry.get("data", {}).get("polygon_file")
+        if polygon_file and polygon_file not in polygon_files:
+            polygon_files.append(polygon_file)
+    if not polygon_files:
+        return
+
+    target_directory = _find_zemax_polygon_objects_folder(application)
+    os.makedirs(target_directory, exist_ok=True)
+    for polygon_file in polygon_files:
+        source_path = os.path.abspath(
+            os.path.join(source_directory, polygon_file))
+        if not os.path.isfile(source_path):
+            raise FileNotFoundError(
+                f"Could not find polygon file {polygon_file!r} next to the "
+                f"prescription in {source_directory!r}.")
+        target_path = os.path.join(
+            target_directory, os.path.basename(polygon_file))
+        if os.path.normcase(source_path) != os.path.normcase(
+                os.path.abspath(target_path)):
+            shutil.copy2(source_path, target_path)
+        if not filecmp.cmp(source_path, target_path, shallow=False):
+            raise IOError(
+                f"Installed polygon file differs from the exported bundle: "
+                f"{target_path!r}.")
+        print(f"Installed polygon object to {target_path}")
+
+
 # ── Tolerant configuration helpers ──────────────────────────────────────────
 # ZOS-API renames properties and enum members between releases. Rather than
 # hard-code one spelling and fail, everything uncertain is attempted by name
@@ -768,6 +817,11 @@ COATING_INSTALL_ENV_VARS = (
     "ZEMAX_COATINGS_DIR",
     "ZEMAX_COATING_DIR",
     "ZOSAPI_COATINGS_DIR",
+)
+POLYGON_OBJECT_INSTALL_ENV_VARS = (
+    "APOLLO14_ZEMAX_POLYGON_OBJECTS_DIR",
+    "ZEMAX_POLYGON_OBJECTS_DIR",
+    "ZOSAPI_POLYGON_OBJECTS_DIR",
 )
 
 
@@ -1164,6 +1218,8 @@ def build(prescription_path, output_path):
     print(f"  coating_file: {settings.get('coating_file')!r}")
     _print_mirror_coating_plan(prescription)
     _install_coating_file(prescription_directory, settings.get("coating_file"))
+    _install_polygon_files(
+        prescription_directory, prescription["objects"], application)
 
     system.New(False)
     system.MakeNonSequential()

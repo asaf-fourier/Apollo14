@@ -1,5 +1,7 @@
 """Regression checks for the Perseus Zemax export example."""
 
+import json
+
 import jax.numpy as jnp
 import numpy as np
 
@@ -19,9 +21,11 @@ from apollo14.perseus import (
     PERSEUS_COMBINER_CENTER,
     PERSEUS_PANTOSCOPIC_TILT,
 )
+from apollo14.projector import Projector
 from apollo14.units import deg, nm
 from examples import export_perseus_zemax
 from helios.combiner_params import CombinerParams
+from helios.io import _serialize_projector, _serialize_system
 from helios.perseus_params import build_parametrized_perseus
 
 
@@ -201,3 +205,64 @@ def test_generated_build_script_dumps_layout_inventory_on_missing_settings():
     assert "NSC 3D Layout settings" in text
     assert "ModifySettings" in text
     assert "USEPOLARIZATION" in text
+
+
+def test_export_uses_saved_chassis_geometry_for_plain_pob(tmp_path):
+    params = CombinerParams.initial()
+    system = build_parametrized_perseus(
+        params,
+        probe_wavelengths=jnp.array([500.0, 600.0]) * nm,
+        projector_glass_length=9.0,
+    )
+    projector = Projector.uniform(
+        position=jnp.array([7.0, 40.0, -1.0]),
+        direction=jnp.array([0.0, -1.0, 0.2]),
+        beam_width=9.0,
+        beam_height=1.5,
+        nx=3,
+        ny=2,
+    )
+    report = {
+        "git_sha": "geometry-snapshot",
+        "system": _serialize_system(system),
+        "projectors": [_serialize_projector(projector)],
+        "fov_grid": {"x_fov": 0.2, "y_fov": 0.3},
+        "final_params": {"spacings": np.asarray(params.spacings).tolist()},
+        "eyebox": {"half_x": 4.0, "half_y": 4.0, "nx": 8, "ny": 8},
+    }
+    (tmp_path / "optimization_report.json").write_text(json.dumps(report))
+
+    snapshot = export_perseus_zemax.load_optimizer_report(tmp_path)
+    pivot, tilt_deg = export_perseus_zemax.chassis_pose(snapshot.system)
+    prescription = build_prescription(
+        snapshot.system,
+        chassis_pivot=pivot,
+        chassis_tilt_deg=tilt_deg,
+        sources=[],
+        trace_wavelengths=jnp.array([550.0]) * nm,
+        glass_names={agc_m074.name: zemax_glass_name(agc_m074.name)},
+    )
+
+    assert prescription.object_named("chassis")["data"]["polygon_file"] == (
+        "chassis.POB")
+    vertices = np.asarray([
+        [float(value) for value in line.split()[2:5]]
+        for line in prescription.polygon_files["chassis.POB"].splitlines()
+        if line.startswith("V ")
+    ])
+    assert np.isclose(np.ptp(vertices[:4, 1]), 21.0, atol=1e-3)
+    assert np.allclose(snapshot.projector.position, projector.position, atol=1e-4)
+    assert snapshot.fov_x == 0.2
+    assert snapshot.fov_y == 0.3
+
+
+def test_generated_builder_installs_bundle_pobs_before_creating_model():
+    text = build_script_text()
+    install_call = (
+        "    _install_polygon_files(\n"
+        "        prescription_directory, prescription[\"objects\"], application)")
+
+    assert install_call in text
+    assert text.index(install_call) < text.index("    system.New(False)")
+    assert "filecmp.cmp(source_path, target_path, shallow=False)" in text
+    assert "APOLLO14_ZEMAX_POLYGON_OBJECTS_DIR" in text

@@ -1,10 +1,10 @@
 """Export the optimized Perseus combiner to Zemax OpticStudio for validation.
 
-Takes the pupil optimizer's output (per-mirror ``R(λ)`` and mirror spacings) and,
-when available, the Atlas coating design built from it, and writes a complete
-non-sequential OpticStudio model: polygon objects for the chassis and beam stop,
-a glass catalog for the substrate, a coating file, a prescription, and the two
-ZOS-API scripts that build and trace it on the Windows machine.
+Takes the pupil optimizer's saved system/projector snapshot and, when available,
+the Atlas coating design built from it, and writes a complete non-sequential
+OpticStudio model: polygon objects for the chassis and beam stop, a glass
+catalog for the substrate, a coating file, a prescription, and the two ZOS-API
+scripts that build and trace it on the Windows machine.
 
 The coating file carries **every** fidelity rung side by side — ideal, flat
 ``R(λ)``, Atlas ``R(λ, θ)``, and the physical film stack — under distinct names.
@@ -22,12 +22,14 @@ copy it to the OpticStudio machine and follow its README.
 
 import json
 import shutil
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 
-from apollo14.elements.glass_block import GlassBlock
+from apollo14.elements.aperture import RectangularAperture
+from apollo14.elements.glass_block import GlassBlock, GlassFace
 from apollo14.elements.partial_mirror import PartialMirror
 from apollo14.elements.pupil import RectangularPupil
 from apollo14.export import export_zemax_bundle
@@ -39,18 +41,8 @@ from apollo14.export.coating import (
 )
 from apollo14.export.prescription import SourceSpec
 from apollo14.materials import agc_m074, air
-from apollo14.perseus import (
-    PERSEUS_BEAM_HEIGHT,
-    PERSEUS_BEAM_WIDTH,
-    PERSEUS_COMBINER_CENTER,
-    PERSEUS_FOV_AROUND_PROJECTOR_Y,
-    PERSEUS_FOV_AROUND_X,
-    PERSEUS_LIGHT_POSITION,
-    PERSEUS_PANTOSCOPIC_TILT,
-    PERSEUS_PROJECTOR_DIRECTION,
-    build_perseus_geometry,
-)
 from apollo14.projector import FovGrid, Projector
+from apollo14.spectral import SpectralTable
 from apollo14.system import OpticalSystem
 from apollo14.units import nm
 
@@ -94,6 +86,22 @@ DETECTOR_SCAN_PIXELS = 200
 
 # ── Load the optimizer output ───────────────────────────────────────────────
 
+_MATERIALS_BY_NAME = {air.name: air, agc_m074.name: agc_m074}
+
+
+@dataclass(frozen=True)
+class OptimizerSnapshot:
+    """The exact system and source state persisted by the optimizer."""
+
+    system: OpticalSystem
+    projector: Projector
+    fov_x: float
+    fov_y: float
+    spacings: np.ndarray
+    eyebox: dict
+    git_sha: str
+
+
 def latest_run(root: Path, file_name: str) -> Path:
     candidates = sorted(root.glob(f"*/{file_name}"))
     if not candidates:
@@ -124,27 +132,143 @@ def coating_source_report(coating_dir: Path) -> str:
     return str(design.get("source_report", "")).rstrip("/")
 
 
-def load_optimizer_report(report_dir: Path):
-    """Return ``(mirrors, spacings, eyebox)`` from an optimize_pupil_perseus run.
+def _material_named(name: str):
+    try:
+        return _MATERIALS_BY_NAME[name]
+    except KeyError as error:
+        raise ValueError(
+            f"Optimizer report uses unknown material {name!r}; add it to "
+            "_MATERIALS_BY_NAME before exporting.") from error
 
-    ``mirrors`` is a list of ``(wavelengths_nm, reflectance)`` in mirror order.
-    """
+
+def _spectral_table(data: dict) -> SpectralTable:
+    return SpectralTable.from_samples(data["wavelengths"], data["values"])
+
+
+def _restore_element(data: dict):
+    """Restore one serialized optimizer element without recreating geometry."""
+    common = {
+        "name": data["name"],
+        "position": np.asarray(data["position"], dtype=float),
+    }
+    if data["type"] == "GlassBlock":
+        faces = [
+            GlassFace(
+                name=face["name"],
+                position=np.asarray(face["position"], dtype=float),
+                normal=np.asarray(face["normal"], dtype=float),
+                vertices=np.asarray(face["vertices"], dtype=float),
+                coating_reflectance=_spectral_table(
+                    face["coating_reflectance"]),
+            )
+            for face in data["faces"]
+        ]
+        return GlassBlock(
+            **common,
+            material=_material_named(data["material"]),
+            faces=faces,
+        )
+    if data["type"] == "RectangularAperture":
+        return RectangularAperture(
+            **common,
+            normal=np.asarray(data["normal"], dtype=float),
+            width=float(data["width"]),
+            height=float(data["height"]),
+            inner_width=float(data["inner_width"]),
+            inner_height=float(data["inner_height"]),
+        )
+    if data["type"] == "PartialMirror":
+        return PartialMirror(
+            **common,
+            normal=np.asarray(data["normal"], dtype=float),
+            width=float(data["width"]),
+            height=float(data["height"]),
+            wavelengths=np.asarray(data["wavelengths"], dtype=float),
+            reflectance=np.asarray(data["reflectance"], dtype=float),
+        )
+    if data["type"] == "RectangularPupil":
+        return RectangularPupil(
+            **common,
+            normal=np.asarray(data["normal"], dtype=float),
+            width=float(data["width"]),
+            height=float(data["height"]),
+        )
+    raise ValueError(f"Unsupported optimizer element type {data['type']!r}.")
+
+
+def _restore_system(data: dict) -> OpticalSystem:
+    system = OpticalSystem(env_material=_material_named(data["env_material"]))
+    for element in data["elements"]:
+        system.add(_restore_element(element))
+    return system
+
+
+def _restore_projector(data: dict) -> Projector:
+    spectrum = data.get("spectrum")
+    restored_spectrum = None
+    if spectrum is not None:
+        restored_spectrum = (
+            np.asarray(spectrum["wavelengths"], dtype=float),
+            np.asarray(spectrum["radiance"], dtype=float),
+        )
+    return Projector.uniform(
+        position=np.asarray(data["position"], dtype=float),
+        direction=np.asarray(data["direction"], dtype=float),
+        beam_width=float(data["beam_width"]),
+        beam_height=float(data["beam_height"]),
+        nx=int(data["nx"]),
+        ny=int(data["ny"]),
+        falloff_x=float(data["falloff_x"]),
+        falloff_y=float(data["falloff_y"]),
+        spectrum=restored_spectrum,
+    )
+
+
+def load_optimizer_report(report_dir: Path) -> OptimizerSnapshot:
+    """Restore the geometry, source, and FOV saved by the optimizer."""
     report = json.loads((report_dir / "optimization_report.json").read_text())
+    projectors = report["projectors"]
+    if len(projectors) != 1:
+        raise ValueError(
+            "Perseus Zemax export requires exactly one saved projector, got "
+            f"{len(projectors)}.")
+    return OptimizerSnapshot(
+        system=_restore_system(report["system"]),
+        projector=_restore_projector(projectors[0]),
+        fov_x=float(report["fov_grid"]["x_fov"]),
+        fov_y=float(report["fov_grid"]["y_fov"]),
+        spacings=np.asarray(report["final_params"]["spacings"], dtype=float),
+        eyebox=report["eyebox"],
+        git_sha=str(report["git_sha"]),
+    )
 
-    elements = [element for element in report["system"]["elements"]
-                if element["type"] == "PartialMirror"]
-    elements.sort(key=lambda element: int(element["name"].split("_")[1]))
 
-    mirrors = []
-    for element in elements:
-        wavelengths_nm = np.asarray(element["wavelengths"]) / float(nm)
-        reflectance = np.asarray(element["reflectance"])
+def mirror_samples(system: OpticalSystem) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Return the saved reflectance samples in numeric mirror order."""
+    mirrors = [element for element in system.elements
+               if isinstance(element, PartialMirror)]
+    mirrors.sort(key=lambda element: int(element.name.split("_")[1]))
+    samples = []
+    for mirror in mirrors:
+        wavelengths_nm = np.asarray(mirror.wavelengths) / float(nm)
         order = np.argsort(wavelengths_nm)
-        mirrors.append((wavelengths_nm[order], reflectance[order]))
+        samples.append((wavelengths_nm[order], np.asarray(mirror.reflectance)[order]))
+    return samples
 
-    spacings = np.asarray(report["final_params"]["spacings"], dtype=float)
-    eyebox = report["eyebox"]
-    return mirrors, spacings, eyebox
+
+def chassis_pose(system: OpticalSystem) -> tuple[np.ndarray, float]:
+    """Get the local POB origin and x-tilt from the saved chassis itself."""
+    chassis = next(
+        element for element in system.elements
+        if isinstance(element, GlassBlock) and element.name == "chassis")
+    bottom_normal = np.asarray(chassis.get_face("bottom").normal, dtype=float)
+    if not np.isclose(bottom_normal[0], 0.0, atol=1e-6):
+        raise ValueError(
+            "The Zemax POB exporter supports chassis rotation about world x; "
+            f"saved bottom normal is {bottom_normal.tolist()}.")
+    tilt_deg = float(np.degrees(np.arctan2(
+        bottom_normal[1], -bottom_normal[2])))
+    return np.asarray(chassis.position, dtype=float), tilt_deg
 
 
 def load_detector_axes(report_dir: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -294,28 +418,6 @@ def load_coating_design(coating_dir: Path | None, report_dir: Path):
     return {record["index"]: record["result"] for record in design["mirrors"]}
 
 
-# ── Build the system the optimizer converged on ─────────────────────────────
-
-def build_system(mirrors, spacings) -> OpticalSystem:
-    geometry = build_perseus_geometry(spacings=spacings)
-
-    system = OpticalSystem(env_material=air)
-    system.add(geometry.chassis)
-    system.add(geometry.aperture)
-    for mirror_index, (wavelengths_nm, reflectance) in enumerate(mirrors):
-        system.add(PartialMirror(
-            name=f"mirror_{mirror_index}",
-            position=geometry.mirror_positions[mirror_index],
-            normal=geometry.mirror_normal.copy(),
-            width=geometry.mirror_width,
-            height=geometry.mirror_height,
-            reflectance=reflectance,
-            wavelengths=wavelengths_nm * nm,
-        ))
-    system.add(geometry.pupil)
-    return system
-
-
 # ── Coatings: every rung, named so they can be swapped in OpticStudio ───────
 
 def build_coatings(mirrors, coating_results):
@@ -390,9 +492,9 @@ def select_mirror_face_coatings(names_by_mode, face_modes):
 
 # ── Sources: one per FOV direction ──────────────────────────────────────────
 
-def build_sources(projector: Projector) -> list[SourceSpec]:
-    grid = FovGrid(projector.direction, PERSEUS_FOV_AROUND_X,
-                   PERSEUS_FOV_AROUND_PROJECTOR_Y, NUM_FOV_X, NUM_FOV_Y)
+def build_sources(projector: Projector, fov_x: float,
+                  fov_y: float) -> list[SourceSpec]:
+    grid = FovGrid(projector.direction, fov_x, fov_y, NUM_FOV_X, NUM_FOV_Y)
     angles = np.asarray(grid.flat_angles)
 
     sources = []
@@ -444,11 +546,12 @@ def main():
                     f"falling back to coating source report {source_report}.")
                 report_dir = Path(source_report)
 
-    mirrors, spacings, eyebox = load_optimizer_report(report_dir)
+    snapshot = load_optimizer_report(report_dir)
+    system = snapshot.system
+    mirrors = mirror_samples(system)
     pupil_x_mm, pupil_y_mm = load_detector_axes(report_dir)
     coating_results = load_coating_design(coating_dir, report_dir)
-    system = build_system(mirrors, spacings)
-    eyebox_detector = build_eyebox_detector(system, eyebox)
+    eyebox_detector = build_eyebox_detector(system, snapshot.eyebox)
     ambient_detectors = build_ambient_detectors(system)
     pupil_pitch_x_mm = abs(float(pupil_x_mm[1] - pupil_x_mm[0]))
     pupil_pitch_y_mm = abs(float(pupil_y_mm[1] - pupil_y_mm[0]))
@@ -468,23 +571,18 @@ def main():
         for detector in ambient_detectors
     })
 
-    projector = Projector.uniform(
-        position=PERSEUS_LIGHT_POSITION,
-        direction=PERSEUS_PROJECTOR_DIRECTION,
-        beam_width=PERSEUS_BEAM_WIDTH, beam_height=PERSEUS_BEAM_HEIGHT,
-        nx=1, ny=1)
-
     blocks, coating_names_by_mode, coating_notes = build_coatings(
         mirrors, coating_results)
     face_coatings = select_mirror_face_coatings(
         coating_names_by_mode, MIRROR_FACE_COATING_MODES)
-    sources = build_sources(projector)
+    sources = build_sources(snapshot.projector, snapshot.fov_x, snapshot.fov_y)
+    chassis_origin, chassis_tilt_deg = chassis_pose(system)
 
     print("── Perseus → Zemax OpticStudio ──")
     print(f"optimizer run : {report_dir}")
     print(f"coating run   : {coating_dir or '(none — flat R(λ) only)'}")
     print(f"mirrors       : {len(mirrors)}  spacings "
-          f"{np.round(spacings, 4).tolist()}")
+          f"{np.round(snapshot.spacings, 4).tolist()}")
     print(f"face coatings : {MIRROR_FACE_COATING_MODES}")
     print(f"mirror mode   : {FRONT_FACE_COATING_MODE}  "
           f"({len(coating_results)} Atlas designs available)")
@@ -513,14 +611,14 @@ def main():
     bundle_dir = export_zemax_bundle(
         output_dir,
         system,
-        chassis_pivot=np.asarray(PERSEUS_COMBINER_CENTER, dtype=float),
-        # Perseus applies the pantoscopic tilt as a right-handed rotation by
-        # the negative of the tilt (see apollo14.perseus conventions).
-        chassis_tilt_deg=float(np.degrees(-float(PERSEUS_PANTOSCOPIC_TILT))),
+        chassis_pivot=chassis_origin,
+        chassis_tilt_deg=chassis_tilt_deg,
         sources=sources,
         trace_wavelengths=[wavelength * nm
                            for wavelength in TRACE_WAVELENGTHS_NM],
-        glass_materials=[agc_m074],
+        glass_materials=[next(
+            element.material for element in system.elements
+            if isinstance(element, GlassBlock) and element.name == "chassis")],
         coating_blocks=blocks,
         face_coatings=face_coatings,
         detector_pixels_by_name=detector_pixels_by_name,
@@ -532,6 +630,8 @@ def main():
                f"- face coating modes: `{MIRROR_FACE_COATING_MODES}`\n"
                f"- detector pixels: `{detector_pixels_by_name}`\n"
                f"- optimizer run: `{report_dir}`\n"
+               f"- optimizer git SHA: `{snapshot.git_sha}`\n"
+               "- geometry source: serialized optimizer system snapshot\n"
                f"- coating run: `{coating_dir or 'none'}`\n"),
     )
 
