@@ -103,7 +103,7 @@ TOLERANCE_RANDOM_SEED = 42
 
 # Optimizer budget PER MIRROR. Modest defaults so a full stack runs in minutes;
 # bump for production recipes (BH max_iterations→100+, local_maxiter→500).
-BH_MAX_ITERATIONS = 3
+BH_MAX_ITERATIONS = 400
 BH_LOCAL_MAXITER = 400
 BH_STEPSIZE = 0.2
 BH_TEMPERATURE = 0.01
