@@ -257,7 +257,7 @@ def _seed_layers(glass, seed_thickness_high, seed_thickness_low) -> list:
     for film_idx in range(NUM_SEED_FILMS):
         is_high = film_idx % 2 == 0
         layers.append(Layer(
-            material=Materials.PLD_TiO2 if is_high else Materials.PLD_Al2O3,
+            material=Materials.pld.TiO2 if is_high else Materials.pld.Al2O3,
             thickness=seed_thickness_high if is_high else seed_thickness_low,
             refractive_index=SEED_N_HIGH if is_high else SEED_N_LOW,
             vary_thickness=True, vary_n=True,
