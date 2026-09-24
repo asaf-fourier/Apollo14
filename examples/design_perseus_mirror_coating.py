@@ -89,11 +89,11 @@ TIO2_N_BOUNDS = (2.0, 2.525)        # PLD_TiO2 tunable index range
 AL2O3_N_BOUNDS = (1.47, 1.65)       # PLD_Al2O3 tunable index range
 SEED_N_HIGH = 2.50                  # QWOT seed indices (max Δn)
 SEED_N_LOW = 1.47
-# Manufacturing thickness (height) tolerance is a hard ±2 nm specification.
-# Atlas expresses tolerances as Gaussian 1σ values, so map the hard limit to
-# three sigma for any future robust-optimization or tolerance analysis.
-THICKNESS_TOLERANCE_PLUS_MINUS_NM = 2.0
-ATLAS_THICKNESS_TOLERANCE_SIGMA_NM = THICKNESS_TOLERANCE_PLUS_MINUS_NM / 3.0
+# Manufacturing thickness (height) tolerance is a hard ±1% of each film's
+# nominal thickness. Atlas expresses tolerances as Gaussian 1σ values, so its
+# robust optimizer uses one third of that layer-specific hard limit.
+THICKNESS_TOLERANCE_PLUS_MINUS_FRACTION = 0.01
+ATLAS_TOLERANCE_SIGMA_DIVISOR = 3.0
 N_TOLERANCE = 0.005
 ROBUST_OPTIMIZATION_SAMPLES = 256
 TOLERANCE_VALIDATION_SAMPLES = 4096
@@ -245,6 +245,12 @@ def _sample_curve_for_print(wavelengths_nm, reflectance, num=9):
             for wl in probes]
 
 
+def _atlas_thickness_sigma_nm(thickness_nm: float) -> float:
+    """Atlas Gaussian 1σ corresponding to the hard relative thickness limit."""
+    return (float(thickness_nm) * THICKNESS_TOLERANCE_PLUS_MINUS_FRACTION
+            / ATLAS_TOLERANCE_SIGMA_DIVISOR)
+
+
 def _seed_layers(glass, seed_thickness_high, seed_thickness_low) -> list:
     """A fresh alternating PLD_TiO2 / PLD_Al2O3 seed stack in ``glass``."""
     layers = [Layer(material=glass)]                       # medium = glass
@@ -256,7 +262,8 @@ def _seed_layers(glass, seed_thickness_high, seed_thickness_low) -> list:
             refractive_index=SEED_N_HIGH if is_high else SEED_N_LOW,
             vary_thickness=True, vary_n=True,
             thickness_bounds=THICKNESS_BOUNDS_NM,
-            thickness_tolerance=ATLAS_THICKNESS_TOLERANCE_SIGMA_NM,
+            thickness_tolerance=_atlas_thickness_sigma_nm(
+                seed_thickness_high if is_high else seed_thickness_low),
             n_tolerance=N_TOLERANCE,
             n_bounds=TIO2_N_BOUNDS if is_high else AL2O3_N_BOUNDS,
         ))
@@ -278,7 +285,8 @@ def _seed_moveon_layers(moveon, seed_thickness_high, seed_thickness_low) -> list
             thickness=seed_thickness_high if is_tio2 else seed_thickness_low,
             vary_thickness=True,
             thickness_bounds=THICKNESS_BOUNDS_NM,
-            thickness_tolerance=ATLAS_THICKNESS_TOLERANCE_SIGMA_NM,
+            thickness_tolerance=_atlas_thickness_sigma_nm(
+                seed_thickness_high if is_tio2 else seed_thickness_low),
         ))
     layers.append(Layer(material=moveon.MR10))
 
@@ -324,6 +332,10 @@ def design_mirror(mirror_index, target_wavelengths_nm, target_reflectance,
         stepsize=BH_STEPSIZE, temperature=BH_TEMPERATURE,
         local_maxiter=BH_LOCAL_MAXITER, callback=hop_progress)
 
+    # Rebase the percentage tolerance on the basin result before polishing.
+    # Atlas stores an absolute per-layer sigma rather than a relative tolerance.
+    for layer in result_bh.film_layers:
+        layer.thickness_tolerance = _atlas_thickness_sigma_nm(layer.thickness)
     refined = [result_bh.layers[0], *result_bh.film_layers, result_bh.layers[-1]]
     polished_designer = OpticalDesigner(layers=refined, target=target)
     result_polished = polished_designer.optimize(
@@ -333,6 +345,10 @@ def design_mirror(mirror_index, target_wavelengths_nm, target_reflectance,
     result.selected_stage = "polish" if result is result_polished else "basin_hopping"
     result.basin_merit = float(result_bh.merit)
     result.polish_merit = float(result_polished.merit)
+    # Ensure the exported recipe records ±1% relative to its final thickness,
+    # including when the basin result wins over the polished result.
+    for layer in result.film_layers:
+        layer.thickness_tolerance = _atlas_thickness_sigma_nm(layer.thickness)
     if result is result_bh:
         print(f"    polish merit {result_polished.merit:.4e} is worse than "
               f"basin best {result_bh.merit:.4e}; retaining basin result")
@@ -367,6 +383,9 @@ def _layer_to_dict(layer) -> dict:
     return {
         "material": layer.material.name,
         "thickness_nm": float(layer.thickness),
+        "thickness_tolerance_plus_minus_percent": (
+            100.0 * THICKNESS_TOLERANCE_PLUS_MINUS_FRACTION),
+        "atlas_thickness_sigma_nm": float(layer.thickness_tolerance),
         "refractive_index": (None if layer.refractive_index is None
                              else float(layer.refractive_index)),
         "n": float(nk.real),
@@ -520,9 +539,11 @@ def validate_manufacturing_tolerance(result, *, seed: int) -> dict:
     sampler = qmc.Sobol(d=dimension, scramble=True, seed=seed)
     unit_samples = sampler.random_base2(
         m=int(np.log2(TOLERANCE_VALIDATION_SAMPLES)))
+    thickness_limits_nm = (
+        base_thicknesses * THICKNESS_TOLERANCE_PLUS_MINUS_FRACTION)
     thickness_error = (
         2.0 * unit_samples[:, :num_thicknesses] - 1.0
-    ) * THICKNESS_TOLERANCE_PLUS_MINUS_NM
+    ) * thickness_limits_nm[None, :]
     thickness_samples = base_thicknesses[None, :] + thickness_error
 
     if num_indices:
@@ -571,7 +592,11 @@ def validate_manufacturing_tolerance(result, *, seed: int) -> dict:
         "sampling": "scrambled Sobol",
         "seed": seed,
         "thickness_error_distribution": "uniform bounded",
-        "thickness_plus_minus_nm": THICKNESS_TOLERANCE_PLUS_MINUS_NM,
+        "thickness_plus_minus_fraction": (
+            THICKNESS_TOLERANCE_PLUS_MINUS_FRACTION),
+        "thickness_plus_minus_percent": (
+            100.0 * THICKNESS_TOLERANCE_PLUS_MINUS_FRACTION),
+        "per_layer_thickness_plus_minus_nm": thickness_limits_nm.tolist(),
         "index_error_distribution": "Gaussian",
         "index_sigma": N_TOLERANCE,
         "max_rs_error_limit": TOLERANCE_MAX_RS_ERROR,
@@ -756,8 +781,12 @@ def main():
             },
             "thickness_bounds_nm": list(THICKNESS_BOUNDS_NM),
             "tolerances": {
-                "thickness_plus_minus_nm": THICKNESS_TOLERANCE_PLUS_MINUS_NM,
-                "atlas_thickness_sigma_nm": ATLAS_THICKNESS_TOLERANCE_SIGMA_NM,
+                "thickness_plus_minus_fraction": (
+                    THICKNESS_TOLERANCE_PLUS_MINUS_FRACTION),
+                "thickness_plus_minus_percent": (
+                    100.0 * THICKNESS_TOLERANCE_PLUS_MINUS_FRACTION),
+                "atlas_sigma_definition": (
+                    "one third of 1% of each nominal film thickness"),
                 "n_sigma": N_TOLERANCE,
                 "robust_optimization_samples": ROBUST_OPTIMIZATION_SAMPLES,
                 "validation_samples": TOLERANCE_VALIDATION_SAMPLES,
