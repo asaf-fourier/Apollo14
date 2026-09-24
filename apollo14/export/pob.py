@@ -1,10 +1,11 @@
 """Write Zemax ``.POB`` polygon objects.
 
 A polygon object is an ASCII file listing vertices and the facets built from
-them. It is the natural NSC representation for the two Perseus parts that no
-native object type covers: the sheared glass chassis (a parallelepiped — its
-top face is translated in y relative to the bottom, not tapered) and the
-beam-defining stop (a rectangular frame with a rectangular hole).
+them. It is the natural NSC representation for the Perseus part no native
+object type covers: the sheared glass chassis (a parallelepiped — its top face
+is translated in y relative to the bottom, not tapered). The beam-defining
+stop is exported separately as a native Boolean subtraction of rectangular
+volumes.
 
 File syntax (OpticStudio "Polygon Object")::
 
@@ -33,12 +34,10 @@ from apollo14.export.placement import (
     planar_placement,
     to_local_direction,
     to_local_frame,
-    zemax_plane_axes,
 )
 
 REFRACTIVE = 0
 REFLECTIVE = 1
-ABSORBING = -1
 
 # Vertices closer than this (in mm) are the same corner. The chassis corners
 # are shared by three faces each and arrive as separate copies.
@@ -233,73 +232,6 @@ def _verify_axis_aligned(block, local_normals) -> None:
                 f"{tuple(np.round(unit_normal, 6))}, expected "
                 f"{tuple(target)}. The tilt handed to "
                 "polygon_from_glass_block is probably the wrong sign.")
-
-
-def polygon_from_aperture(aperture) -> tuple[PolygonObject, Placement]:
-    """Convert a :class:`~apollo14.elements.aperture.RectangularAperture`.
-
-    The stop is an opaque frame with a clear opening. It is emitted as four
-    coplanar absorbing rectangles tiling the frame — the opening is simply the
-    hole they leave, so rays through it are untouched, exactly as
-    ``aperture_interact`` treats them. Rays missing the outer frame pass by,
-    which also matches Apollo14: the stop is a finite screen, not an infinite
-    occluder.
-    """
-    outer_half_x, outer_half_y = half_extents_in_zemax_frame(
-        aperture, "aperture outer frame")
-
-    # ``half_extents_in_zemax_frame`` reads .width/.height; build a lightweight
-    # stand-in so the inner opening goes through the identical axis mapping.
-    class _InnerOpening:
-        normal = aperture.normal
-        width = aperture.inner_width
-        height = aperture.inner_height
-        _local_x = aperture._local_x
-
-    inner_half_x, inner_half_y = half_extents_in_zemax_frame(
-        _InnerOpening(), "aperture opening")
-
-    if inner_half_x > outer_half_x or inner_half_y > outer_half_y:
-        raise ValueError(
-            f"Aperture opening ({2 * inner_half_x:.3f} × "
-            f"{2 * inner_half_y:.3f} mm) is not inside its frame "
-            f"({2 * outer_half_x:.3f} × {2 * outer_half_y:.3f} mm).")
-
-    bars = [
-        # (x_low, x_high, y_low, y_high)
-        (-outer_half_x, outer_half_x, inner_half_y, outer_half_y),    # top
-        (-outer_half_x, outer_half_x, -outer_half_y, -inner_half_y),  # bottom
-        (-outer_half_x, -inner_half_x, -inner_half_y, inner_half_y),  # left
-        (inner_half_x, outer_half_x, -inner_half_y, inner_half_y),    # right
-    ]
-    bar_names = ["top bar", "bottom bar", "left bar", "right bar"]
-
-    vertex_groups = []
-    for x_low, x_high, y_low, y_high in bars:
-        vertex_groups.append(np.array([
-            [x_low, y_low, 0.0],
-            [x_high, y_low, 0.0],
-            [x_high, y_high, 0.0],
-            [x_low, y_high, 0.0],
-        ]))
-
-    vertices, numbered_groups = _merge_vertices(vertex_groups)
-    facets = [
-        Facet(vertex_numbers=numbers, is_reflective=ABSORBING,
-              face_number=face_number)
-        for face_number, numbers in enumerate(numbered_groups, start=1)
-    ]
-    face_names = {number: name
-                  for number, name in enumerate(bar_names, start=1)}
-
-    polygon = PolygonObject(vertices=vertices, facets=facets,
-                            face_names=face_names)
-    placement = planar_placement(aperture, "aperture")
-
-    # The bars are laid out in the exported local frame; confirm that frame is
-    # the one the placement produces.
-    zemax_plane_axes(aperture.normal, "aperture")
-    return polygon, placement
 
 
 def polygon_from_partial_mirror(mirror) -> tuple[PolygonObject, Placement]:

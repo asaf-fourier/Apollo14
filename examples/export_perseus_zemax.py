@@ -2,9 +2,10 @@
 
 Takes the pupil optimizer's saved system/projector snapshot and, when available,
 the Atlas coating design built from it, and writes a complete non-sequential
-OpticStudio model: polygon objects for the chassis and beam stop, a glass
-catalog for the substrate, a coating file, a prescription, and the two ZOS-API
-scripts that build and trace it on the Windows machine.
+OpticStudio model: a polygon object for the chassis, a native Boolean
+outer-minus-inner beam stop, a glass catalog for the substrate, a coating file,
+a prescription, and the two ZOS-API scripts that build and trace it on the
+Windows machine.
 
 The coating file carries **every** fidelity rung side by side — ideal, flat
 ``R(λ)``, Atlas ``R(λ, θ)``, and the physical film stack — under distinct names.

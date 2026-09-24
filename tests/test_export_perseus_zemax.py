@@ -1,10 +1,12 @@
 """Regression checks for the Perseus Zemax export example."""
 
 import json
+from types import SimpleNamespace
 
 import jax.numpy as jnp
 import numpy as np
 
+from apollo14.elements.aperture import RectangularAperture
 from apollo14.elements.glass_block import GlassBlock
 from apollo14.elements.pupil import RectangularPupil
 from apollo14.export.bundle import (
@@ -12,8 +14,10 @@ from apollo14.export.bundle import (
     _clone_system_with_extra_pupils,
     _display_coating,
     _readme_header,
+    _readme_objects,
     zemax_glass_name,
 )
+from apollo14.export.placement import half_extents_in_zemax_frame, planar_placement
 from apollo14.export.prescription import build_prescription
 from apollo14.export.zosapi_script import build_script_text, sweep_script_text
 from apollo14.materials import agc_m074
@@ -22,6 +26,7 @@ from apollo14.perseus import (
     PERSEUS_PANTOSCOPIC_TILT,
 )
 from apollo14.projector import Projector
+from apollo14.system import OpticalSystem
 from apollo14.units import deg, nm
 from examples import export_perseus_zemax
 from helios.combiner_params import CombinerParams
@@ -164,6 +169,74 @@ def test_partial_mirrors_inherit_the_chassis_material_name():
     ]
     assert mirror_materials
     assert set(mirror_materials) == {zemax_glass_name(agc_m074.name)}
+
+
+def test_aperture_exports_as_native_boolean_outer_minus_inner():
+    aperture = RectangularAperture(
+        name="aperture",
+        position=jnp.array([7.0, 35.159, 0.187]),
+        normal=jnp.array([0.0, -0.9981, -0.0624]),
+        width=14.0,
+        height=6.0,
+        inner_width=11.0,
+        inner_height=2.0,
+    )
+    prescription = build_prescription(
+        OpticalSystem(elements=[aperture]),
+        chassis_pivot=jnp.zeros(3),
+        chassis_tilt_deg=0.0,
+        sources=[],
+        trace_wavelengths=jnp.array([550.0]) * nm,
+        glass_names={},
+    )
+
+    outer = prescription.object_named("aperture outer (A)")
+    inner = prescription.object_named("aperture inner (B)")
+    boolean = prescription.object_named("aperture")
+    expected_outer = half_extents_in_zemax_frame(aperture, "outer")
+    opening = SimpleNamespace(
+        normal=aperture.normal,
+        width=aperture.inner_width,
+        height=aperture.inner_height,
+        _local_x=aperture._local_x,
+    )
+    expected_inner = half_extents_in_zemax_frame(opening, "opening")
+    expected_placement = planar_placement(aperture, aperture.name)
+
+    assert [outer["index"], inner["index"], boolean["index"]] == [1, 2, 3]
+    assert outer["type"] == inner["type"] == "rectangular_volume"
+    assert boolean["type"] == "boolean_native"
+    assert boolean["comment"] == "A-B"
+    assert boolean["material"] == "ABSORB"
+    assert boolean["data"] == {"object_a": outer["index"],
+                               "object_b": inner["index"]}
+    assert outer["position"] == inner["position"] == [0.0, 0.0, 0.0]
+    assert outer["tilt_deg"] == inner["tilt_deg"] == [0.0, 0.0, 0.0]
+    assert outer["ignore_rays"] is inner["ignore_rays"] is True
+    assert outer["do_not_draw"] is inner["do_not_draw"] is True
+    assert np.allclose(
+        [outer["data"]["x1_half_width"], outer["data"]["y1_half_width"]],
+        expected_outer)
+    assert np.allclose(
+        [inner["data"]["x1_half_width"], inner["data"]["y1_half_width"]],
+        expected_inner)
+    assert outer["data"]["z_length"] == inner["data"]["z_length"] > 0.0
+    assert np.allclose(boolean["position"], expected_placement.position)
+    assert np.allclose(boolean["tilt_deg"], expected_placement.tilt_deg)
+    assert "aperture.POB" not in prescription.polygon_files
+    assert "`aperture` aperture is the `A-B` Boolean Native row" in _readme_objects(
+        prescription)
+
+
+def test_generated_build_script_supports_boolean_native_apertures():
+    text = build_script_text()
+
+    assert '"boolean_native": ["BooleanNative", "Boolean Native"]' in text
+    assert 'nce_types.RaysIgnoreObjectType, ["Always"]' in text
+    assert '["RaysIgnoreObject"]' in text
+    assert '["DoNotDrawObject"]' in text
+    assert '["ObjectA"]' in text
+    assert '["ObjectB"]' in text
 
 
 def test_generated_sweep_script_handles_multiple_detectors():

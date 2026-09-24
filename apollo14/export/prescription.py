@@ -7,9 +7,14 @@ that could silently be wrong lives here, is computed on this side, and is
 checked by ``tests/test_zemax_export.py``. The generated ZOS-API script is then
 a thin, dumb reader of this document.
 
+A framed :class:`~apollo14.elements.aperture.RectangularAperture` occupies
+three NSC rows: hidden outer and inner ``Rectangular Volume`` parents followed
+by an absorbing ``Boolean Native`` result with the control string ``A-B``.
+
 Object order in the document is the order objects are inserted into the
 non-sequential component editor, and ``inside_of`` references are 1-based
-indices into that order — matching the editor's own numbering.
+indices into that order — matching the editor's own numbering. Boolean Native
+parent references use those same 1-based indices.
 """
 
 from dataclasses import dataclass, field
@@ -29,7 +34,6 @@ from apollo14.export.placement import (
 )
 from apollo14.export.pob import (
     format_polygon_object,
-    polygon_from_aperture,
     polygon_from_glass_block,
 )
 from apollo14.units import nm
@@ -43,6 +47,9 @@ DEFAULT_MAX_NESTED_TOUCHING_OBJECTS = 100
 DEFAULT_MIN_RELATIVE_INTENSITY = 1e-5
 DEFAULT_MIN_ABSOLUTE_INTENSITY = 1e-5
 PARTIAL_MIRROR_THICKNESS_MM = 0.001
+# Boolean Native operates on solid parents. One micrometre is effectively a
+# plane for this model while still giving the aperture a well-defined volume.
+APERTURE_BOOLEAN_THICKNESS_MM = 0.001
 
 
 class SourceSpec(NamedTuple):
@@ -78,12 +85,17 @@ class Prescription:
     def objects(self) -> list[dict]:
         return self.document["objects"]
 
-    def object_named(self, comment: str) -> dict:
+    def object_named(self, name: str) -> dict:
+        """Return an object by its NSC comment or exported human-facing label."""
         for entry in self.objects:
-            if entry["comment"] == comment:
+            if name in (entry["comment"], entry.get("label")):
                 return entry
-        available = [entry["comment"] for entry in self.objects]
-        raise KeyError(f"No exported object {comment!r}. Available: {available}")
+        available = [
+            entry["comment"] if entry.get("label") is None
+            else f"{entry['label']} ({entry['comment']})"
+            for entry in self.objects
+        ]
+        raise KeyError(f"No exported object {name!r}. Available: {available}")
 
 
 def build_prescription(
@@ -145,21 +157,22 @@ def build_prescription(
                 face_coatings)
             polygon_files[file_name] = polygon_text
             block_indices[element.name] = len(objects) + 1
+            entries = [entry]
         elif isinstance(element, RectangularAperture):
-            entry, polygon_text, file_name = _export_aperture(element)
-            polygon_files[file_name] = polygon_text
+            entries = _export_aperture(element, first_index=len(objects) + 1)
         elif isinstance(element, PartialMirror):
-            entry = _export_partial_mirror(
-                element, coating_names, face_coatings, chassis_material_name)
+            entries = [_export_partial_mirror(
+                element, coating_names, face_coatings, chassis_material_name)]
         elif isinstance(element, RectangularPupil):
-            entry = _export_pupil(element, detector_pixels)
+            entries = [_export_pupil(element, detector_pixels)]
         else:
             raise TypeError(
                 f"No Zemax export for element type {type(element).__name__!r} "
                 f"({getattr(element, 'name', '?')}).")
 
-        entry["index"] = len(objects) + 1
-        objects.append(entry)
+        for entry in entries:
+            entry["index"] = len(objects) + 1
+            objects.append(entry)
 
     _assign_mirrors_inside_chassis(system, objects, block_indices)
 
@@ -238,23 +251,92 @@ def _export_glass_block(block, pivot, tilt_deg, glass_names, face_coatings):
     return entry, polygon_text, file_name
 
 
-def _export_aperture(aperture):
-    polygon, placement = polygon_from_aperture(aperture)
-    file_name = f"{aperture.name}.POB"
-    polygon_text = format_polygon_object(
-        polygon, f"Apollo14 {aperture.name} — absorbing beam stop")
+def _export_aperture(aperture, *, first_index: int) -> list[dict]:
+    """Export a framed aperture as an absorbing Boolean Native subtraction.
 
-    entry = {
-        "type": "polygon",
-        "comment": aperture.name,
-        "position": [float(v) for v in placement.position],
-        "tilt_deg": [float(v) for v in placement.tilt_deg],
+    ``RectangularAperture`` is a planar outer rectangle with a clear inner
+    rectangle. OpticStudio's Boolean Native object needs volumetric parents, so
+    the first two NSC rows are thin rectangular volumes and the third row is
+    ``A-B``. The Boolean object's local axes come from parent A; its own row
+    carries the optimized world placement. Keeping both parents at the global
+    origin with identity tilts makes their local frames coincide and keeps them
+    out of the optical layout once they are hidden.
+    """
+    outer_half_x, outer_half_y = half_extents_in_zemax_frame(
+        aperture, f"{aperture.name} outer frame")
+
+    # ``half_extents_in_zemax_frame`` reads .width/.height. Give it the same
+    # local-frame information with the opening's dimensions so its axis mapping
+    # stays identical to the outer frame's mapping.
+    class _InnerOpening:
+        normal = aperture.normal
+        width = aperture.inner_width
+        height = aperture.inner_height
+        _local_x = aperture._local_x
+
+    inner_half_x, inner_half_y = half_extents_in_zemax_frame(
+        _InnerOpening(), f"{aperture.name} opening")
+    if inner_half_x > outer_half_x or inner_half_y > outer_half_y:
+        raise ValueError(
+            f"Aperture opening ({2 * inner_half_x:.3f} × "
+            f"{2 * inner_half_y:.3f} mm) is not inside its frame "
+            f"({2 * outer_half_x:.3f} × {2 * outer_half_y:.3f} mm).")
+
+    parent_common = {
+        "type": "rectangular_volume",
+        "position": [0.0, 0.0, 0.0],
+        "tilt_deg": [0.0, 0.0, 0.0],
         "material": "",
         "inside_of": 0,
-        "data": {"polygon_file": file_name},
-        "face_coatings": {},
+        # A Boolean Native references its parents but they must not also trace
+        # as standalone volumes or appear in the 3D layout.
+        "ignore_rays": True,
+        "do_not_draw": True,
     }
-    return entry, polygon_text, file_name
+    outer_entry = {
+        **parent_common,
+        "comment": f"{aperture.name} outer (A)",
+        "face_coatings": {},
+        "data": {
+            "x1_half_width": outer_half_x,
+            "y1_half_width": outer_half_y,
+            "z_length": APERTURE_BOOLEAN_THICKNESS_MM,
+            "x2_half_width": outer_half_x,
+            "y2_half_width": outer_half_y,
+        },
+    }
+    inner_entry = {
+        **parent_common,
+        "comment": f"{aperture.name} inner (B)",
+        "face_coatings": {},
+        "data": {
+            "x1_half_width": inner_half_x,
+            "y1_half_width": inner_half_y,
+            "z_length": APERTURE_BOOLEAN_THICKNESS_MM,
+            "x2_half_width": inner_half_x,
+            "y2_half_width": inner_half_y,
+        },
+    }
+
+    placement = planar_placement(aperture, aperture.name)
+    boolean_entry = {
+        "type": "boolean_native",
+        # The NSC Boolean Native parses its Comment field as the control
+        # string, so this cannot be replaced by a human-readable object name.
+        "comment": "A-B",
+        "label": aperture.name,
+        "position": [float(v) for v in placement.position],
+        "tilt_deg": [float(v) for v in placement.tilt_deg],
+        "material": "ABSORB",
+        "inside_of": 0,
+        "data": {
+            "object_a": first_index,
+            "object_b": first_index + 1,
+        },
+        "face_coatings": {},
+        **_frame_record(aperture),
+    }
+    return [outer_entry, inner_entry, boolean_entry]
 
 
 def _export_partial_mirror(

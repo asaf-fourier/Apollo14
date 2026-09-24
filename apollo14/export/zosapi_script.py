@@ -693,6 +693,7 @@ OBJECT_TYPE_CANDIDATES = {
     "rectangle": ["Rectangle"],
     "rectangular_volume": ["RectangularVolume", "VolumeRectangle",
                             "Rectangular Volume"],
+    "boolean_native": ["BooleanNative", "Boolean Native"],
     "detector_rectangle": ["DetectorRectangle", "DetectorRect"],
     "source_two_angle": ["SourceTwoAngle", "SourceTwoAngles"],
 }
@@ -1280,7 +1281,7 @@ def _apply_object(ZOSAPI, nce_types, nce_object, entry, base_directory):
             f"{comment}: type data", getattr(nce_object, "TypeData", None))
 
     _apply_object_pose(nce_object, entry, comment)
-    _apply_object_metadata(nce_object, object_data, entry, comment)
+    _apply_object_metadata(nce_types, nce_object, object_data, entry, comment)
     _apply_object_coatings(nce_object, entry, comment)
 
 
@@ -1329,8 +1330,8 @@ def _apply_object_pose(nce_object, entry, comment):
         ))
 
 
-def _apply_object_metadata(nce_object, object_data, entry, comment):
-    """Apply material, inside-of, and type-specific data fields."""
+def _apply_object_metadata(nce_types, nce_object, object_data, entry, comment):
+    """Apply material, visibility, and type-specific data fields."""
     if entry.get("material"):
         configure(f"{comment}: material {entry['material']}",
                   lambda: setattr(nce_object, "Material", entry["material"]))
@@ -1343,6 +1344,28 @@ def _apply_object_metadata(nce_object, object_data, entry, comment):
     data = entry.get("data", {})
     targets = [object_data, nce_object] if object_data is not None else [nce_object]
     _apply_object_data(targets, entry["type"], data, comment)
+    _apply_object_visibility_and_ray_behavior(nce_types, nce_object, entry,
+                                              comment)
+
+
+def _apply_object_visibility_and_ray_behavior(nce_types, nce_object, entry,
+                                              comment):
+    """Apply the Boolean-parent hiding and ray-ignore flags when requested."""
+    if entry.get("ignore_rays"):
+        def ignore_rays():
+            always = resolve_enum(
+                nce_types.RaysIgnoreObjectType, ["Always"],
+                f"rays-ignore policy for {comment}")
+            set_first_available(
+                [nce_object], ["RaysIgnoreObject"], always,
+                f"{comment}: rays-ignore object")
+
+        configure(f"{comment}: rays-ignore Always", ignore_rays)
+
+    if entry.get("do_not_draw"):
+        set_first_available(
+            [nce_object], ["DoNotDrawObject"], True,
+            f"{comment}: do not draw object")
 
 
 def _apply_object_coatings(nce_object, entry, comment):
@@ -1370,6 +1393,9 @@ def _apply_object_data(targets, object_type, data, comment):
 
     if object_type == "rectangular_volume":
         _apply_rectangular_volume_dimensions(targets, data, comment)
+
+    if object_type == "boolean_native":
+        _apply_boolean_native_operands(targets, data, comment)
 
     if object_type == "detector_rectangle":
         _apply_detector_pixels(targets, data, comment)
@@ -1411,6 +1437,14 @@ def _apply_rectangular_volume_dimensions(targets, data, comment):
                         ["Y2HalfWidth", "Y2HalfWidth1", "YHalfWidth2",
                          "HalfWidthY2", "Y2HalfWidth_mm"],
                         data["y2_half_width"], f"{comment}: Y2 half width")
+
+
+def _apply_boolean_native_operands(targets, data, comment):
+    """Point a Boolean Native row at its preceding A and B parent objects."""
+    set_first_available(targets, ["ObjectA"], int(data["object_a"]),
+                        f"{comment}: Boolean Native object A")
+    set_first_available(targets, ["ObjectB"], int(data["object_b"]),
+                        f"{comment}: Boolean Native object B")
 
 
 def _apply_detector_pixels(targets, data, comment):

@@ -4,7 +4,7 @@ One call writes everything OpticStudio needs plus the two scripts that drive it:
 
 ===========================  =================================================
 ``prescription.json``        every object, placement and setting
-``*.POB``                    polygon objects (chassis, beam stop)
+``*.POB``                    polygon object (chassis)
 ``<catalog>.AGF``            glass catalog for the substrate
 ``<coatings>.DAT``           coating definitions for the mirror stack
 ``build_zemax_model.py``     ZOS-API script that constructs the ``.ZMX``
@@ -274,9 +274,10 @@ def _readme_header(notes):
         "ray tracing regardless of tier. Only a legacy pre-2023-R1 *Standard* licence —",
         "sequential-only — cannot run this model at all.",
         "",
-        "Nothing here needs a Premium-only feature: the chassis and stop are native",
-        "polygon objects rather than imported CAD parts, the sources are analytic rather",
-        "than measured rayfiles, and the sweep script disables scattering.",
+        "Nothing here needs a Premium-only feature: the chassis is a native polygon",
+        "object and the stop is a native Boolean object rather than an imported CAD part;",
+        "the sources are analytic rather than measured rayfiles, and the sweep script",
+        "disables scattering.",
         "",
         "The build script starts a standalone OpticStudio session. It will not close",
         "a session it did not start.",
@@ -319,13 +320,31 @@ def _readme_install(glass_catalog, coating_file):
 
 
 def _readme_objects(prescription):
-    return "\n".join([
+    lines = [
         "## Objects",
         "",
         "| # | type | comment | material | inside of | coating |",
         "|---|------|---------|----------|-----------|---------|",
         _object_rows(prescription),
-    ])
+    ]
+    object_comments = {
+        entry["index"]: entry["comment"] for entry in prescription.objects
+    }
+    for entry in prescription.objects:
+        if entry["type"] != "boolean_native":
+            continue
+        parent_a = object_comments[entry["data"]["object_a"]]
+        parent_b = object_comments[entry["data"]["object_b"]]
+        label = entry.get("label", entry["comment"])
+        lines.extend([
+            "",
+            f"The `{label}` aperture is the `{entry['comment']}` Boolean Native row. "
+            "Its Object A",
+            f"and Object B fields point to the hidden, ray-ignored `{parent_a}` and",
+            f"`{parent_b}` rectangular-volume parent rows. The Boolean row carries the",
+            "physical position and tilt; its parents are local shape inputs at the origin.",
+        ])
+    return "\n".join(lines)
 
 
 def _readme_glass(fits, glass_names):
