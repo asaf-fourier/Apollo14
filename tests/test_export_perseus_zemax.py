@@ -171,6 +171,39 @@ def test_partial_mirrors_inherit_the_chassis_material_name():
     assert set(mirror_materials) == {zemax_glass_name(agc_m074.name)}
 
 
+def test_chassis_all_faces_get_ideal_export_coatings():
+    system = build_parametrized_perseus(
+        CombinerParams.initial(),
+        probe_wavelengths=jnp.array([550.0]) * nm,
+    )
+    chassis = next(
+        element for element in system.elements
+        if isinstance(element, GlassBlock) and element.name == "chassis")
+    coating_blocks, face_coatings = export_perseus_zemax.build_chassis_ideal_coatings(
+        chassis)
+    prescription = build_prescription(
+        system,
+        chassis_pivot=PERSEUS_COMBINER_CENTER,
+        chassis_tilt_deg=float(-PERSEUS_PANTOSCOPIC_TILT / deg),
+        sources=[],
+        trace_wavelengths=jnp.array([550.0]) * nm,
+        glass_names={agc_m074.name: zemax_glass_name(agc_m074.name)},
+        face_coatings=face_coatings,
+    )
+
+    expected_name = "I.995"
+    assert [(block.name, block.definition) for block in coating_blocks] == [
+        (expected_name, f"COAT {expected_name}")]
+    assert face_coatings == {
+        ("chassis", face.name): expected_name
+        for face in chassis.faces
+    }
+    assert prescription.object_named("chassis")["face_coatings"] == {
+        str(face_number): expected_name
+        for face_number, face in enumerate(chassis.faces, start=1)
+    }
+
+
 def test_aperture_exports_as_native_boolean_outer_minus_inner():
     aperture = RectangularAperture(
         name="aperture",

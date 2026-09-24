@@ -39,6 +39,7 @@ from apollo14.export.coating import (
     ideal_coating,
     stack_coating,
     table_coating,
+    zemax_builtin_ideal_coating,
 )
 from apollo14.export.prescription import SourceSpec
 from apollo14.materials import agc_m074, air
@@ -421,6 +422,9 @@ def load_coating_design(coating_dir: Path | None, report_dir: Path):
 
 # ── Coatings: every rung, named so they can be swapped in OpticStudio ───────
 
+IDEAL_COATING_REFERENCE_WAVELENGTH_NM = 550.0
+
+
 def build_coatings(mirrors, coating_results):
     """Return coating blocks and names for all four rungs."""
     blocks = []
@@ -428,13 +432,12 @@ def build_coatings(mirrors, coating_results):
         "ideal": {}, "flat": {}, "atlas": {}, "stack": {}}
     notes = []
 
-    reference_wavelength_nm = 550.0
-
     for mirror_index, (wavelengths_nm, reflectance) in enumerate(mirrors):
         element_name = f"mirror_{mirror_index}"
 
         reference_reflectance = float(
-            np.interp(reference_wavelength_nm, wavelengths_nm, reflectance))
+            np.interp(IDEAL_COATING_REFERENCE_WAVELENGTH_NM,
+                      wavelengths_nm, reflectance))
         ideal_name = f"IDEAL_M{mirror_index}"
         blocks.append(ideal_coating(ideal_name, reference_reflectance))
         names_by_mode["ideal"][element_name] = ideal_name
@@ -472,6 +475,30 @@ def build_coatings(mirrors, coating_results):
         names_by_mode["stack"][element_name] = stack_name
 
     return blocks, names_by_mode, notes
+
+
+def build_chassis_ideal_coatings(chassis: GlassBlock):
+    """Apply OpticStudio's native ideal AR coating to every chassis face.
+
+    Each face uses the optimizer's reflectance at the common Ideal reference
+    wavelength.  Faces with the same value share one native ``COAT I.xxx``
+    entry in the bundle's active coating file, so it resolves in Zemax without
+    custom ``IDEAL_CHASSIS_*`` records.
+    """
+    blocks_by_name = {}
+    face_coatings = {}
+    for face in chassis.faces:
+        wavelengths_nm = (
+            np.asarray(face.coating_reflectance.wavelengths, dtype=float)
+            / float(nm))
+        reflectance = np.asarray(face.coating_reflectance.values, dtype=float)
+        reference_reflectance = float(np.interp(
+            IDEAL_COATING_REFERENCE_WAVELENGTH_NM,
+            wavelengths_nm, reflectance))
+        block = zemax_builtin_ideal_coating(1.0 - reference_reflectance)
+        blocks_by_name.setdefault(block.name, block)
+        face_coatings[(chassis.name, face.name)] = block.name
+    return list(blocks_by_name.values()), face_coatings
 
 
 def select_mirror_face_coatings(names_by_mode, face_modes):
@@ -550,6 +577,9 @@ def main():
     snapshot = load_optimizer_report(report_dir)
     system = snapshot.system
     mirrors = mirror_samples(system)
+    chassis = next(
+        element for element in system.elements
+        if isinstance(element, GlassBlock) and element.name == "chassis")
     pupil_x_mm, pupil_y_mm = load_detector_axes(report_dir)
     coating_results = load_coating_design(coating_dir, report_dir)
     eyebox_detector = build_eyebox_detector(system, snapshot.eyebox)
@@ -574,8 +604,12 @@ def main():
 
     blocks, coating_names_by_mode, coating_notes = build_coatings(
         mirrors, coating_results)
+    chassis_coating_blocks, chassis_face_coatings = build_chassis_ideal_coatings(
+        chassis)
+    blocks.extend(chassis_coating_blocks)
     face_coatings = select_mirror_face_coatings(
         coating_names_by_mode, MIRROR_FACE_COATING_MODES)
+    face_coatings.update(chassis_face_coatings)
     sources = build_sources(snapshot.projector, snapshot.fov_x, snapshot.fov_y)
     chassis_origin, chassis_tilt_deg = chassis_pose(system)
 
@@ -585,16 +619,15 @@ def main():
     print(f"mirrors       : {len(mirrors)}  spacings "
           f"{np.round(snapshot.spacings, 4).tolist()}")
     print(f"face coatings : {MIRROR_FACE_COATING_MODES}")
+    print("chassis coats : "
+          f"{', '.join(chassis_face_coatings.values())}")
     print(f"mirror mode   : {FRONT_FACE_COATING_MODE}  "
           f"({len(coating_results)} Atlas designs available)")
     print("ambient dets  : "
           f"{', '.join(detector.name for detector in ambient_detectors)}")
     for note in coating_notes:
         print(f"  ! {note}")
-    chassis_material_name = next(
-        element.material.name
-        for element in system.elements
-        if isinstance(element, GlassBlock) and element.name == "chassis")
+    chassis_material_name = chassis.material.name
     for mirror_index in range(len(mirrors)):
         mirror_name = f"mirror_{mirror_index}"
         selected_coating = face_coatings.get((mirror_name, "front"))
@@ -629,6 +662,7 @@ def main():
         notes=(f"Perseus combiner, {len(mirrors)} mirrors, mirror face mode "
                f"`{FRONT_FACE_COATING_MODE}`.\n\n"
                f"- face coating modes: `{MIRROR_FACE_COATING_MODES}`\n"
+               f"- chassis face coatings: `{chassis_face_coatings}`\n"
                f"- detector pixels: `{detector_pixels_by_name}`\n"
                f"- optimizer run: `{report_dir}`\n"
                f"- optimizer git SHA: `{snapshot.git_sha}`\n"

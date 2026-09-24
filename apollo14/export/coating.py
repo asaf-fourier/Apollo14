@@ -33,6 +33,8 @@ File syntax (OpticStudio coating file)::
 
     IDEAL <name> <transmitted intensity> <reflected intensity>
 
+    COAT I.<transmission>
+
     TABLE <name>
     ANGL <degrees>
     WAVE <µm> <Rs> <Rp> <Ts> <Tp>
@@ -94,6 +96,33 @@ def ideal_coating(name: str, reflectance: float) -> CoatingBlock:
     transmitted = 1.0 - reflected
     definition = (f"IDEAL {name} {transmitted:.6f} {reflected:.6f}")
     return CoatingBlock(name=name, definition=definition,
+                        material_definitions={})
+
+
+def zemax_builtin_ideal_coating(transmission: float) -> CoatingBlock:
+    """Register an OpticStudio native ideal coating by transmitted intensity.
+
+    For example, ``COAT I.995`` is OpticStudio's built-in ideal coating with
+    99.5% transmission and 0.5% reflection.  The short form still belongs in
+    the active coating file, which lets an exported bundle use it alongside
+    its custom mirror-coating definitions.
+    """
+    transmission = float(transmission)
+    if not 0.0 <= transmission <= 1.0:
+        raise ValueError(
+            "A Zemax built-in ideal coating transmission must be between "
+            f"zero and one, got {transmission!r}.")
+
+    # OpticStudio omits the leading zero: 0.995 → I.995.  Match the six-digit
+    # precision used by ``ideal_coating`` so two records with the same emitted
+    # Ideal model receive the same catalog name.
+    scaled = round(transmission * 1_000_000)
+    if scaled == 1_000_000:
+        suffix = "100"
+    else:
+        suffix = f"{scaled:06d}".rstrip("0") or "0"
+    name = f"I.{suffix}"
+    return CoatingBlock(name=name, definition=f"COAT {name}",
                         material_definitions={})
 
 
