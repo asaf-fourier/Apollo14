@@ -76,7 +76,7 @@ PERSEUS_PRISM_ANGLE = 10.578 * deg           # top-side wedge (chassis z-skew)
 PERSEUS_MIRROR_NORMAL_ANGLE = (90.0 - 50.289) * deg
 # The combiner is manufactured from 0.75 mm wafers cut at the mirror angle.
 # Projecting the wafer-normal pitch onto world y gives the mirror-center gap.
-PERSEUS_WAFER_THICKNESS = 0.75 * mm
+PERSEUS_WAFER_THICKNESS = 1 * mm
 PERSEUS_WAFER_ANGLE = 39.7 * deg
 PERSEUS_MIRROR_Y_SPACING = (
     PERSEUS_WAFER_THICKNESS / math.sin(float(PERSEUS_WAFER_ANGLE)))
