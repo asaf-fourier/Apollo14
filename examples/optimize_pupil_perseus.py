@@ -398,7 +398,7 @@ def _clip(params: CombinerParams) -> CombinerParams:
 
 # ── Adam optimizer ──────────────────────────────────────────────────────────
 
-PHASE1_STEPS = 50
+PHASE1_STEPS = 150
 PHASE2_STEPS = 100
 
 adam_cfg_phase1 = AdamConfig(peak_lr=3e-3, warmup_steps=20, num_steps=PHASE1_STEPS)
