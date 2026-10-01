@@ -30,6 +30,7 @@ import math
 from typing import NamedTuple
 
 import jax.numpy as jnp
+from atlas import Material
 
 from apollo14.combiner import compensated_reflectances
 from apollo14.elements.aperture import RectangularAperture
@@ -163,6 +164,7 @@ class PerseusGeometry(NamedTuple):
     light_position: jnp.ndarray     # (3,) projector location
     light_direction: jnp.ndarray    # (3,) tilted beam axis
     pupil_center: jnp.ndarray       # (3,) pupil center
+    glass_material: Material
 
 
 def build_perseus_geometry(
@@ -190,6 +192,7 @@ def build_perseus_geometry(
     pantoscopic_tilt: float = PERSEUS_PANTOSCOPIC_TILT,
     projector_tilt: float = PERSEUS_PROJECTOR_TILT,
     ar_reflectance: SpectralTable = PERSEUS_AR_REFLECTANCE,
+    glass_material: Material = agc_m074,
 ) -> PerseusGeometry:
     """Place every Perseus element, reproducing the visualization exactly.
 
@@ -243,7 +246,7 @@ def build_perseus_geometry(
                       + jnp.array([0.0, projector_glass_length / 2.0, 0.0]))
     chassis = GlassBlock.create_chassis(
         name="chassis", x=float(combiner_width), y=chassis_height,
-        z=float(chassis_z), material=agc_m074, z_skew=z_skew,
+        z=float(chassis_z), material=glass_material, z_skew=z_skew,
         coating_reflectance=ar_reflectance,
     ).translate(chassis_center)
 
@@ -285,12 +288,13 @@ def build_perseus_geometry(
         mirror_positions=mirror_positions, mirror_normal=mirror_normal,
         mirror_width=mirror_width, mirror_height=mirror_height,
         light_position=light_position, light_direction=light_direction,
-        pupil_center=pupil_center,
+        pupil_center=pupil_center, glass_material=glass_material,
     )
 
 
 def build_perseus_system(
     *,
+    glass_material: Material,
     num_mirrors: int = PERSEUS_NUM_MIRRORS,
     stack_span: float | None = None,
     base_ratio: float = PERSEUS_BASE_RATIO,
@@ -301,6 +305,7 @@ def build_perseus_system(
 ) -> OpticalSystem:
     """Build the Perseus reference system with baked flat reflectances.
 
+    ``glass_material`` explicitly selects the Atlas chassis material.
     Mirror-center gaps follow the manufactured wafer pitch unless an explicit
     ``stack_span`` is supplied (see :func:`spacings_for_count`). Each mirror
     gets a wavelength-flat,
@@ -310,7 +315,7 @@ def build_perseus_system(
     geometry = build_perseus_geometry(
         spacings=spacings_for_count(num_mirrors, stack_span),
         pantoscopic_tilt=pantoscopic_tilt, projector_tilt=projector_tilt,
-        chassis_z=chassis_z, **geometry_kwargs)
+        chassis_z=chassis_z, glass_material=glass_material, **geometry_kwargs)
 
     reflectance_table = compensated_reflectances(
         jnp.full_like(DEFAULT_MIRROR_WAVELENGTHS, base_ratio), num_mirrors)

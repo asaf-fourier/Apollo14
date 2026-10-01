@@ -11,7 +11,7 @@ into one ``MirrorStackSeg`` so the hot loop runs under ``lax.scan``
 instead of unrolling per-mirror.
 
 Wavelength is baked into ``FaceSeg.n1``/``n2`` by ``prepare_route`` —
-routes returned by ``build_route`` still hold ``MaterialData`` there,
+routes returned by ``build_route`` still hold Atlas materials there,
 which lets the same route be prepared at many wavelengths.
 
 Typical usage::
@@ -264,7 +264,7 @@ def build_route(system: OpticalSystem, path: Sequence[PathEntry]) -> Route:
     path crosses the face.
 
     **No wavelength resolution.** ``FaceSeg.n1``/``n2`` are still
-    ``MaterialData`` after ``build_route`` — resolving them to scalars
+    Atlas materials after ``build_route`` — resolving them to scalars
     happens later in ``prepare_route(route, wavelength)``. This lets the
     same route be prepared for many wavelengths without rebuilding.
 

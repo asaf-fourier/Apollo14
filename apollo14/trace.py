@@ -26,7 +26,7 @@ from apollo14.elements.partial_mirror import (
     mirror_transmit_one,
 )
 from apollo14.elements.pupil import PupilSeg, pupil_interact
-from apollo14.materials import MaterialData
+from apollo14.materials import refractive_index
 from apollo14.ray import Ray
 from apollo14.route import Route
 
@@ -46,10 +46,6 @@ class TraceResult(NamedTuple):
 
 # ── Route preparation ────────────────────────────────────────────────────────
 
-def _interp_n(mat: MaterialData, wavelength):
-    return jnp.interp(wavelength, mat.wavelengths, mat.n_values)
-
-
 def _resolve_face(seg: FaceSeg, wavelength) -> PreparedFaceSeg:
     return PreparedFaceSeg(
         position=seg.position,
@@ -57,8 +53,8 @@ def _resolve_face(seg: FaceSeg, wavelength) -> PreparedFaceSeg:
         local_x=seg.local_x,
         local_y=seg.local_y,
         half_extents=seg.half_extents,
-        n1=_interp_n(seg.n1, wavelength),
-        n2=_interp_n(seg.n2, wavelength),
+        n1=refractive_index(seg.n1, wavelength),
+        n2=refractive_index(seg.n2, wavelength),
         coating_reflectance=seg.coating_reflectance.sample(wavelength),
     )
 

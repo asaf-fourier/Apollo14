@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 
-from apollo14.materials import Material, air
+from atlas import Material
+
+from apollo14.materials import air
 
 
 @dataclass

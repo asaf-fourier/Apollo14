@@ -173,6 +173,9 @@ def main(argv=None):
         window_cells=args.window_cells,
     )
     records = validate_design(design, context)
+    source_glass = context.system.resolve(("chassis", "back"))._block_material.name
+    coating_media = {record["result"]["incident_medium"] for record in records}
+    media_match = coating_media == {source_glass}
     count = len(records)
     tolerance = design["design_params"]["tolerances"]
     fraction = (
@@ -317,7 +320,8 @@ def main(argv=None):
         metrics, brightness, color = response_metrics(response, context, reference=ideal)
         _ratios(metrics, brightness, ideal_metrics, ideal_brightness)
         passed = (
-            metrics["mean_brightness_ratio_to_ideal"] >= args.minimum_mean_ratio
+            media_match
+            and metrics["mean_brightness_ratio_to_ideal"] >= args.minimum_mean_ratio
             and metrics["minimum_point_ratio_to_ideal"] >= args.minimum_point_ratio
             and metrics["maximum_delta_xy_from_ideal"] is not None
             and metrics["maximum_delta_xy_from_ideal"] <= args.maximum_color_shift
@@ -329,6 +333,12 @@ def main(argv=None):
         if sample % 8 == 0 or sample == args.samples - 1:
             print(f"System tolerance build {sample + 1}/{args.samples}", flush=True)
     issues = []
+    if not media_match:
+        issues.append(
+            f"Coating media {sorted(coating_media)} differ from saved chassis material {source_glass}. "
+            "Results retain the saved ray geometry and are conditional; regenerate the source "
+            "optimization with matching glass before assessing system pass rates."
+        )
     if nominal_metrics["mean_brightness_ratio_to_ideal"] < args.minimum_mean_ratio:
         issues.append(
             f"Nominal mean brightness is {nominal_metrics['mean_brightness_ratio_to_ideal']:.1%} of ideal, below the diagnostic threshold."

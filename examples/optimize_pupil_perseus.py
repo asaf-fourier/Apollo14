@@ -45,6 +45,7 @@ from apollo14.binning import make_sample_lattice
 from apollo14.combiner import compensated_reflectances
 from apollo14.elements.pupil import RectangularPupil
 from apollo14.geometry import planar_grid_points
+from apollo14.materials import agc_m074
 from apollo14.perseus import (
     PERSEUS_BEAM_HEIGHT,
     PERSEUS_BEAM_WIDTH,
@@ -85,6 +86,7 @@ enable_jax_compilation_cache()
 # Spacing follows the manufactured wafer pitch and is frozen (not optimized).
 NUM_MIRRORS = PERSEUS_NUM_MIRRORS          # ← tune the mirror count here
 CHASSIS_Z = PERSEUS_CHASSIS_Z              # 3.0 mm full combiner depth
+COMBINER_MATERIAL = agc_m074              # Atlas glass used for tracing and saved systems
 FROZEN_SPACINGS = spacings_for_count(NUM_MIRRORS)   # (M-1,) wafer-pitch gaps
 SEED_SPACING = PERSEUS_MIRROR_STACK_SPAN / (NUM_MIRRORS - 1)   # per-mirror gap
 
@@ -247,6 +249,7 @@ PADDING_CELLS = KERNEL_SIZE_CELLS // 2
 
 _ref_system = build_parametrized_perseus(
     CombinerParams.initial(num_mirrors=NUM_MIRRORS),
+    glass_material=COMBINER_MATERIAL,
     probe_wavelengths=TRACE_WAVELENGTHS, chassis_z=CHASSIS_Z)
 _pupil = next(e for e in _ref_system.elements if isinstance(e, RectangularPupil))
 
@@ -319,6 +322,7 @@ def _compute_spectral_response_for(
     """
     system = build_parametrized_perseus(
         params, probe_wavelengths=wavelengths,
+        glass_material=COMBINER_MATERIAL,
         chassis_z=CHASSIS_Z)
     branch_routes = build_combiner_branch_routes(
         system, num_mirrors=NUM_MIRRORS,
@@ -699,6 +703,7 @@ def main():
 
     final_system = build_parametrized_perseus(
         params, probe_wavelengths=VALIDATION_WAVELENGTHS,
+        glass_material=COMBINER_MATERIAL,
         chassis_z=CHASSIS_Z)
 
     if is_flat:

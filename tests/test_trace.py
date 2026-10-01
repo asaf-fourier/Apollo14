@@ -68,8 +68,9 @@ class TestBuildRoute:
         assert len(faces) == 2
         # Back face enters glass: n1=air(1), n2=glass(>1).
         back = faces[0]
-        # Before prepare_route, n1/n2 are MaterialData (have n_values arrays).
-        assert back.n2.n_values.shape[-1] > 1
+        # Before prepare_route, n1/n2 retain the Atlas material objects.
+        assert back.n1 is air
+        assert back.n2 is agc_m074
 
     def test_custom_path(self):
         system = build_default_system()

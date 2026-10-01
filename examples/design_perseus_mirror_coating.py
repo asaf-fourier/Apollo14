@@ -55,7 +55,7 @@ from plotly.colors import sample_colorscale
 from scipy.stats import norm, qmc
 
 from apollo14.geometry import snell_refract
-from apollo14.materials import agc_m074
+from apollo14.materials import air, refractive_index
 from apollo14.perseus import (
     PERSEUS_BEAM_HEIGHT,
     PERSEUS_BEAM_WIDTH,
@@ -84,7 +84,7 @@ NUM_ANGLES = 5                      # AOI samples across the swept range
 
 # Alternating high/low-index films (DBR-style contrast) in AGC M-074 glass.
 NUM_SEED_FILMS = 5
-NUM_SEED_FILMS = 15
+# NUM_SEED_FILMS = 15
 THICKNESS_BOUNDS_NM = (20.0, 200.0)
 TIO2_N_BOUNDS = (2.0, 2.525)        # PLD_TiO2 tunable index range
 AL2O3_N_BOUNDS = (1.47, 1.65)       # PLD_Al2O3 tunable index range
@@ -112,7 +112,7 @@ POLISH_MAX_ITERATIONS = 500
 
 SAVE_PER_MIRROR_PLOTS = True
 OUTPUT_ROOT = "examples/reports"
-
+GLASS = Materials.moveon.MR10
 
 # ── Load the optimizer output ────────────────────────────────────────────────
 
@@ -187,7 +187,8 @@ def _incidence_angle_deg(beam_direction, entry_normal, mirror_normal,
     if np.dot(beam, face_normal) > 0:      # snell_refract wants it against the ray
         face_normal = -face_normal
     in_glass, _tir = snell_refract(jnp.asarray(beam), jnp.asarray(face_normal),
-                                   1.0, glass_index)
+                                   refractive_index(air, REFERENCE_WAVELENGTH_NM * nm),
+                                   glass_index)
     in_glass = np.asarray(in_glass)
     mirror_unit = np.asarray(mirror_normal)
     mirror_unit = mirror_unit / np.linalg.norm(mirror_unit)
@@ -271,9 +272,9 @@ def _seed_layers(glass, seed_thickness_high, seed_thickness_low) -> list:
     layers.append(Layer(material=glass))                   # substrate = glass
     return layers
 
-def _seed_moveon_layers(moveon, seed_thickness_high, seed_thickness_low) -> list:
+def _seed_moveon_layers(moveon, seed_thickness_high, seed_thickness_low, glass=GLASS) -> list:
     """moveon materials only."""
-    layers = [Layer(material=moveon.MR10)]
+    layers = [Layer(material=glass)]
     # stack_materials = [moveon.SiO2, moveon.Ti3O5, moveon.SiO2, moveon.TiO2, moveon.Al2O3, moveon.TiO2, moveon.SiO2, moveon.Ti3O5, moveon.SiO2]
     # stack_materials = [moveon.SiO2, moveon.TiO2, moveon.SiO2, moveon.TiO2, moveon.SiO2, moveon.TiO2, moveon.SiO2, moveon.TiO2, moveon.SiO2, moveon.TiO2, moveon.SiO2, moveon.TiO2, moveon.SiO2]
     # stack_materials = [moveon.TiO2, moveon.SiO2, moveon.TiO2, moveon.SiO2, moveon.TiO2]
@@ -289,7 +290,7 @@ def _seed_moveon_layers(moveon, seed_thickness_high, seed_thickness_low) -> list
             thickness_tolerance=_atlas_thickness_sigma_nm(
                 seed_thickness_high if is_tio2 else seed_thickness_low),
         ))
-    layers.append(Layer(material=moveon.MR10))
+    layers.append(Layer(material=glass))
 
     return layers
 
@@ -315,7 +316,7 @@ def design_mirror(mirror_index, target_wavelengths_nm, target_reflectance,
 
     designer = OpticalDesigner(
         # layers=_seed_layers(glass, seed_thickness_high, seed_thickness_low),
-        layers=_seed_moveon_layers(Materials.moveon, seed_thickness_high, seed_thickness_low),
+        layers=_seed_moveon_layers(Materials.moveon, seed_thickness_high, seed_thickness_low, glass),
         target=target)
     hop_state = {"hop": 0, "best": float("inf")}
 
@@ -660,9 +661,9 @@ def main():
             f"MIRROR_INDICES contains invalid entries {invalid_indices}; "
             f"valid range is 0..{num_mirrors - 1}")
 
+    glass = GLASS
     # Geometry / spectrum shared by the whole stack (mirrors share one normal).
-    glass_index = float(jnp.interp(REFERENCE_WAVELENGTH_NM * nm,
-                                   agc_m074.wavelengths, agc_m074.n_values))
+    glass_index = float(refractive_index(glass, REFERENCE_WAVELENGTH_NM * nm))
     aoi_min, aoi_max, aoi_on_axis, fov_ray_angles = incidence_angle_range(
         mirror_normal, num_mirrors, glass_index)
     aoi_design = 0.5 * (aoi_min + aoi_max)
@@ -673,7 +674,6 @@ def main():
 
     band = (float(mirrors[0][1].min()), float(mirrors[0][1].max()))
     weights = projector_weights(np.linspace(*band, NUM_WAVELENGTHS))
-    glass = Materials.AGC_M074
 
     print("── Perseus mirror stack → Atlas coatings ──")
     print(f"source report : {report_dir}  (pupil-optimizer mode: {curve_mode})")
@@ -770,8 +770,10 @@ def main():
             "fit_weights": "0.2 + 0.8·radiance/peak (projector-spectrum weighted)",
             "materials": {
                 "medium_substrate": glass.name,
-                "high_index": "PLD_TiO2", "high_n_bounds": list(TIO2_N_BOUNDS),
-                "low_index": "PLD_Al2O3", "low_n_bounds": list(AL2O3_N_BOUNDS),
+                "high_index": Materials.moveon.TiO2.name,
+                "high_n_bounds": Materials.moveon.TiO2.n_range,
+                "low_index": Materials.moveon.SiO2.name,
+                "low_n_bounds": Materials.moveon.SiO2.n_range,
             },
             "seed": {
                 "num_films": NUM_SEED_FILMS,

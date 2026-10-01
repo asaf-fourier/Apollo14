@@ -5,6 +5,7 @@ from typing import NamedTuple
 
 import jax.numpy as jnp
 import numpy as np
+from atlas import Material
 
 from apollo14.geometry import (
     compute_local_axes,
@@ -14,7 +15,7 @@ from apollo14.geometry import (
     rotate_vectors,
     snell_refract,
 )
-from apollo14.materials import Material, air
+from apollo14.materials import air
 from apollo14.ray import Ray
 from apollo14.spectral import SpectralTable
 
@@ -39,7 +40,7 @@ def validate_reflectance_table(table: SpectralTable) -> SpectralTable:
 class FaceSeg(NamedTuple):
     """Refracting face (glass-block face or boundary plane).
 
-    ``n1``/``n2`` hold ``MaterialData`` before ``prepare_route`` and scalar
+    ``n1``/``n2`` hold Atlas materials before ``prepare_route`` and scalar
     arrays after.
     """
     position: jnp.ndarray
@@ -47,8 +48,8 @@ class FaceSeg(NamedTuple):
     local_x: jnp.ndarray
     local_y: jnp.ndarray
     half_extents: jnp.ndarray
-    n1: jnp.ndarray
-    n2: jnp.ndarray
+    n1: Material
+    n2: Material
     coating_reflectance: SpectralTable
 
 
@@ -118,8 +119,8 @@ class GlassFace:
             local_x=self._local_x,
             local_y=self._local_y,
             half_extents=self.half_extents,
-            n1=incoming.data,
-            n2=outgoing.data,
+            n1=incoming,
+            n2=outgoing,
             coating_reflectance=self.coating_reflectance,
         )
         return seg, outgoing
@@ -129,7 +130,7 @@ def face_interact(seg: PreparedFaceSeg, ray: Ray, wavelength):
     """Refract through a glass face using Snell's law.
 
     ``seg.n1`` and ``seg.n2`` must be scalar arrays — callers use
-    ``prepare_route`` to resolve them from ``MaterialData``.
+    ``prepare_route`` to resolve them from Atlas materials.
     """
     alive_in = ray.intensity > 0
 

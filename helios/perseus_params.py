@@ -17,6 +17,7 @@ reference builder never drift.
 from __future__ import annotations
 
 import jax.numpy as jnp
+from atlas import Material
 
 from apollo14.elements.partial_mirror import PartialMirror
 from apollo14.materials import air
@@ -27,7 +28,7 @@ from apollo14.perseus import (
     build_perseus_geometry,
 )
 from apollo14.system import OpticalSystem
-from apollo14.units import mm, nm
+from apollo14.units import nm
 from helios.combiner_params import CombinerParams
 
 # Fallback probe grid for curves that carry no wavelength centers of their
@@ -39,6 +40,7 @@ _DEFAULT_PROBE_WAVELENGTHS = jnp.linspace(420 * nm, 660 * nm, 100)
 def build_parametrized_perseus(
     params: CombinerParams,
     *,
+    glass_material: Material,
     probe_wavelengths: jnp.ndarray | None = None,
     pantoscopic_tilt: float = PERSEUS_PANTOSCOPIC_TILT,
     projector_tilt: float = PERSEUS_PROJECTOR_TILT,
@@ -51,6 +53,7 @@ def build_parametrized_perseus(
         params: :class:`CombinerParams` — ``spacings`` ``(M-1,)`` and a
             batched reflectance ``curves`` with leaves shaped ``(M, …)``.
             Both flow into the returned system, so gradients reach them.
+        glass_material: Atlas material used by the chassis and every glass face.
         probe_wavelengths: ``(K,)`` grid on which each mirror's curve is
             eager-sampled before storage. Defaults to a dense visible-band
             grid (works for curves without their own centers, e.g. a flat
@@ -74,7 +77,7 @@ def build_parametrized_perseus(
     geometry = build_perseus_geometry(
         spacings=params.spacings,
         pantoscopic_tilt=pantoscopic_tilt, projector_tilt=projector_tilt,
-        chassis_z=chassis_z, **geometry_kwargs)
+        chassis_z=chassis_z, glass_material=glass_material, **geometry_kwargs)
 
     num_mirrors = params.curves.amplitude.shape[0]
 

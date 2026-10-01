@@ -87,7 +87,7 @@ def build_combiner_branch_routes(system: OpticalSystem,
     """Build unprepared branch routes that terminate on the pupil.
 
     Returns ``num_mirrors`` routes (one per mirror branch) with
-    ``MaterialData`` still in ``FaceSeg`` fields — call
+    Atlas materials still in ``FaceSeg`` fields — call
     ``prepare_route(r, wavelength)`` before tracing.
 
     Set ``include_aperture=False`` to omit the beam-defining stop from the
