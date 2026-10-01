@@ -60,7 +60,7 @@ MIN_ABSOLUTE_INTENSITY = 1.0e-8
 
 # Default rung for the mirror faces. Change this value to move the coating
 # policy without touching the exporter internals.
-FRONT_FACE_COATING_MODE = "atlas"
+FRONT_FACE_COATING_MODE = "stack"
 BACK_FACE_COATING_MODE = None
 MIRROR_FACE_COATING_MODES = {
     "front": FRONT_FACE_COATING_MODE,

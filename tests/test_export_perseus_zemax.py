@@ -34,8 +34,8 @@ from helios.io import _serialize_projector, _serialize_system
 from helios.perseus_params import build_parametrized_perseus
 
 
-def test_perseus_export_defaults_to_atlas_coatings():
-    assert export_perseus_zemax.FRONT_FACE_COATING_MODE == "atlas"
+def test_perseus_export_defaults_to_physical_stack_coatings():
+    assert export_perseus_zemax.FRONT_FACE_COATING_MODE == "stack"
     assert export_perseus_zemax.BACK_FACE_COATING_MODE is None
 
 
@@ -47,11 +47,11 @@ def test_face_coating_modes_resolve_to_mirror_face_names():
             "atlas": {"mirror_0": "ATLAS_M0"},
             "stack": {"mirror_0": "STACK_M0"},
         },
-        {"front": "atlas", "back": None},
+        {"front": "stack", "back": None},
     )
 
     assert face_coatings == {
-        ("mirror_0", "front"): "ATLAS_M0",
+        ("mirror_0", "front"): "STACK_M0",
     }
 
 
