@@ -20,14 +20,14 @@ numbering is 1-based and facet vertices must be listed in continuous order
 around the facet (no bow ties).
 
 Vertices are written in the object's **local** frame; the NSC row carries the
-position and tilt (see :mod:`apollo14.export.placement`).
+position and tilt (see :mod:`apollo14.export.zemax.placement`).
 """
 
 from typing import NamedTuple
 
 import numpy as np
 
-from apollo14.export.placement import (
+from apollo14.export.zemax.placement import (
     Placement,
     from_local_frame,
     half_extents_in_zemax_frame,

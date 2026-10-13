@@ -26,15 +26,16 @@ from apollo14.elements.aperture import RectangularAperture
 from apollo14.elements.glass_block import GlassBlock
 from apollo14.elements.partial_mirror import PartialMirror
 from apollo14.elements.pupil import RectangularPupil
-from apollo14.export.placement import (
+from apollo14.export.zemax.formats.pob import (
+    format_polygon_object,
+    polygon_from_glass_block,
+)
+from apollo14.export.zemax.placement import (
     half_extents_in_zemax_frame,
     planar_placement,
     rectangle_frame_to_tilts,
+    tilts_to_rotation,
     zemax_plane_axes,
-)
-from apollo14.export.pob import (
-    format_polygon_object,
-    polygon_from_glass_block,
 )
 from apollo14.units import nm
 
@@ -50,6 +51,10 @@ PARTIAL_MIRROR_THICKNESS_MM = 0.001
 # Boolean Native operates on solid parents. One micrometre is effectively a
 # plane for this model while still giving the aperture a well-defined volume.
 APERTURE_BOOLEAN_THICKNESS_MM = 0.001
+# Source rotations are sent directly to OpticStudio. Nine decimal places are
+# far below any meaningful angular tolerance while removing residues such as
+# 6.000000000000001 from a grid that was defined as exactly 6 degrees.
+SOURCE_TILT_DECIMALS = 9
 
 
 class SourceSpec(NamedTuple):
@@ -62,22 +67,32 @@ class SourceSpec(NamedTuple):
     the pointing direction decides how much of it clears the 11 × 2 mm stop, and
     a roll convention invented here instead of taken from the projector would
     quietly change the answer.
+
+    ``fov_x_deg``/``fov_y_deg`` are analysis metadata for the independently
+    traced source direction. They do not alter its already-computed vector.
+    ``power`` is the source's initial model state, while ``sweep_power`` is the
+    source power used by the generated polychromatic field analysis runner.
     """
+
     label: str
-    position: np.ndarray        # (3,) world mm
-    direction: np.ndarray       # (3,) unit
-    beam_width: float           # mm, across beam_local_x
-    beam_height: float          # mm, across beam_local_y
-    beam_local_x: np.ndarray    # (3,) unit
-    beam_local_y: np.ndarray    # (3,) unit
+    position: np.ndarray  # (3,) world mm
+    direction: np.ndarray  # (3,) unit
+    beam_width: float  # mm, across beam_local_x
+    beam_height: float  # mm, across beam_local_y
+    beam_local_x: np.ndarray  # (3,) unit
+    beam_local_y: np.ndarray  # (3,) unit
     power: float = 1.0
     layout_rays: int = 8
     analysis_rays: int = 200_000
+    fov_x_deg: float | None = None
+    fov_y_deg: float | None = None
+    sweep_power: float = 1.0
 
 
 @dataclass
 class Prescription:
     """A complete Zemax model: the JSON document plus the files it references."""
+
     document: dict[str, Any]
     polygon_files: dict[str, str] = field(default_factory=dict)
 
@@ -91,7 +106,8 @@ class Prescription:
             if name in (entry["comment"], entry.get("label")):
                 return entry
         available = [
-            entry["comment"] if entry.get("label") is None
+            entry["comment"]
+            if entry.get("label") is None
             else f"{entry['label']} ({entry['comment']})"
             for entry in self.objects
         ]
@@ -153,22 +169,24 @@ def build_prescription(
     for element in system.elements:
         if isinstance(element, GlassBlock):
             entry, polygon_text, file_name = _export_glass_block(
-                element, chassis_pivot, chassis_tilt_deg, glass_names,
-                face_coatings)
+                element, chassis_pivot, chassis_tilt_deg, glass_names, face_coatings
+            )
             polygon_files[file_name] = polygon_text
             block_indices[element.name] = len(objects) + 1
             entries = [entry]
         elif isinstance(element, RectangularAperture):
             entries = _export_aperture(element, first_index=len(objects) + 1)
         elif isinstance(element, PartialMirror):
-            entries = [_export_partial_mirror(
-                element, coating_names, face_coatings, chassis_material_name)]
+            entries = [
+                _export_partial_mirror(element, coating_names, face_coatings, chassis_material_name)
+            ]
         elif isinstance(element, RectangularPupil):
             entries = [_export_pupil(element, detector_pixels)]
         else:
             raise TypeError(
                 f"No Zemax export for element type {type(element).__name__!r} "
-                f"({getattr(element, 'name', '?')}).")
+                f"({getattr(element, 'name', '?')})."
+            )
 
         for entry in entries:
             entry["index"] = len(objects) + 1
@@ -185,12 +203,14 @@ def build_prescription(
         float(wavelength) / (1000.0 * nm)
         for wavelength in np.atleast_1d(np.asarray(trace_wavelengths))
     ]
+    wavelength_weights = [1.0] * len(wavelengths_um)
 
     document = {
         "units": {"lens": "mm", "wavelength": "um"},
         "system": {
             "mode": "non_sequential",
             "wavelengths_um": wavelengths_um,
+            "wavelength_weights": wavelength_weights,
             "ray_splitting": True,
             "max_segments": int(max_segments),
             "max_intersections": int(max_intersections),
@@ -214,7 +234,8 @@ def _resolve_chassis_material_name(system, glass_names):
         if material_name is None:
             raise KeyError(
                 f"No Zemax glass name given for chassis material "
-                f"{element.material.name!r}; pass one via glass_names.")
+                f"{element.material.name!r}; pass one via glass_names."
+            )
         return material_name
     return None
 
@@ -222,14 +243,14 @@ def _resolve_chassis_material_name(system, glass_names):
 def _export_glass_block(block, pivot, tilt_deg, glass_names, face_coatings):
     polygon, placement = polygon_from_glass_block(block, pivot, tilt_deg)
     file_name = f"{block.name}.POB"
-    polygon_text = format_polygon_object(
-        polygon, f"Apollo14 {block.name} — {block.material.name}")
+    polygon_text = format_polygon_object(polygon, f"Apollo14 {block.name} — {block.material.name}")
 
     material_name = glass_names.get(block.material.name)
     if material_name is None:
         raise KeyError(
             f"No Zemax glass name given for material "
-            f"{block.material.name!r}; pass one via glass_names.")
+            f"{block.material.name!r}; pass one via glass_names."
+        )
 
     # Face numbers in the polygon file follow the block's face order.
     coatings_by_face_number = {}
@@ -263,7 +284,8 @@ def _export_aperture(aperture, *, first_index: int) -> list[dict]:
     out of the optical layout once they are hidden.
     """
     outer_half_x, outer_half_y = half_extents_in_zemax_frame(
-        aperture, f"{aperture.name} outer frame")
+        aperture, f"{aperture.name} outer frame"
+    )
 
     # ``half_extents_in_zemax_frame`` reads .width/.height. Give it the same
     # local-frame information with the opening's dimensions so its axis mapping
@@ -275,12 +297,14 @@ def _export_aperture(aperture, *, first_index: int) -> list[dict]:
         _local_x = aperture._local_x
 
     inner_half_x, inner_half_y = half_extents_in_zemax_frame(
-        _InnerOpening(), f"{aperture.name} opening")
+        _InnerOpening(), f"{aperture.name} opening"
+    )
     if inner_half_x > outer_half_x or inner_half_y > outer_half_y:
         raise ValueError(
             f"Aperture opening ({2 * inner_half_x:.3f} × "
             f"{2 * inner_half_y:.3f} mm) is not inside its frame "
-            f"({2 * outer_half_x:.3f} × {2 * outer_half_y:.3f} mm).")
+            f"({2 * outer_half_x:.3f} × {2 * outer_half_y:.3f} mm)."
+        )
 
     parent_common = {
         "type": "rectangular_volume",
@@ -339,9 +363,7 @@ def _export_aperture(aperture, *, first_index: int) -> list[dict]:
     return [outer_entry, inner_entry, boolean_entry]
 
 
-def _export_partial_mirror(
-    mirror, coating_names, face_coatings, chassis_material_name
-):
+def _export_partial_mirror(mirror, coating_names, face_coatings, chassis_material_name):
     half_x, half_y = half_extents_in_zemax_frame(mirror, mirror.name)
     placement = planar_placement(mirror, mirror.name)
 
@@ -362,8 +384,7 @@ def _export_partial_mirror(
         # NSC coatings live on faces; the mirror's front face is 1 and the
         # back face is 2. The helper below lets the caller configure faces by
         # side name instead of hard-coding row numbers everywhere.
-        "face_coatings": _partial_mirror_face_coatings(
-            mirror.name, coating_names, face_coatings),
+        "face_coatings": _partial_mirror_face_coatings(mirror.name, coating_names, face_coatings),
         "reference_reflectance": {
             "wavelengths_nm": [float(w) / nm for w in mirror.wavelengths],
             "values": [float(r) for r in mirror.reflectance],
@@ -381,13 +402,11 @@ def _partial_mirror_face_coatings(mirror_name, coating_names, face_coatings):
     """
     face_coatings = face_coatings or {}
 
-    front_coating = _lookup_face_coating(
-        face_coatings, mirror_name, ("front", "1", 1))
+    front_coating = _lookup_face_coating(face_coatings, mirror_name, ("front", "1", 1))
     if front_coating is None and mirror_name in coating_names:
         front_coating = coating_names[mirror_name]
 
-    back_coating = _lookup_face_coating(
-        face_coatings, mirror_name, ("back", "2", 2))
+    back_coating = _lookup_face_coating(face_coatings, mirror_name, ("back", "2", 2))
 
     coatings_by_face_number = {}
     if front_coating is not None:
@@ -454,21 +473,39 @@ def _frame_record(element) -> dict:
 
 def _export_source(source: SourceSpec):
     direction = np.asarray(source.direction, dtype=float)
-    direction = direction / np.linalg.norm(direction)
+    if direction.shape != (3,) or not np.all(np.isfinite(direction)):
+        raise ValueError(f"Source {source.label!r} direction must be a finite 3-vector.")
+    direction_norm = float(np.linalg.norm(direction))
+    if direction_norm == 0.0:
+        raise ValueError(f"Source {source.label!r} direction must be non-zero.")
+    direction = direction / direction_norm
 
     # Match the projector's whole frame, not just where it points — see
     # SourceSpec on why the beam's roll matters here.
-    tilt_x, tilt_y, tilt_z = rectangle_frame_to_tilts(
-        source.beam_local_x, source.beam_local_y, direction, source.label)
+    raw_tilts = rectangle_frame_to_tilts(
+        source.beam_local_x, source.beam_local_y, direction, source.label
+    )
+    tilts = tuple(_rounded_source_tilt(value) for value in raw_tilts)
+    traced_direction = tilts_to_rotation(*tilts)[:, 2]
+    direction_error = float(np.linalg.norm(traced_direction - direction))
+    if direction_error > 1e-9:
+        raise ValueError(
+            f"Source {source.label!r} changed direction by {direction_error:.3e} "
+            "when its Zemax tilts were rounded."
+        )
+
+    fov_angles_deg = _source_fov_angles_deg(source)
+    initial_power = _finite_nonnegative_source_value(source.power, source.label, "power")
+    sweep_power = _finite_nonnegative_source_value(source.sweep_power, source.label, "sweep_power")
 
     entry = {
         "type": "source_two_angle",
-        "comment": (f"{source.label} dir="
-                    f"({direction[0]:.6f},{direction[1]:.6f},"
-                    f"{direction[2]:.6f})"),
+        "comment": (
+            f"{source.label} dir=({direction[0]:.6f},{direction[1]:.6f},{direction[2]:.6f})"
+        ),
         "label": source.label,
         "position": [float(v) for v in np.asarray(source.position, dtype=float)],
-        "tilt_deg": [float(tilt_x), float(tilt_y), float(tilt_z)],
+        "tilt_deg": list(tilts),
         "material": "",
         "inside_of": 0,
         "data": {
@@ -478,13 +515,62 @@ def _export_source(source: SourceSpec):
             # projector, which emits a grid of parallel rays.
             "half_angle_x": 0.0,
             "half_angle_y": 0.0,
-            "power": float(source.power),
+            "power": initial_power,
+            # The standalone polychromatic field sweep enables one source at a
+            # time using this value. It stays separate from power because
+            # every non-first source is initially muted in the saved model.
+            "sweep_power": sweep_power,
             "layout_rays": int(source.layout_rays),
             "analysis_rays": int(source.analysis_rays),
         },
         "intended_direction": [float(v) for v in direction],
     }
+    if fov_angles_deg is not None:
+        entry["fov_angles_deg"] = fov_angles_deg
     return entry
+
+
+def _source_fov_angles_deg(source):
+    """Return validated optional FOV metadata for one exported source."""
+    if (source.fov_x_deg is None) != (source.fov_y_deg is None):
+        raise ValueError(f"Source {source.label!r} needs both fov_x_deg and fov_y_deg, or neither.")
+    if source.fov_x_deg is None:
+        return None
+    return [
+        _finite_source_value(source.fov_x_deg, source.label, "fov_x_deg"),
+        _finite_source_value(source.fov_y_deg, source.label, "fov_y_deg"),
+    ]
+
+
+def _finite_source_value(value, source_label, field_name):
+    """Return one finite source setting with a useful error."""
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"Source {source_label!r} has invalid {field_name} {value!r}; use a finite number."
+        ) from error
+    if not np.isfinite(result):
+        raise ValueError(
+            f"Source {source_label!r} has invalid {field_name} {value!r}; use a finite number."
+        )
+    return result
+
+
+def _finite_nonnegative_source_value(value, source_label, field_name):
+    """Return one finite non-negative source setting with a useful error."""
+    result = _finite_source_value(value, source_label, field_name)
+    if result < 0.0:
+        raise ValueError(
+            f"Source {source_label!r} has invalid {field_name} {value!r}; "
+            "use a finite non-negative value."
+        )
+    return result
+
+
+def _rounded_source_tilt(value):
+    rounded = round(float(value), SOURCE_TILT_DECIMALS)
+    return 0.0 if rounded == 0.0 else rounded
 
 
 def _assign_mirrors_inside_chassis(system, objects, block_indices) -> None:
@@ -499,11 +585,13 @@ def _assign_mirrors_inside_chassis(system, objects, block_indices) -> None:
     if len(block_indices) > 1:
         raise NotImplementedError(
             f"Export supports one glass block; found {sorted(block_indices)}. "
-            "Enclosing-block selection would need per-mirror containment tests.")
+            "Enclosing-block selection would need per-mirror containment tests."
+        )
 
     (chassis_index,) = block_indices.values()
-    mirror_names = {element.name for element in system.elements
-                    if isinstance(element, PartialMirror)}
+    mirror_names = {
+        element.name for element in system.elements if isinstance(element, PartialMirror)
+    }
     for entry in objects:
         if entry["comment"] in mirror_names:
             entry["inside_of"] = chassis_index
