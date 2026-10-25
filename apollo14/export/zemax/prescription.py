@@ -71,7 +71,10 @@ class SourceSpec(NamedTuple):
     ``fov_x_deg``/``fov_y_deg`` are analysis metadata for the independently
     traced source direction. They do not alter its already-computed vector.
     ``power`` is the source's initial model state, while ``sweep_power`` is the
-    source power used by the generated polychromatic field analysis runner.
+    source power used by the generated polychromatic field analysis runner. A
+    zero initial power is represented in OpticStudio by zero analysis rays,
+    because some ZOS-API releases retain a positive source power when zero is
+    requested.
     """
 
     label: str
@@ -143,7 +146,8 @@ def build_prescription(
             — for Perseus, minus the pantoscopic tilt. It is undone to recover
             object-local chassis vertices and then re-applied by the NSC row.
         sources: one entry per beam to emit; Apollo14 traces FOV directions one
-            at a time, so all but the first are exported with zero power.
+            at a time, so all but the first are initially disabled. A zero
+            ``SourceSpec.power`` is encoded as zero analysis rays in Zemax.
         trace_wavelengths: wavelengths to register in the system, in Apollo14's
             internal units.
         glass_names: Apollo14 material name → Zemax catalog glass name.
@@ -518,7 +522,7 @@ def _export_source(source: SourceSpec):
             "power": initial_power,
             # The standalone polychromatic field sweep enables one source at a
             # time using this value. It stays separate from power because
-            # every non-first source is initially muted in the saved model.
+            # every non-first source is initially muted with zero analysis rays.
             "sweep_power": sweep_power,
             "layout_rays": int(source.layout_rays),
             "analysis_rays": int(source.analysis_rays),

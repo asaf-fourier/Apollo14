@@ -19,8 +19,14 @@ System Wavelengths according to their wavelength-editor weights in each field
 trace. The generated ZPL macro restores any saved field into Detector Viewer
 without retracing it. When prescription.json contains a pupil-report
 configuration, the same run also writes its self-contained cross-field report.
+When it contains an aperture-report configuration, the run traces the configured
+vertical opening-height and complete-aperture shift states, restores the nominal aperture,
+and writes a selectable tolerance report. The horizontal opening is never edited.
 When it contains a coating-report configuration, the run also writes a linked
 physical layer-stack table from the recipe exported to the coating file.
+When it contains an eyebox-overlap configuration, the run derives field
+polygons and their contained overlap quad from the completed numeric detector
+cube without another trace or an image-processing dependency.
 
 The runner reads NCE detector data type 0 directly, which is OpticStudio's
 flux-per-pixel quantity. It stops with a clear error rather than silently
@@ -42,21 +48,35 @@ SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 REPORTING_DIRECTORY = SCRIPT_DIRECTORY / "reporting"
 sys.path.insert(0, str(SCRIPT_DIRECTORY))
 sys.path.insert(0, str(REPORTING_DIRECTORY))
-from build_zemax_model import connect, disconnect  # noqa: E402  (shared connection code)
+from build_zemax_model import (  # noqa: E402  (shared connection and ZOS-API helpers)
+    SOURCE_ANALYSIS_RAYS_PARAMETER,
+    SOURCE_POWER_ATTRIBUTE_CANDIDATES,
+    SOURCE_POWER_PARAMETER,
+    SOURCE_WAVENUMBER_PARAMETER,
+    connect,
+    disconnect,
+    get_data_implementation,
+    get_object_data_implementation,
+    read_nce_parameter,
+    set_nce_parameter,
+    set_required_attribute,
+    source_settings,
+)
 from position_space_analysis import (  # noqa: E402  (generated reporting module)
     NativeDetectorArchive,
     PositionSpaceCube,
     SystemSpectrum,
     detector_directory_name,
+    write_configured_eyebox_overlap_report,
     write_position_space_index,
 )
 from zemax_pupil_report import (  # noqa: E402  (generated reporting module)
     write_configured_pupil_reports,
 )
+from zemax_aperture_report import ApertureSweepReport  # noqa: E402  (generated beside this script)
 from zemax_coating_report import write_coating_report  # noqa: E402  (generated beside this script)
 
 DEFAULT_OUTPUT_DIRECTORY = "zemax_sweep"
-SOURCE_POWER_CANDIDATES = ("Power", "SourcePower")
 SOURCE_COLOR_ENUM_CANDIDATES = ("SystemWavelengths", "SystemWavelength")
 
 
@@ -101,52 +121,45 @@ def find_objects(prescription):
     return detectors, sources
 
 
-def _set_first_available_attribute(target, candidates, value):
-    """Write the first matching source-power attribute on ``target``."""
-    for name in candidates:
-        if not hasattr(target, name):
-            continue
-        try:
-            setattr(target, name, value)
-            return True
-        except Exception:  # noqa: BLE001 - try the next API spelling.
-            continue
-    return False
-
-
-def _set_source_parameter(nce_object, ZOSAPI, column_name, value, integer=False):
-    """Set one common source parameter through the version-stable NCE cell."""
-    try:
-        column = getattr(ZOSAPI.Editors.NCE.ObjectColumn, column_name)
-        cell = nce_object.GetObjectCell(column)
-    except Exception as error:  # noqa: BLE001
-        raise RuntimeError(
-            f"Could not access source parameter {column_name}: {error!r}.") from error
-
-    attributes = (("IntegerValue", "DoubleValue") if integer
-                  else ("DoubleValue", "IntegerValue"))
-    errors = []
-    for attribute in attributes:
-        if not hasattr(cell, attribute):
-            continue
-        try:
-            typed_value = int(value) if attribute == "IntegerValue" else float(value)
-            setattr(cell, attribute, typed_value)
-            return
-        except Exception as error:  # noqa: BLE001
-            errors.append(f"{attribute}: {error!r}")
-    raise RuntimeError(
-        f"Could not set source parameter {column_name} to {value!r}; "
-        + "; ".join(errors or ["no writable value property"]))
-
-
 def _set_source_power(nce_object, ZOSAPI, power):
-    """Set common source parameter 3, trying typed data before the cell."""
-    object_data = nce_object.ObjectData
-    if _set_first_available_attribute(
-            object_data, SOURCE_POWER_CANDIDATES, float(power)):
+    """Set and verify source power, preferring the row-level NCE cell."""
+    expected_value = float(power)
+    errors = []
+    try:
+        set_nce_parameter(
+            nce_object, ZOSAPI, SOURCE_POWER_PARAMETER, expected_value)
         return
-    _set_source_parameter(nce_object, ZOSAPI, "Par3", power)
+    except Exception as error:  # noqa: BLE001
+        errors.append(f"NCE parameter 3: {error}")
+
+    # Retain the concrete ObjectData path for releases where the typed source
+    # interface is writable but NCE parameter cells are not.
+    object_data = get_object_data_implementation(nce_object)
+    if object_data is not None:
+        for attribute in SOURCE_POWER_ATTRIBUTE_CANDIDATES:
+            try:
+                getattr(object_data, attribute)
+            except AttributeError:
+                continue
+            except Exception as error:  # noqa: BLE001
+                errors.append(f"ObjectData.{attribute} lookup: {error!r}")
+                continue
+            try:
+                setattr(object_data, attribute, expected_value)
+                observed_value = read_nce_parameter(
+                    nce_object, ZOSAPI, SOURCE_POWER_PARAMETER)
+            except Exception as error:  # noqa: BLE001
+                errors.append(f"ObjectData.{attribute}: {error!r}")
+                continue
+            if observed_value == expected_value:
+                return
+            errors.append(
+                f"ObjectData.{attribute}: requested {expected_value!r}, "
+                f"parameter 3 read back {observed_value!r}")
+    else:
+        errors.append("concrete ObjectData is unavailable")
+    raise RuntimeError(
+        f"Could not set source power to {expected_value!r}; " + "; ".join(errors))
 
 
 def _system_wavelength_color_mode(ZOSAPI):
@@ -166,20 +179,32 @@ def configure_sources_for_polychromatic_trace(editor, sources, ZOSAPI):
     for entry in sources:
         nce_object = editor.GetObjectAt(entry["index"])
         try:
-            sources_data = nce_object.SourcesData
+            sources_data = get_data_implementation(nce_object, "SourcesData")
+            if sources_data is None:
+                raise RuntimeError("SourcesData is unavailable for this object.")
             if (hasattr(sources_data, "IsSourcesAvailable")
                     and not sources_data.IsSourcesAvailable):
                 raise RuntimeError("SourcesData is unavailable for this object.")
             sources_data.SourceColor = mode
+            observed_mode = sources_data.SourceColor
+            if observed_mode != mode and str(observed_mode) != str(mode):
+                raise RuntimeError(
+                    f"SourceColor read back as {observed_mode!r}, expected {mode!r}.")
         except Exception as error:  # noqa: BLE001
             raise RuntimeError(
                 f"Could not set source {entry.get('label', entry['index'])!r} "
                 f"to System Wavelengths: {error!r}.") from error
-        _set_source_parameter(nce_object, ZOSAPI, "Par4", 0, integer=True)
+        set_nce_parameter(
+            nce_object, ZOSAPI, SOURCE_WAVENUMBER_PARAMETER, 0, integer=True)
 
 
 def set_only_active_source(editor, sources, active_index, ZOSAPI):
-    """Enable one field source at its analysis power and mute every other source."""
+    """Enable one field source by giving only it analysis rays.
+
+    Inactive sources retain their valid positive Power and are disabled with an
+    analysis-ray count of zero, which works across ZOS-API releases that reject
+    a zero source Power.
+    """
     matching_sources = [
         entry for entry in sources if entry["index"] == active_index
     ]
@@ -187,36 +212,77 @@ def set_only_active_source(editor, sources, active_index, ZOSAPI):
         raise KeyError(f"Source object {active_index!r} is not unique in the sweep.")
 
     active_source = matching_sources[0]
-    source_data = active_source.get("data", {})
-    if not isinstance(source_data, dict):
-        raise ValueError(
-            f"Source {active_source.get('label', active_index)!r} data must be a mapping.")
-    try:
-        active_power = float(source_data.get("sweep_power", 1.0))
-    except (TypeError, ValueError) as error:
-        raise ValueError(
-            f"Source {active_source.get('label', active_index)!r} has an invalid "
-            "sweep_power.") from error
-    if not math.isfinite(active_power) or active_power < 0.0:
-        raise ValueError(
-            f"Source {active_source.get('label', active_index)!r} has invalid "
-            f"sweep_power {active_power!r}.")
+    active_label = active_source.get("label", active_index)
+    settings = source_settings(active_source.get("data", {}), active_label)
+
+    if settings.sweep_power > 0.0:
+        active_object = editor.GetObjectAt(active_source["index"])
+        _set_source_power(active_object, ZOSAPI, settings.sweep_power)
 
     for entry in sources:
-        power = active_power if entry is active_source else 0.0
         nce_object = editor.GetObjectAt(entry["index"])
-        _set_source_power(nce_object, ZOSAPI, power)
+        ray_count = (
+            settings.analysis_rays
+            if entry is active_source and settings.sweep_power > 0.0
+            else 0
+        )
+        set_nce_parameter(
+            nce_object, ZOSAPI, SOURCE_ANALYSIS_RAYS_PARAMETER,
+            ray_count, integer=True)
 
 
-def trace(system):
-    """Run one non-sequential ray trace with splitting and polarization on."""
+def _detector_data_value(system, detector_index, pixel):
+    """Read one detector value across Python.NET out-parameter conventions."""
+    result = system.NCE.GetDetectorData(detector_index, pixel, 0)
+    if isinstance(result, tuple):
+        if len(result) < 2 or not result[0]:
+            raise RuntimeError(
+                f"NCE.GetDetectorData rejected detector {detector_index}, "
+                f"pixel {pixel}: {result!r}.")
+        result = result[1]
+    return float(result)
+
+
+def _uncleared_detectors(system, detector_indices):
+    """Return exported detectors whose total flux is nonzero."""
+    uncleared = []
+    for detector_index in detector_indices:
+        total_flux = _detector_data_value(system, detector_index, 0)
+        if total_flux != 0.0:
+            uncleared.append((detector_index, total_flux))
+    return uncleared
+
+
+def clear_and_trace(system, detectors):
+    """Clear detector state, verify it is empty, then trace exactly one field."""
+    detector_indices = [int(detector["index"]) for detector in detectors]
     ray_trace = system.Tools.OpenNSCRayTrace()
+    if ray_trace is None:
+        raise RuntimeError("OpticStudio did not open the non-sequential ray-trace tool.")
     try:
         ray_trace.SplitNSCRays = True
         ray_trace.ScatterNSCRays = False
         ray_trace.UsePolarization = True
         ray_trace.IgnoreErrors = True
+        ray_trace.SaveRays = False
+
+        # ZOS-API equivalent of OpticStudio's Clear & Trace action. Clear all
+        # buffers, then explicitly clear each exported detector on API versions
+        # that expose object-based clearing.
         ray_trace.ClearDetectors(0)
+        clear_detector_object = getattr(ray_trace, "ClearDetectorObject", None)
+        if clear_detector_object is not None:
+            for detector_index in detector_indices:
+                clear_detector_object(detector_index)
+
+        uncleared = _uncleared_detectors(system, detector_indices)
+        if uncleared:
+            details = ", ".join(
+                f"object {detector_index}: {total_flux:.6e}"
+                for detector_index, total_flux in uncleared)
+            raise RuntimeError(
+                "Detector clear failed before the field trace; refusing to write "
+                f"an accumulated detector map ({details}).")
         ray_trace.RunAndWaitForCompletion()
     finally:
         ray_trace.Close()
@@ -224,19 +290,10 @@ def trace(system):
 
 def _read_detector_with_nce(system, detector_index, pixels_x, pixels_y):
     """Read detector pixels directly from the NSC editor."""
-    editor = system.NCE
-
-    values = []
-    for pixel in range(1, pixels_x * pixels_y + 1):
-        result = editor.GetDetectorData(detector_index, pixel, 0)
-        # pythonnet surfaces the out-parameter either as a tuple or a value.
-        if isinstance(result, tuple):
-            if len(result) < 2 or not result[0]:
-                raise RuntimeError(
-                    f"NCE.GetDetectorData rejected detector {detector_index}, "
-                    f"pixel {pixel}: {result!r}.")
-            result = result[1]
-        values.append(float(result))
+    values = [
+        _detector_data_value(system, detector_index, pixel)
+        for pixel in range(1, pixels_x * pixels_y + 1)
+    ]
     return [values[row * pixels_x:(row + 1) * pixels_x]
             for row in range(pixels_y)]
 
@@ -467,6 +524,8 @@ def _trace_metadata(spectrum, readout_route):
         "scatter_nsc_rays": False,
         "use_polarization": True,
         "clear_detectors": True,
+        "trace_mode": "clear_and_trace_per_field",
+        "source_isolation": "zero_analysis_rays_for_inactive_sources",
         "detector_readout": readout_route,
     }
 
@@ -531,6 +590,146 @@ def _write_pupil_reports(detector_outputs, report_specs, output_directory):
     return reports
 
 
+def _write_eyebox_overlap_report(detector_outputs, specification,
+                                  output_directory):
+    """Write one configured numeric field-overlap report and index record."""
+    result = write_configured_eyebox_overlap_report(
+        [cube for _detector, cube, _directory in detector_outputs],
+        specification,
+        output_directory,
+    )
+    if result is None:
+        return None
+    record = {
+        "report_name": result["report_name"],
+        "title": result["title"],
+        "detail": result["detail"],
+        "detector_label": result["detector_label"],
+        "html": _relative_path(result["html"], output_directory),
+        "json": _relative_path(result["json"], output_directory),
+        "contained_overlap_quad_csv": _relative_path(
+            result["contained_overlap_quad_csv"], output_directory),
+    }
+    print(f"  wrote eyebox field-overlap report: {result['html']}")
+    return record
+
+
+_APERTURE_Y1_HALF_WIDTH_CANDIDATES = (
+    "Y1HalfWidth", "Y1HalfWidth1", "YHalfWidth1", "HalfWidthY1", "Y1HalfWidth_mm")
+_APERTURE_Y2_HALF_WIDTH_CANDIDATES = (
+    "Y2HalfWidth", "Y2HalfWidth1", "YHalfWidth2", "HalfWidthY2", "Y2HalfWidth_mm")
+
+
+def _set_aperture_vertical_state(system, specification, height_delta_mm,
+                                 vertical_shift_mm):
+    """Apply one vertical state without writing any horizontal property."""
+    geometry = specification["geometry"]
+    inner_object = system.NCE.GetObjectAt(geometry["inner_object_index"])
+    boolean_object = system.NCE.GetObjectAt(geometry["boolean_object_index"])
+    object_data = getattr(inner_object, "ObjectData", None)
+    y_half_width = (
+        geometry["nominal_inner_y_half_width_mm"]
+        + float(height_delta_mm) / 2.0)
+    nominal_position = geometry["nominal_aperture_position_mm"]
+    vertical_direction = geometry["local_vertical_world"]
+    y_position = nominal_position[1] + float(vertical_shift_mm) * vertical_direction[1]
+    z_position = nominal_position[2] + float(vertical_shift_mm) * vertical_direction[2]
+    targets = [object_data, inner_object]
+    set_required_attribute(
+        targets, _APERTURE_Y1_HALF_WIDTH_CANDIDATES, y_half_width,
+        "aperture inner-volume Y1 half width")
+    set_required_attribute(
+        targets, _APERTURE_Y2_HALF_WIDTH_CANDIDATES, y_half_width,
+        "aperture inner-volume Y2 half width")
+    set_required_attribute(
+        [boolean_object], ("YPosition",), y_position,
+        "Boolean aperture global Y position for a local-vertical shift")
+    set_required_attribute(
+        [boolean_object], ("ZPosition",), z_position,
+        "Boolean aperture global Z position for a local-vertical shift")
+
+
+def _aperture_detector_pairs(detectors, detector_labels):
+    """Return selected detector entries in the configured UI order."""
+    detectors_by_label = {_detector_label(detector): detector for detector in detectors}
+    missing = [label for label in detector_labels if label not in detectors_by_label]
+    if missing:
+        raise RuntimeError(
+            "Aperture report detectors are absent from the loaded prescription: "
+            + ", ".join(repr(label) for label in missing) + ".")
+    return [detectors_by_label[label] for label in detector_labels]
+
+
+def _nominal_aperture_cubes(detector_outputs, detector_labels):
+    """Select completed main-sweep cubes for the zero/zero aperture state."""
+    cubes_by_label = {
+        cube.detector_label: cube
+        for _detector, cube, _directory in detector_outputs
+    }
+    return [cubes_by_label[label] for label in detector_labels]
+
+
+def _trace_aperture_state(system, ZOSAPI, sources, detectors, spectrum,
+                          state_number, state_count):
+    """Trace one non-nominal aperture state into temporary detector cubes."""
+    cubes = [PositionSpaceCube(detector, sources, spectrum) for detector in detectors]
+    for field_number, source in enumerate(sources, start=1):
+        set_only_active_source(system.NCE, sources, source["index"], ZOSAPI)
+        label = source.get("label", f"source_{source['index']}")
+        print(
+            f"  aperture state {state_number}/{state_count}, field "
+            f"{field_number}/{len(sources)}: {label}")
+        clear_and_trace(system, detectors)
+        for detector_index, detector in enumerate(detectors):
+            cube = cubes[detector_index]
+            rows, _route = read_detector(
+                system,
+                detector["index"],
+                detector["data"]["pixels_x"],
+                detector["data"]["pixels_y"],
+            )
+            cube.record(source["index"], rows)
+    return cubes
+
+
+def _write_aperture_report(system, ZOSAPI, sources, detectors, spectrum,
+                           detector_outputs, pupil_report_specs,
+                           aperture_report, output_directory):
+    """Trace configured aperture variants and write one interactive report."""
+    if not aperture_report:
+        return None
+    collector = ApertureSweepReport(aperture_report, pupil_report_specs)
+    selected_detectors = _aperture_detector_pairs(detectors, collector.detector_labels)
+    nominal_cubes = _nominal_aperture_cubes(
+        detector_outputs, collector.detector_labels)
+    states = list(collector.states)
+    try:
+        for state_number, (_height_index, _shift_index, height_delta,
+                           vertical_shift) in enumerate(states, start=1):
+            nominal = abs(height_delta) <= 1.0e-12 and abs(vertical_shift) <= 1.0e-12
+            print(
+                f"Aperture state {state_number}/{len(states)}: full-height delta "
+                f"{height_delta:+g} mm, vertical shift {vertical_shift:+g} mm"
+                + (" (reusing main sweep)" if nominal else ""))
+            if nominal:
+                cubes = nominal_cubes
+            else:
+                _set_aperture_vertical_state(
+                    system, aperture_report, height_delta, vertical_shift)
+                cubes = _trace_aperture_state(
+                    system, ZOSAPI, sources, selected_detectors, spectrum,
+                    state_number, len(states))
+            collector.record_state(height_delta, vertical_shift, cubes)
+    finally:
+        # The generated model on disk is never overwritten, and this also
+        # restores the live standalone session if a report calculation fails.
+        _set_aperture_vertical_state(system, aperture_report, 0.0, 0.0)
+
+    result = collector.write(output_directory)
+    print(f"  wrote Zemax aperture tolerance report: {result['html']}")
+    return result
+
+
 def _finalize_native_archive(system, ZOSAPI, application, detectors,
                              native_archive, output_directory):
     """Write, install, and index the native Detector Viewer artifacts."""
@@ -555,7 +754,8 @@ def _finalize_native_archive(system, ZOSAPI, application, detectors,
 def _run_position_space_sweep(system, ZOSAPI, sources, detectors, spectrum,
                               output_directory, model_directory=None,
                               application=None, pupil_report_specs=None,
-                              coating_report=None):
+                              aperture_report=None, coating_report=None,
+                              eyebox_overlap_report=None):
     """Trace each field once with its complete system-wavelength spectrum."""
     if not sources:
         raise RuntimeError("The prescription contains no source_two_angle objects.")
@@ -578,7 +778,7 @@ def _run_position_space_sweep(system, ZOSAPI, sources, detectors, spectrum,
         print(
             f"[{trace_number}/{len(sources)}] {label}, polychromatic "
             "System Wavelengths (wavenumber 0)")
-        trace(system)
+        clear_and_trace(system, detectors)
         route = _capture_field(
             system, source, detector_outputs, native_archive)
         if readout_route is None:
@@ -589,6 +789,15 @@ def _run_position_space_sweep(system, ZOSAPI, sources, detectors, spectrum,
         detector_outputs, output_directory, trace_metadata)
     derived_reports = _write_pupil_reports(
         detector_outputs, pupil_report_specs or [], output_directory)
+    overlap_index_record = _write_eyebox_overlap_report(
+        detector_outputs, eyebox_overlap_report, output_directory)
+    if overlap_index_record is not None:
+        derived_reports.append(overlap_index_record)
+    aperture_index_record = _write_aperture_report(
+        system, ZOSAPI, sources, detectors, spectrum, detector_outputs,
+        pupil_report_specs or [], aperture_report, output_directory)
+    if aperture_index_record is not None:
+        derived_reports.append(aperture_index_record)
     coating_index_record = write_coating_report(coating_report, output_directory)
     if coating_index_record is not None:
         derived_reports.append(coating_index_record)
@@ -624,8 +833,12 @@ def main(model_path, prescription_path, output_directory):
             Path(model_path).resolve().parent, application,
             pupil_report_specs=prescription.get(
                 "analyses", {}).get("pupil_reports", []),
+            aperture_report=prescription.get(
+                "analyses", {}).get("aperture_report"),
             coating_report=prescription.get(
-                "analyses", {}).get("coating_report"))
+                "analyses", {}).get("coating_report"),
+            eyebox_overlap_report=prescription.get(
+                "analyses", {}).get("eyebox_overlap_report"))
     finally:
         disconnect(application)
 

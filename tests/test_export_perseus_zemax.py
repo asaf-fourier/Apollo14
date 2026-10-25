@@ -12,7 +12,9 @@ from apollo14.elements.glass_block import GlassBlock
 from apollo14.elements.pupil import RectangularPupil
 from apollo14.export.zemax.bundle import (
     _apply_detector_pixel_overrides,
+    _attach_aperture_report,
     _attach_coating_report,
+    _attach_eyebox_overlap_report,
     _attach_pupil_reports,
     _clone_system_with_extra_pupils,
     _display_coating,
@@ -26,6 +28,9 @@ from apollo14.export.zemax.placement import (
     tilts_to_rotation,
 )
 from apollo14.export.zemax.prescription import build_prescription
+from apollo14.export.zemax.reporting.eyebox_overlap_report import (
+    EyeboxOverlapReportSpec,
+)
 from apollo14.export.zemax.templates.zosapi_script import build_script_text, sweep_script_text
 from apollo14.materials import agc_m074
 from apollo14.perseus import (
@@ -187,6 +192,14 @@ def test_export_bundle_helpers_can_add_and_relabel_secondary_detector():
         pupil_pitch_y_mm=1.0,
     )
     _attach_pupil_reports(prescription, report_specs)
+    aperture_report = export_perseus_zemax.build_zemax_aperture_report(
+        SimpleNamespace(pupil=pupil, eyebox=eyebox)
+    )
+    _attach_aperture_report(prescription, aperture_report)
+    _attach_eyebox_overlap_report(
+        prescription,
+        EyeboxOverlapReportSpec(detector_label="eyebox"),
+    )
 
     detectors = [entry for entry in prescription.objects if entry["type"] == "detector_rectangle"]
     assert [entry["comment"] for entry in detectors] == ["pupil", "eyebox"]
@@ -207,6 +220,22 @@ def test_export_bundle_helpers_can_add_and_relabel_secondary_detector():
     assert reports[0]["export_angular_response"] is False
     assert reports[1]["export_angular_response"] is True
     assert all(report["eye_positions_x"] == 8 for report in reports)
+    aperture = prescription.document["analyses"]["aperture_report"]
+    assert aperture["detector_labels"] == ["pupil", "eyebox"]
+    assert aperture["opening_height_deltas_mm"] == list(
+        aperture_report.opening_height_deltas_mm
+    )
+    assert aperture["vertical_shifts_mm"] == list(aperture_report.vertical_shifts_mm)
+    assert aperture["geometry"]["nominal_opening_width_mm"] == 12.0
+    assert aperture["geometry"]["nominal_opening_height_mm"] == 3.0
+    overlap = prescription.document["analyses"]["eyebox_overlap_report"]
+    assert overlap["detector_label"] == "eyebox"
+    assert overlap["report_name"] == "eyebox_field_overlap"
+    assert overlap["dense_zone_settings"] == {
+        "neighborhood_fraction_of_short_detector_axis": 0.05,
+        "minimum_local_positive_pixel_fraction": 0.5,
+        "minimum_local_flux_density_fraction_of_field_max": 0.1,
+    }
 
 
 def test_detector_configuration_errors_are_rejected_before_bundle_write():
@@ -242,6 +271,11 @@ def test_detector_configuration_errors_are_rejected_before_bundle_write():
                     "coordinate_frame": "zemax",
                 }
             ],
+        )
+    with pytest.raises(ValueError, match="not exported"):
+        _attach_eyebox_overlap_report(
+            prescription,
+            EyeboxOverlapReportSpec(detector_label="missing"),
         )
 
     colliding = SimpleNamespace(
@@ -434,6 +468,12 @@ def test_generated_sweep_script_builds_position_space_cubes_for_all_detectors():
     assert "configure_sources_for_polychromatic_trace" in text
     assert "set_sources_wavenumber" not in text
     assert "NCE.GetDetectorData(data=0: flux per pixel)" in text
+    assert "ApertureSweepReport" in text
+    assert "_set_aperture_vertical_state" in text
+    assert "_APERTURE_Y1_HALF_WIDTH_CANDIDATES" in text
+    assert "_APERTURE_Y2_HALF_WIDTH_CANDIDATES" in text
+    assert "X1HalfWidth" not in text
+    assert "X2HalfWidth" not in text
 
 
 def test_generated_build_script_sets_layout_checkboxes_tolerantly():

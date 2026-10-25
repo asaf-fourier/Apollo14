@@ -10,6 +10,16 @@ optimizer.
 in as plain arrays (see ``examples/export_perseus_zemax.py``).
 """
 
-from apollo14.export.zemax import PupilReportSpec, export_zemax_bundle
+from apollo14.export.zemax import (
+    ApertureSweepReportSpec,
+    EyeboxOverlapReportSpec,
+    PupilReportSpec,
+    export_zemax_bundle,
+)
 
-__all__ = ["PupilReportSpec", "export_zemax_bundle"]
+__all__ = [
+    "ApertureSweepReportSpec",
+    "EyeboxOverlapReportSpec",
+    "PupilReportSpec",
+    "export_zemax_bundle",
+]

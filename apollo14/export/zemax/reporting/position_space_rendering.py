@@ -276,8 +276,9 @@ def _write_html_report(html_path, cube, slice_entries, color_scale):
 <h1>Position-space detector response: {detector_name}</h1>
 <p>The cube shape is <code>{shape}</code>, ordered as
 <code>field, pixel_y, pixel_x</code>. {source_note}</p>
-<p>Each map is a single polychromatic trace with source wavenumber 0. Its
-System Wavelengths spectrum is {spectrum_text}.</p>
+<p>Each map is one isolated Clear &amp; Trace operation: detector buffers are
+cleared, one field source is enabled, and one polychromatic trace runs with
+source wavenumber 0. Its System Wavelengths spectrum is {spectrum_text}.</p>
 <p>Each map uses the same square-root color scale from zero to the rounded
 display limit <code>{scale_maximum}</code> detector-flux units per pixel. Row zero
 is drawn at the top; for a Detector Rectangle this is the local -y row. See

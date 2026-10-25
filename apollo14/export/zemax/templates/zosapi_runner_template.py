@@ -102,10 +102,19 @@ def _expected_html_reports(out_dir, prescription_path):
         reports.append(report_directory / "index.html")
         if specification.get("export_angular_response", False):
             reports.append(report_directory / "angular_response.html")
+    aperture_report = prescription.get("analyses", {}).get("aperture_report")
+    if aperture_report:
+        reports.append(
+            out_dir / "reports" / aperture_report["report_name"] / "index.html")
     coating_report = prescription.get("analyses", {}).get("coating_report")
     if coating_report:
         reports.append(
             out_dir / "reports" / coating_report["report_name"] / "index.html")
+    overlap_report = prescription.get("analyses", {}).get(
+        "eyebox_overlap_report")
+    if overlap_report:
+        reports.append(
+            out_dir / "reports" / overlap_report["report_name"] / "index.html")
     return list(dict.fromkeys(reports))
 
 

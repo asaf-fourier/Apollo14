@@ -6,6 +6,15 @@ from :mod:`apollo14.export`.
 """
 
 from apollo14.export.zemax.bundle import export_zemax_bundle
+from apollo14.export.zemax.reporting.eyebox_overlap_report import (
+    EyeboxOverlapReportSpec,
+)
+from apollo14.export.zemax.reporting.zemax_aperture_report import ApertureSweepReportSpec
 from apollo14.export.zemax.reporting.zemax_pupil_report import PupilReportSpec
 
-__all__ = ["PupilReportSpec", "export_zemax_bundle"]
+__all__ = [
+    "ApertureSweepReportSpec",
+    "EyeboxOverlapReportSpec",
+    "PupilReportSpec",
+    "export_zemax_bundle",
+]

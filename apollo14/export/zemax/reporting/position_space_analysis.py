@@ -8,6 +8,7 @@ Zemax bundle.
 """
 
 try:
+    from .eyebox_overlap_report import write_configured_eyebox_overlap_report
     from .html_plotting import format_compact_number
     from .position_space_common import (
         CSV_FLOAT_FORMAT,
@@ -22,6 +23,7 @@ try:
     from .position_space_native import NativeDetectorArchive
     from .position_space_rendering import _field_display, _format_angle_deg
 except ImportError:  # Standalone copies in a generated Zemax bundle.
+    from eyebox_overlap_report import write_configured_eyebox_overlap_report
     from html_plotting import format_compact_number
     from position_space_common import (  # type: ignore[no-redef]
         CSV_FLOAT_FORMAT,
@@ -50,5 +52,6 @@ __all__ = [
     "_format_angle_deg",
     "detector_directory_name",
     "format_compact_number",
+    "write_configured_eyebox_overlap_report",
     "write_position_space_index",
 ]

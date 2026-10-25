@@ -22,8 +22,12 @@ from pathlib import Path
 from apollo14.export.zemax.formats.agf import fit_sellmeier, format_glass_catalog
 from apollo14.export.zemax.formats.coating import format_coating_file
 from apollo14.export.zemax.prescription import build_prescription
+from apollo14.export.zemax.reporting.eyebox_overlap_report import (
+    normalize_eyebox_overlap_report,
+)
 from apollo14.export.zemax.reporting.html_plotting import REPORT_LAYOUT_VERSION
 from apollo14.export.zemax.reporting.position_space_analysis import detector_directory_name
+from apollo14.export.zemax.reporting.zemax_aperture_report import resolve_aperture_report
 from apollo14.export.zemax.reporting.zemax_coating_report import normalize_coating_report
 from apollo14.export.zemax.reporting.zemax_pupil_report import (
     normalize_pupil_report_specs,
@@ -50,9 +54,14 @@ PORTABLE_REPORT_MODULES = (
     "position_space_core.py",
     "position_space_index.py",
     "position_space_native.py",
+    "eyebox_overlap_geometry.py",
+    "eyebox_overlap_core.py",
+    "eyebox_overlap_report_template.py",
+    "eyebox_overlap_report.py",
     "position_space_analysis.py",
     "zemax_angular_response.py",
     "zemax_pupil_report.py",
+    "zemax_aperture_report.py",
     "zemax_coating_report.py",
 )
 
@@ -84,7 +93,9 @@ def export_zemax_bundle(
     detector_pixels_by_name=None,
     extra_pupils=(),
     pupil_reports=(),
+    aperture_report=None,
     coating_report=None,
+    eyebox_overlap_report=None,
     glass_catalog: str = DEFAULT_GLASS_CATALOG,
     coating_file: str = DEFAULT_COATING_FILE,
     notes: str = "",
@@ -104,9 +115,14 @@ def export_zemax_bundle(
     instances (or
     equivalent mappings) whose detector geometry is validated before any
     bundle files are written.
+    ``aperture_report`` optionally requests a Zemax-side vertical opening
+    height/shift tolerance sweep. Its horizontal opening is held fixed, and
+    its selected detectors reuse the configured pupil-report integrations.
     ``coating_report`` is optional recipe metadata for the physical mirror
     stacks. The Zemax sweep writes it as a linked HTML analysis page from the
     same serialized input used to create the coating file.
+    ``eyebox_overlap_report`` requests the numeric all-field overlap polygon
+    and its maximum-area contained quad for one completed detector cube.
 
     Returns the bundle directory.
     """
@@ -131,7 +147,9 @@ def export_zemax_bundle(
     )
     _apply_detector_pixel_overrides(prescription, detector_pixels_by_name or {})
     _attach_pupil_reports(prescription, pupil_reports)
+    _attach_aperture_report(prescription, aperture_report)
     _attach_coating_report(prescription, coating_report, coating_file)
+    _attach_eyebox_overlap_report(prescription, eyebox_overlap_report)
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -261,15 +279,85 @@ def _attach_coating_report(prescription, coating_report, coating_file):
     if normalized is None:
         return
 
-    pupil_report_names = {
+    configured_report_names = {
         str(report.get("report_name", "")).casefold()
         for report in prescription.document.get("analyses", {}).get("pupil_reports", [])
     }
-    if normalized["report_name"].casefold() in pupil_report_names:
+    aperture_report = prescription.document.get("analyses", {}).get("aperture_report")
+    if aperture_report:
+        configured_report_names.add(str(aperture_report.get("report_name", "")).casefold())
+    if normalized["report_name"].casefold() in configured_report_names:
         raise ValueError(
-            f"Coating report name {normalized['report_name']!r} conflicts with a pupil report."
+            f"Coating report name {normalized['report_name']!r} conflicts with another report."
         )
     prescription.document.setdefault("analyses", {})["coating_report"] = normalized
+
+
+def _attach_eyebox_overlap_report(prescription, specification):
+    """Validate and persist one detector field-overlap report request."""
+    normalized = normalize_eyebox_overlap_report(specification)
+    if normalized is None:
+        return
+
+    detector_label = normalized["detector_label"]
+    if detector_label not in _detectors_by_label(prescription):
+        raise ValueError(
+            "Eyebox overlap report references a detector label that is not exported: "
+            f"{detector_label!r}."
+        )
+
+    analyses = prescription.document.get("analyses", {})
+    configured_names = {
+        str(report.get("report_name", "")).casefold()
+        for report in analyses.get("pupil_reports", [])
+    }
+    for key in ("aperture_report", "coating_report"):
+        report = analyses.get(key)
+        if report:
+            configured_names.add(str(report.get("report_name", "")).casefold())
+    if normalized["report_name"].casefold() in configured_names:
+        raise ValueError(
+            f"Eyebox overlap report name {normalized['report_name']!r} conflicts "
+            "with another report."
+        )
+    prescription.document.setdefault("analyses", {})["eyebox_overlap_report"] = normalized
+
+
+def _attach_aperture_report(prescription, aperture_report):
+    """Resolve and persist one Zemax-side vertical aperture sweep."""
+    resolved = resolve_aperture_report(aperture_report, prescription.objects)
+    if resolved is None:
+        return
+
+    detectors_by_label = _detectors_by_label(prescription)
+    missing_detectors = sorted(set(resolved["detector_labels"]) - set(detectors_by_label))
+    if missing_detectors:
+        raise ValueError(
+            "Aperture report references detector labels that are not exported: "
+            + ", ".join(repr(label) for label in missing_detectors)
+            + "."
+        )
+
+    pupil_reports = prescription.document.get("analyses", {}).get("pupil_reports", [])
+    pupil_reports_by_detector = {report["detector_label"]: report for report in pupil_reports}
+    missing_integrations = sorted(
+        set(resolved["detector_labels"]) - set(pupil_reports_by_detector)
+    )
+    if missing_integrations:
+        raise ValueError(
+            "Aperture report detectors require matching pupil-report configurations: "
+            + ", ".join(repr(label) for label in missing_integrations)
+            + "."
+        )
+
+    pupil_report_names = {
+        str(report.get("report_name", "")).casefold() for report in pupil_reports
+    }
+    if resolved["report_name"].casefold() in pupil_report_names:
+        raise ValueError(
+            f"Aperture report name {resolved['report_name']!r} conflicts with a pupil report."
+        )
+    prescription.document.setdefault("analyses", {})["aperture_report"] = resolved
 
 
 def _detectors_by_label(prescription):
@@ -432,7 +520,9 @@ def _readme(
             _readme_header(notes),
             _readme_install(glass_catalog, coating_file),
             _readme_position_space_analysis(),
+            _readme_eyebox_overlap_report(prescription),
             _readme_pupil_reports(prescription),
+            _readme_aperture_report(prescription),
             _readme_coating_report(prescription),
             _readme_objects(prescription),
             _readme_glass(fits, glass_names),
@@ -523,8 +613,13 @@ def _readme_position_space_analysis():
         [
             "## Position-space detector analysis",
             "",
-            "The sweep runs each source direction once. Before tracing, it sets Source",
-            "Color to System Wavelengths and source parameter 4, Wavenumber, to zero.",
+            "The sweep runs each source direction once. For every field it enables only",
+            "that source by assigning zero analysis rays to every other source. Source",
+            "Power remains positive for ZOS-API compatibility. It then clears all detector",
+            "buffers, verifies the exported detectors are empty, and traces once. This is",
+            "the ZOS-API equivalent of Clear & Trace.",
+            "Before tracing, it sets Source Color to System Wavelengths and source",
+            "parameter 4, Wavenumber, to zero.",
             "OpticStudio then chooses ray wavelengths from the registered system",
             "wavelengths according to their Wavelength Data Editor weights. Every",
             "detector map therefore contains the combined polychromatic response.",
@@ -566,42 +661,70 @@ def _readme_position_space_analysis():
             "weights again. These detector maps are response functions, not radiance by",
             "themselves.",
             "",
+            _readme_native_macro_usage(),
+        ]
+    )
+
+
+def _readme_native_macro_usage():
+    """Explain the generated ZPL macro's fields, actions, and assumptions."""
+    return "\n".join(
+        [
             "### Open a saved field in OpticStudio",
             "",
-            "The sweep also saves each just-traced Detector Rectangle state as native",
-            "OpticStudio .DDR data under out/zemax_detector_data/. It writes",
-            "apollo14_view_position_space.zpl beside apollo14_combiner.zmx and installs",
-            "a copy in OpticStudio's configured ZPL macro folder, so it appears in Macro",
-            "List. The macro loads every detector's saved data for a selected",
-            "field and opens a preconfigured native Detector Viewer in False Color. It",
-            "does not alter sources or retrace the model.",
+            "The sweep saves each just-traced Detector Rectangle state as native",
+            "OpticStudio .DDR data under `out/zemax_detector_data/`. It writes",
+            "`apollo14_view_position_space.zpl` beside `apollo14_combiner.zmx` and",
+            "installs a copy in OpticStudio's configured ZPL folder for **Programming →",
+            "Macro List**.",
             "",
-            "1. Let build_and_run.py finish, then open apollo14_combiner.zmx in",
-            "   OpticStudio from this bundle directory.",
-            "2. In Programming, use Refresh List if OpticStudio was already open, then",
-            "   open Macro List and run apollo14_view_position_space.",
-            "3. Enter the one-based field number printed by the macro. It opens Detector",
-            "   Viewer with the saved polychromatic data. Choose another detector from",
-            "   its selector if needed.",
+            "The macro prints these values before asking for its only input:",
             "",
-            "Run that same macro again to switch fields; no source-power edits, source",
-            "wavelength edits, or ray trace are needed. The archive manifest at",
-            "out/zemax_detector_data/native_detector_archive.json maps every .DDR file",
-            "to its detector and field/source, and records the combined spectrum once.",
+            "| Printed value | Meaning | Required user action |",
+            "|---|---|---|",
+            "| Field number | One-based index of one independently traced exported FOV source direction. It is not an OpticStudio Field Data Editor row and it is not a wavelength. | Enter one listed number. |",
+            "| Source object | Non-sequential source object that was active for that saved trace. | None; do not activate or edit the source. |",
+            "| FOV x / FOV y | Angular coordinates of that source direction in the exported FOV grid. | Use them to identify the desired view direction. |",
+            "| Sweep power | Source power already used when that field was traced. The saved detector data already includes it. | Do not enter or apply it again. |",
+            "| Detector object and label | Every Detector Rectangle whose `.DDR` state will be restored. | After the viewer opens, use its **Detector** selector if you want an object other than the initially listed detector. |",
+            "| System wavelengths and weights | Polychromatic spectrum already combined in each saved `.DDR` state with source wavenumber 0. | Do not select a wavelength or change the Wavelength Data Editor. |",
             "",
-            "The sweep log prints the installed macro path. If automatic installation",
-            "warns that the ZPL folder could not be found or written, copy the generated",
-            "apollo14_view_position_space.zpl from beside apollo14_combiner.zmx into the",
-            "ZPL folder configured in OpticStudio Preferences > Folders, then use",
-            "Programming > Refresh List.",
+            "For the chosen field the macro automatically loads the matching `.DDR` file",
+            "into every listed detector object, then opens Detector Viewer in **False",
+            "Color** for the first detector. It does not trace rays, sum multiple fields,",
+            "change source powers, change wavelengths, or change the user's global Detector",
+            "Viewer defaults.",
             "",
-            "Detector Viewer natively displays Incoherent Irradiance (flux divided by the",
-            "constant detector-pixel area), so its spatial pattern is the saved flux map",
-            "with a fixed scale factor. The CSV/NPZ response cube remains the exact",
-            "flux-per-pixel export. There is one .DDR state per detector and field.",
+            "Manual prerequisites and actions:",
             "",
-            "Detector Viewer shows one detector and one field at a time. Use the generated",
-            "HTML report to browse the fields without reopening the native analysis.",
+            "1. Run `python build_and_run.py` successfully before using the macro.",
+            "2. Keep `apollo14_combiner.zmx` and its generated",
+            "   `out/zemax_detector_data/` directory in their original relative locations.",
+            "3. Open that matching `apollo14_combiner.zmx` in OpticStudio. The macro assumes",
+            "   the exported detector object numbers are unchanged. Rebuild and rerun the",
+            "   sweep after model or object-number changes.",
+            "4. If the entry is missing, use **Programming → Refresh List**, then open",
+            "   **Macro List** and run `apollo14_view_position_space`.",
+            "5. Enter one of the field numbers printed by the macro.",
+            "6. Detector Viewer initially shows the first listed detector. Select another",
+            "   restored detector in the viewer when needed.",
+            "7. Run the macro again to replace the detector states with another field.",
+            "",
+            "No manual source-power edit, wavelength edit, or ray trace is required. The",
+            "archive manifest at `out/zemax_detector_data/native_detector_archive.json`",
+            "contains the same field definitions, detector mapping, macro actions, and",
+            "manual prerequisites in machine-readable form.",
+            "",
+            "If automatic macro installation fails, copy",
+            "`apollo14_view_position_space.zpl` from beside the model into the ZPL folder",
+            "configured in OpticStudio Preferences → Folders, then use **Programming →",
+            "Refresh List**.",
+            "",
+            "Detector Viewer displays Incoherent Irradiance: saved flux per pixel divided",
+            "by the constant detector-pixel area. The CSV/NPZ response cube retains exact",
+            "flux per pixel. Detector Viewer shows one detector and one field at a time; use",
+            "the generated HTML report to browse fields without reopening the native",
+            "analysis.",
         ]
     )
 
@@ -657,6 +780,91 @@ def _readme_pupil_reports(prescription):
             "Their unit is OpticStudio source-power units/mm².",
             "They do not copy values from `apollo14_eyebox_report.html` and do not",
             "claim calibrated radiance or luminance.",
+        ]
+    )
+
+
+def _readme_eyebox_overlap_report(prescription):
+    """Explain the configured all-field eyebox overlap analysis."""
+    report = prescription.document.get("analyses", {}).get("eyebox_overlap_report")
+    if not report:
+        return ""
+    settings = report["dense_zone_settings"]
+    return "\n".join(
+        [
+            "## Automatic eyebox field-overlap report",
+            "",
+            "`build_and_run.py` writes "
+            f"`out/reports/{report['report_name']}/index.html` directly from the "
+            f"completed `{report['detector_label']}` detector cube. It appears under "
+            "**Analysis reports** in the fixed left menu of "
+            "`out/position_space_index.html`.",
+            "",
+            "The report builds one dense-zone convex polygon per field, intersects all "
+            "field polygons, and finds a maximum-area four-vertex shape whose vertices "
+            "remain inside that overlap polygon. The plot includes selectable field "
+            "polygons and the existing detector-map PNGs; JSON and CSV retain the exact "
+            "numeric geometry.",
+            "",
+            "It uses detector flux values already collected by the independent Clear & "
+            "Trace field sweep. No image processing, NumPy installation, or additional "
+            "OpticStudio trace is required. Dense-zone thresholds are stored in "
+            "`prescription.json`: neighborhood fraction "
+            f"{settings['neighborhood_fraction_of_short_detector_axis']:g}, local "
+            "positive-pixel fraction "
+            f"{settings['minimum_local_positive_pixel_fraction']:g}, and local flux "
+            "density fraction "
+            f"{settings['minimum_local_flux_density_fraction_of_field_max']:g}.",
+        ]
+    )
+
+
+def _readme_aperture_report(prescription):
+    """Explain the optional geometry sweep performed on the OpticStudio host."""
+    report = prescription.document.get("analyses", {}).get("aperture_report")
+    if not report:
+        return ""
+    geometry = report["geometry"]
+    height_values = ", ".join(f"{value:+g}" for value in report["opening_height_deltas_mm"])
+    shift_values = ", ".join(f"{value:+g}" for value in report["vertical_shifts_mm"])
+    detector_labels = ", ".join(f"`{label}`" for label in report["detector_labels"])
+    state_count = len(report["opening_height_deltas_mm"]) * len(
+        report["vertical_shifts_mm"]
+    )
+    return "\n".join(
+        [
+            "## Automatic Zemax aperture tolerance report",
+            "",
+            "`build_and_run.py` also writes "
+            f"`out/reports/{report['report_name']}/index.html`. It appears under "
+            "**Analysis reports** in the fixed left menu.",
+            "",
+            f"The report crosses full clear-opening height changes [{height_values}] mm "
+            f"with complete-aperture local vertical shifts [{shift_values}] mm, producing "
+            f"{state_count} "
+            "selectable states. A +0.1 mm full-height change adds +0.05 mm to each "
+            "inner-volume Y half width. The detector selector contains "
+            f"{detector_labels}.",
+            "",
+            "Opening-height states change only the Boolean inner volume's local-Y end half "
+            "widths. Shift states move the complete Boolean aperture along its exported "
+            "local-Y world axis. Its horizontal half width remains "
+            f"{geometry['inner_x_half_width_mm']:g} mm and its horizontal position remains "
+            f"{geometry['nominal_inner_x_position_mm']:g} mm; the Boolean object's global X "
+            f"position remains {geometry['nominal_aperture_position_mm'][0]:g} mm in every "
+            "state. The nominal "
+            f"clear opening is {geometry['nominal_opening_width_mm']:g}×"
+            f"{geometry['nominal_opening_height_mm']:g} mm.",
+            "",
+            "The nominal state reuses the main detector sweep. OpticStudio traces the other "
+            f"{state_count - 1} states across every exported FOV source using the same "
+            "polychromatic System Wavelengths and source powers. The page provides selectors "
+            "for detector, opening-height state, vertical-shift state, and result quantity. "
+            "It also writes exact state-summary and per-FOV CSV tables. All plotted values "
+            "come from the Zemax detector traces; no local Apollo14 report values are copied.",
+            "",
+            "The runner restores the nominal aperture height and world position in a "
+            "`finally` block. It does not save a tolerance state into the `.zmx` model.",
         ]
     )
 

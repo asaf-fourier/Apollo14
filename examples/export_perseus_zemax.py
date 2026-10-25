@@ -33,7 +33,12 @@ from apollo14.elements.aperture import RectangularAperture
 from apollo14.elements.glass_block import GlassBlock, GlassFace
 from apollo14.elements.partial_mirror import PartialMirror
 from apollo14.elements.pupil import RectangularPupil
-from apollo14.export import PupilReportSpec, export_zemax_bundle
+from apollo14.export import (
+    ApertureSweepReportSpec,
+    EyeboxOverlapReportSpec,
+    PupilReportSpec,
+    export_zemax_bundle,
+)
 from apollo14.export.zemax.formats.coating import (
     CoatingBlock,
     flat_table_coating,
@@ -84,6 +89,12 @@ FOV_GRID_DECIMALS = 3
 # throughput checks, not for a final Monte Carlo estimate.
 SOURCE_ANALYSIS_RAYS = 20_000
 
+# Zemax-side aperture tolerance states. These values change only the exported
+# Boolean opening's local vertical axis. The full horizontal opening and its
+# horizontal center remain identical to the nominal optimized model.
+APERTURE_HEIGHT_DELTAS_MM = (0.0, 0.1)#(-0.1, 0.0, 0.1)
+APERTURE_VERTICAL_SHIFTS_MM = (0.0)#(-0.1, 0.0, 0.1)
+
 # Trace wavelengths registered in the Zemax system — the R/G/B lines Apollo14
 # optimizes against.
 TRACE_WAVELENGTHS_NM = (460.0, 525.0, 630.0)
@@ -117,6 +128,7 @@ class DetectorExportPlan:
     eyebox: RectangularPupil
     ambient: tuple[RectangularPupil, ...]
     reports: tuple[PupilReportSpec, ...]
+    overlap_report: EyeboxOverlapReportSpec
     pixels_by_name: dict[str, tuple[int, int]]
 
     @property
@@ -147,6 +159,7 @@ class ZemaxExportPlan:
     mirrors: tuple[tuple[np.ndarray, np.ndarray], ...]
     coating_results: dict[int, dict]
     detectors: DetectorExportPlan
+    aperture_report: ApertureSweepReportSpec
     coatings: CoatingExportPlan
     sources: tuple[SourceSpec, ...]
     chassis_origin: np.ndarray
@@ -755,9 +768,10 @@ def build_sources(projector: Projector, fov_x: float, fov_y: float) -> list[Sour
                 beam_height=float(projector.beam_height),
                 beam_local_x=sample.beam_local_x,
                 beam_local_y=sample.beam_local_y,
-                # Apollo14 traces one direction at a time; the sweep script gives
-                # each source its independent sweep power in turn, so only the
-                # first is live in the saved model.
+                # Apollo14 traces one direction at a time. Zero marks every
+                # non-first source as initially disabled; the Zemax builder
+                # implements that state with zero analysis rays because some
+                # ZOS-API releases reject a zero source Power.
                 power=1.0 if direction_index == 0 else 0.0,
                 analysis_rays=SOURCE_ANALYSIS_RAYS,
                 fov_x_deg=float(angle_x_deg),
@@ -829,9 +843,22 @@ def prepare_detector_export(
         eyebox=eyebox_detector,
         ambient=ambient_detectors,
         reports=pupil_reports,
+        overlap_report=EyeboxOverlapReportSpec(detector_label=eyebox_detector.name),
         pixels_by_name={
             detector.name: DETECTOR_SCAN_SHAPE for detector in exported_detectors
         },
+    )
+
+
+def build_zemax_aperture_report(
+    detectors: DetectorExportPlan,
+) -> ApertureSweepReportSpec:
+    """Configure a compact vertical aperture tolerance sweep in OpticStudio."""
+    return ApertureSweepReportSpec(
+        aperture_label="aperture",
+        detector_labels=(detectors.pupil.name, detectors.eyebox.name),
+        opening_height_deltas_mm=APERTURE_HEIGHT_DELTAS_MM,
+        vertical_shifts_mm=APERTURE_VERTICAL_SHIFTS_MM,
     )
 
 
@@ -875,6 +902,7 @@ def build_export_plan(report_dir: Path, coating_dir: Path | None) -> ZemaxExport
     )
     coating_results = load_coating_design(coating_dir, report_dir)
     chassis_origin, chassis_tilt_deg = chassis_pose(system)
+    detectors = prepare_detector_export(snapshot, report_dir)
     return ZemaxExportPlan(
         report_dir=report_dir,
         coating_dir=coating_dir,
@@ -882,7 +910,8 @@ def build_export_plan(report_dir: Path, coating_dir: Path | None) -> ZemaxExport
         chassis=chassis,
         mirrors=mirrors,
         coating_results=coating_results,
-        detectors=prepare_detector_export(snapshot, report_dir),
+        detectors=detectors,
+        aperture_report=build_zemax_aperture_report(detectors),
         coatings=prepare_coating_export(chassis, mirrors, coating_results),
         sources=tuple(build_sources(snapshot.projector, snapshot.fov_x, snapshot.fov_y)),
         chassis_origin=chassis_origin,
@@ -912,6 +941,11 @@ def print_export_summary(plan: ZemaxExportPlan) -> None:
         "ambient dets  : "
         + ", ".join(detector.name for detector in plan.detectors.ambient)
     )
+    print(
+        "aperture sweep: height "
+        f"{list(plan.aperture_report.opening_height_deltas_mm)} mm × shift "
+        f"{list(plan.aperture_report.vertical_shifts_mm)} mm (vertical only)"
+    )
     for note in coatings.notes:
         print(f"  ! {note}")
     chassis_material_name = plan.chassis.material.name
@@ -934,6 +968,9 @@ def build_bundle_notes(plan: ZemaxExportPlan) -> str:
         f"- face coating modes: `{MIRROR_FACE_COATING_MODES}`\n"
         f"- chassis face coatings: `{plan.coatings.chassis_face_coatings}`\n"
         f"- detector pixels: `{plan.detectors.pixels_by_name}`\n"
+        f"- eyebox overlap report: `{plan.detectors.overlap_report.report_name}`\n"
+        f"- aperture height deltas (mm): `{plan.aperture_report.opening_height_deltas_mm}`\n"
+        f"- aperture vertical shifts (mm): `{plan.aperture_report.vertical_shifts_mm}`\n"
         f"- optimizer run: `{plan.report_dir}`\n"
         f"- optimizer git SHA: `{plan.snapshot.git_sha}`\n"
         "- geometry source: serialized optimizer system snapshot\n"
@@ -962,7 +999,9 @@ def write_export_bundle(
         detector_pixels_by_name=plan.detectors.pixels_by_name,
         extra_pupils=plan.detectors.extra_detectors,
         pupil_reports=plan.detectors.reports,
+        aperture_report=plan.aperture_report,
         coating_report=plan.coatings.report,
+        eyebox_overlap_report=plan.detectors.overlap_report,
         min_relative_intensity=MIN_RELATIVE_INTENSITY,
         min_absolute_intensity=MIN_ABSOLUTE_INTENSITY,
         notes=build_bundle_notes(plan),

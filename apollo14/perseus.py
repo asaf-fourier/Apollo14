@@ -69,6 +69,8 @@ PERSEUS_PROJECTOR_DIRECTION = normalize(
 # ── Combiner (glass chassis + cascade of tilted partial mirrors) ────────────
 
 PERSEUS_PANTOSCOPIC_TILT = 7.0 * deg         # CCW about world-x, about combiner center
+PERSEUS_COMBINER_NORMAL = normalize(
+    rotate_vectors(jnp.array([0.0, 0.0, 1.0]), X_AXIS, -PERSEUS_PANTOSCOPIC_TILT))
 PERSEUS_NUM_MIRRORS = 8
 PERSEUS_PRISM_ANGLE = 10.578 * deg           # top-side wedge (chassis z-skew)
 # Mirror plane normal sits this far off the (untilted) combiner normal +z; the

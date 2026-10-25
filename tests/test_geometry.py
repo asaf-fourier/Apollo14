@@ -215,6 +215,30 @@ def test_perseus_ar_coating_is_on_all_chassis_faces_and_survives_transforms():
                                original.coating_reflectance.values)
 
 
+def test_perseus_visualizer_reuses_the_canonical_geometry():
+    from apollo14.perseus import build_perseus_system
+    from apollo14.units import nm
+    from examples.visualize_perseus import build_routes, build_visual_system
+
+    visual_system = build_visual_system()
+    reference_system = build_perseus_system()
+
+    assert [element.name for element in visual_system.elements] == [
+        element.name for element in reference_system.elements
+    ]
+    for visual_element, reference_element in zip(
+        visual_system.elements, reference_system.elements, strict=True
+    ):
+        assert type(visual_element) is type(reference_element)
+        assert jnp.allclose(visual_element.position, reference_element.position)
+        if hasattr(reference_element, "normal"):
+            assert jnp.allclose(visual_element.normal, reference_element.normal)
+
+    without_aperture = build_visual_system(include_aperture=False)
+    assert "aperture" not in [element.name for element in without_aperture.elements]
+    assert len(build_routes(without_aperture, 550.0 * nm)) == 9
+
+
 def test_perseus_adds_five_mm_of_glass_only_on_projector_side():
     from apollo14.perseus import (
         PERSEUS_BASE_LIGHT_POSITION,
