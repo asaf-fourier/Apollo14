@@ -40,6 +40,7 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+from atlas import Materials
 
 from apollo14.binning import make_sample_lattice
 from apollo14.combiner import compensated_reflectances
@@ -86,7 +87,8 @@ enable_jax_compilation_cache()
 # Spacing follows the manufactured wafer pitch and is frozen (not optimized).
 NUM_MIRRORS = PERSEUS_NUM_MIRRORS          # ← tune the mirror count here
 CHASSIS_Z = PERSEUS_CHASSIS_Z              # 3.0 mm full combiner depth
-COMBINER_MATERIAL = agc_m074              # Atlas glass used for tracing and saved systems
+# COMBINER_MATERIAL = agc_m074              # Atlas glass used for tracing and saved systems
+COMBINER_MATERIAL = Materials.schott.BASF2
 FROZEN_SPACINGS = spacings_for_count(NUM_MIRRORS)   # (M-1,) wafer-pitch gaps
 SEED_SPACING = PERSEUS_MIRROR_STACK_SPAN / (NUM_MIRRORS - 1)   # per-mirror gap
 

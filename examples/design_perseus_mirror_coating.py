@@ -83,7 +83,7 @@ NUM_WAVELENGTHS = 120               # target sample points across the band
 NUM_ANGLES = 5                      # AOI samples across the swept range
 
 # Alternating high/low-index films (DBR-style contrast) in AGC M-074 glass.
-NUM_SEED_FILMS = 5
+NUM_SEED_FILMS = 7
 # NUM_SEED_FILMS = 15
 THICKNESS_BOUNDS_NM = (20.0, 200.0)
 TIO2_N_BOUNDS = (2.0, 2.525)        # PLD_TiO2 tunable index range
@@ -112,7 +112,8 @@ POLISH_MAX_ITERATIONS = 500
 
 SAVE_PER_MIRROR_PLOTS = True
 OUTPUT_ROOT = "examples/reports"
-GLASS = Materials.moveon.MR10
+# GLASS = Materials.moveon.MR10
+GLASS = Materials.schott.BASF2
 
 # ── Load the optimizer output ────────────────────────────────────────────────
 
@@ -293,7 +294,6 @@ def _seed_moveon_layers(moveon, seed_thickness_high, seed_thickness_low, glass=G
     layers.append(Layer(material=glass))
 
     return layers
-
 
 
 # ── Design one mirror (basin hopping → L-BFGS polish) ────────────────────────
