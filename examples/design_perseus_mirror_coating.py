@@ -88,8 +88,17 @@ NUM_SEED_FILMS = 7
 THICKNESS_BOUNDS_NM = (20.0, 200.0)
 TIO2_N_BOUNDS = (2.0, 2.525)        # PLD_TiO2 tunable index range
 AL2O3_N_BOUNDS = (1.47, 1.65)       # PLD_Al2O3 tunable index range
-SEED_N_HIGH = 2.50                  # QWOT seed indices (max Δn)
+SEED_N_HIGH = 2.50                  # QWOT seed indices for the PLD tunable stack
 SEED_N_LOW = 1.47
+# Fixed-dispersion films used by the active seed (see design_mirror).
+HIGH_INDEX_MATERIAL = Materials.balzers.Nb2O5
+LOW_INDEX_MATERIAL = Materials.balzers.Al2O3
+# The targets are weak (~2%) partial mirrors, so the seed must start in a
+# low-reflectance basin. A QWOT H/L stack is a high reflector (seed Rs up to
+# ~98%) and L-BFGS gets trapped near it (merit ~1e-2). Instead, seed the high-
+# index films thin (at the lower bound) and the low-index spacers at QWOT
+# computed from the low-index material's real index.
+SEED_THICKNESS_HIGH_NM = 20.0
 # Manufacturing thickness (height) tolerance is a hard ±1% of each film's
 # nominal thickness. Atlas expresses tolerances as Gaussian 1σ values, so its
 # robust optimizer uses one third of that layer-specific hard limit.
@@ -104,7 +113,7 @@ TOLERANCE_RANDOM_SEED = 42
 
 # Optimizer budget PER MIRROR. Modest defaults so a full stack runs in minutes;
 # bump for production recipes (BH max_iterations→100+, local_maxiter→500).
-BH_MAX_ITERATIONS = 500
+BH_MAX_ITERATIONS = 300
 BH_LOCAL_MAXITER = 400
 BH_STEPSIZE = 0.2
 BH_TEMPERATURE = 0.01
@@ -295,15 +304,16 @@ def _seed_moveon_layers(moveon, seed_thickness_high, seed_thickness_low, glass=G
 
     return layers
 
-def _seed_layers_2_materials(material_1, material_2, thickness_1, thickness_2, glass=GLASS, thickness_tol=2*nm) -> list:
+def _seed_layers_2_materials(material_1, material_2, thickness_1, thickness_2, glass=GLASS) -> list:
     layers = [Layer(material=glass)]
     for i in range(NUM_SEED_FILMS):
         is_1 = i % 2 == 0
+        thickness = thickness_1 if is_1 else thickness_2
         layers.append(Layer(
             material=material_1 if is_1 else material_2,
-            thickness=thickness_1 if is_1 else thickness_2,
+            thickness=thickness,
             thickness_bounds=THICKNESS_BOUNDS_NM,
-            thickness_tolerance=thickness_tol,
+            thickness_tolerance=_atlas_thickness_sigma_nm(thickness),
             vary_thickness=True,
         ))
     layers.append(Layer(material=glass))
@@ -331,12 +341,11 @@ def design_mirror(mirror_index, target_wavelengths_nm, target_reflectance,
     designer = OpticalDesigner(
         # layers=_seed_layers(glass, seed_thickness_high, seed_thickness_low),
         layers=_seed_layers_2_materials(
-            material_1=Materials.balzers.Nb2O5,
-            material_2=Materials.balzers.Al2O3,
+            material_1=HIGH_INDEX_MATERIAL,
+            material_2=LOW_INDEX_MATERIAL,
             thickness_1=seed_thickness_high,
             thickness_2=seed_thickness_low,
             glass=glass,
-            thickness_tol=2*nm
         ),
         # layers=_seed_moveon_layers(Materials.moveon, seed_thickness_high, seed_thickness_low, glass),
         target=target)
@@ -689,10 +698,13 @@ def main():
     aoi_min, aoi_max, aoi_on_axis, fov_ray_angles = incidence_angle_range(
         mirror_normal, num_mirrors, glass_index)
     aoi_design = 0.5 * (aoi_min + aoi_max)
-    seed_thickness_high = _qwot_thickness_nm(
-        REFERENCE_WAVELENGTH_NM, SEED_N_HIGH, glass_index, aoi_design)
+    high_index = float(Layer(material=HIGH_INDEX_MATERIAL, thickness=1.0)
+                       .index_at(REFERENCE_WAVELENGTH_NM).real)
+    low_index = float(Layer(material=LOW_INDEX_MATERIAL, thickness=1.0)
+                      .index_at(REFERENCE_WAVELENGTH_NM).real)
+    seed_thickness_high = SEED_THICKNESS_HIGH_NM
     seed_thickness_low = _qwot_thickness_nm(
-        REFERENCE_WAVELENGTH_NM, SEED_N_LOW, glass_index, aoi_design)
+        REFERENCE_WAVELENGTH_NM, low_index, glass_index, aoi_design)
 
     band = (float(mirrors[0][1].min()), float(mirrors[0][1].max()))
     weights = projector_weights(np.linspace(*band, NUM_WAVELENGTHS))
@@ -710,7 +722,9 @@ def main():
     print(f"  Atlas design angles ({NUM_ANGLES} samples, deg): "
           + ", ".join(f"{a:.2f}" for a in angle_grid))
     print(f"seed stack    : {NUM_SEED_FILMS} films ({NUM_SEED_FILMS // 2} H/L pairs), "
-          f"QWOT@{aoi_design:.0f}° H={seed_thickness_high:.0f}nm L={seed_thickness_low:.0f}nm")
+          f"{HIGH_INDEX_MATERIAL.name}/{LOW_INDEX_MATERIAL.name}, "
+          f"thin H={seed_thickness_high:.0f}nm, "
+          f"L=QWOT@{aoi_design:.0f}° {seed_thickness_low:.0f}nm")
     print(f"budget/mirror : basin_hopping {BH_MAX_ITERATIONS}×{BH_LOCAL_MAXITER}, "
           f"lbfgs polish {POLISH_MAX_ITERATIONS}\n")
 
@@ -792,14 +806,14 @@ def main():
             "fit_weights": "0.2 + 0.8·radiance/peak (projector-spectrum weighted)",
             "materials": {
                 "medium_substrate": glass.name,
-                "high_index": Materials.moveon.TiO2.name,
-                "high_n_bounds": Materials.moveon.TiO2.n_range,
-                "low_index": Materials.moveon.SiO2.name,
-                "low_n_bounds": Materials.moveon.SiO2.n_range,
+                "high_index": HIGH_INDEX_MATERIAL.name,
+                "high_n_at_reference": high_index,
+                "low_index": LOW_INDEX_MATERIAL.name,
+                "low_n_at_reference": low_index,
             },
             "seed": {
                 "num_films": NUM_SEED_FILMS,
-                "n_high": SEED_N_HIGH, "n_low": SEED_N_LOW,
+                "n_high": high_index, "n_low": low_index,
                 "thickness_high_nm": seed_thickness_high,
                 "thickness_low_nm": seed_thickness_low,
                 "design_aoi_deg": aoi_design,
