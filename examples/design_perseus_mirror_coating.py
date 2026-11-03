@@ -92,7 +92,9 @@ SEED_N_HIGH = 2.50                  # QWOT seed indices for the PLD tunable stac
 SEED_N_LOW = 1.47
 # Fixed-dispersion films used by the active seed (see design_mirror).
 HIGH_INDEX_MATERIAL = Materials.balzers.Nb2O5
-LOW_INDEX_MATERIAL = Materials.balzers.Al2O3
+# LOW_INDEX_MATERIAL = Materials.balzers.Al2O3
+LOW_INDEX_MATERIAL = Materials.moveon.SiO2
+
 # The targets are weak (~2%) partial mirrors, so the seed must start in a
 # low-reflectance basin. A QWOT H/L stack is a high reflector (seed Rs up to
 # ~98%) and L-BFGS gets trapped near it (merit ~1e-2). Instead, seed the high-
@@ -113,7 +115,7 @@ TOLERANCE_RANDOM_SEED = 42
 
 # Optimizer budget PER MIRROR. Modest defaults so a full stack runs in minutes;
 # bump for production recipes (BH max_iterations→100+, local_maxiter→500).
-BH_MAX_ITERATIONS = 300
+BH_MAX_ITERATIONS = 60
 BH_LOCAL_MAXITER = 400
 BH_STEPSIZE = 0.2
 BH_TEMPERATURE = 0.01
