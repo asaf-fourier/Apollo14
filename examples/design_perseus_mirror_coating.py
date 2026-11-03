@@ -104,7 +104,7 @@ TOLERANCE_RANDOM_SEED = 42
 
 # Optimizer budget PER MIRROR. Modest defaults so a full stack runs in minutes;
 # bump for production recipes (BH max_iterations→100+, local_maxiter→500).
-BH_MAX_ITERATIONS = 10000
+BH_MAX_ITERATIONS = 500
 BH_LOCAL_MAXITER = 400
 BH_STEPSIZE = 0.2
 BH_TEMPERATURE = 0.01
@@ -295,6 +295,20 @@ def _seed_moveon_layers(moveon, seed_thickness_high, seed_thickness_low, glass=G
 
     return layers
 
+def _seed_layers_2_materials(material_1, material_2, thickness_1, thickness_2, glass=GLASS, thickness_tol=2*nm) -> list:
+    layers = [Layer(material=glass)]
+    for i in range(NUM_SEED_FILMS):
+        is_1 = i % 2 == 0
+        layers.append(Layer(
+            material=material_1 if is_1 else material_2,
+            thickness=thickness_1 if is_1 else thickness_2,
+            thickness_bounds=THICKNESS_BOUNDS_NM,
+            thickness_tolerance=thickness_tol,
+            vary_thickness=True,
+        ))
+    layers.append(Layer(material=glass))
+
+    return layers
 
 # ── Design one mirror (basin hopping → L-BFGS polish) ────────────────────────
 
@@ -316,7 +330,15 @@ def design_mirror(mirror_index, target_wavelengths_nm, target_reflectance,
 
     designer = OpticalDesigner(
         # layers=_seed_layers(glass, seed_thickness_high, seed_thickness_low),
-        layers=_seed_moveon_layers(Materials.moveon, seed_thickness_high, seed_thickness_low, glass),
+        layers=_seed_layers_2_materials(
+            material_1=Materials.balzers.Nb2O5,
+            material_2=Materials.balzers.Al2O3,
+            thickness_1=seed_thickness_high,
+            thickness_2=seed_thickness_low,
+            glass=glass,
+            thickness_tol=2*nm
+        ),
+        # layers=_seed_moveon_layers(Materials.moveon, seed_thickness_high, seed_thickness_low, glass),
         target=target)
     hop_state = {"hop": 0, "best": float("inf")}
 
