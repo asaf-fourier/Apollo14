@@ -45,6 +45,15 @@ class Projector:
     ``nx × ny`` lattice spanning ``beam_width × beam_height``. All rays
     start at intensity 1.0 before spectral and angular scaling.
 
+    ``cell_centered`` picks where the lattice points sit. ``False`` (default)
+    is endpoint-inclusive: the outermost rays lie exactly on the beam edges,
+    yet each carries a full ray's weight while representing only half a cell.
+    When an aperture clips the beam near its edges (as the Perseus beam stop
+    does), those over-weighted edge rays bias the throughput low at coarse
+    ``ny``. ``True`` places each ray at the center of one of ``nx × ny``
+    equal cells tiling the beam (pitch ``width / nx``), which converges at
+    much coarser sampling — see :func:`apollo14.geometry.planar_grid_points`.
+
     Angular roll-off is modelled as a linear falloff in the projector's
     local x/y axes, specified as ``fraction per radian``. For example, a
     2% drop at 6° maps to ``falloff_x = 0.02 / (6 * deg)``.
@@ -62,11 +71,13 @@ class Projector:
     spectrum: tuple[jnp.ndarray, jnp.ndarray] | None = None
     """Optional ``(wavelengths, radiance)`` spectral emission curve.
     Units: wavelengths in internal length units, radiance in W/sr/m²/nm."""
+    cell_centered: bool = False  # rays at cell centers instead of endpoint-inclusive
 
     @classmethod
     def uniform(cls, position, direction, beam_width, beam_height,
                 nx: int, ny: int, spectrum=None,
-                falloff_x: float = 0.0, falloff_y: float = 0.0):
+                falloff_x: float = 0.0, falloff_y: float = 0.0,
+                cell_centered: bool = False):
         """Create a projector with uniform intensity across all pixels."""
         return cls(
             position=position,
@@ -75,13 +86,14 @@ class Projector:
             beam_height=beam_height,
             nx=nx, ny=ny,
             falloff_x=falloff_x, falloff_y=falloff_y,
-            spectrum=spectrum,
+            spectrum=spectrum, cell_centered=cell_centered,
         )
 
     @classmethod
     def from_csv(cls, path, position, direction, beam_width, beam_height,
                  nx: int, ny: int, column: str = "W",
-                 falloff_x: float = 0.0, falloff_y: float = 0.0):
+                 falloff_x: float = 0.0, falloff_y: float = 0.0,
+                 cell_centered: bool = False):
         """Build a projector whose spectrum comes from a measured CSV.
 
         The CSV is expected to have a ``wavelength`` column (in nm) and one
@@ -96,7 +108,7 @@ class Projector:
             beam_height=beam_height,
             nx=nx, ny=ny,
             falloff_x=falloff_x, falloff_y=falloff_y,
-            spectrum=(wls, rad),
+            spectrum=(wls, rad), cell_centered=cell_centered,
         )
 
     def spectral_band(self, threshold: float = 0.05) -> tuple[float, float]:
@@ -181,8 +193,13 @@ class Projector:
             direction if direction is not None else self.direction)
         local_x, local_y = self._compute_basis(unit_direction)
 
-        xs = jnp.linspace(-self.beam_width / 2, self.beam_width / 2, self.nx)
-        ys = jnp.linspace(-self.beam_height / 2, self.beam_height / 2, self.ny)
+        half_width, half_height = self.beam_width / 2, self.beam_height / 2
+        if self.cell_centered:
+            # Inset half a cell so nx × ny equal cells exactly tile the beam.
+            half_width -= self.beam_width / (2 * self.nx)
+            half_height -= self.beam_height / (2 * self.ny)
+        xs = jnp.linspace(-half_width, half_width, self.nx)
+        ys = jnp.linspace(-half_height, half_height, self.ny)
         grid_x, grid_y = jnp.meshgrid(xs, ys)  # (ny, nx)
         grid_x_flat = grid_x.ravel()
         grid_y_flat = grid_y.ravel()
@@ -232,7 +249,8 @@ class PlayNitrideLed(Projector):
     @classmethod
     def create_broadband(cls, position, direction, beam_width, beam_height,
                          nx: int, ny: int,
-                         falloff_x: float = 0.0, falloff_y: float = 0.0):
+                         falloff_x: float = 0.0, falloff_y: float = 0.0,
+                         cell_centered: bool = False):
         """Measured panel-white spectrum, peak-normalized.
 
         Reads the ``W`` column — the manufacturer's measurement of the
@@ -251,6 +269,7 @@ class PlayNitrideLed(Projector):
             nx=nx, ny=ny,
             falloff_x=falloff_x, falloff_y=falloff_y,
             spectrum=(wavelengths, radiance / radiance.max()),
+            cell_centered=cell_centered,
         )
 
 

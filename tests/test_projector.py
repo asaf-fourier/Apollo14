@@ -1,4 +1,5 @@
 import jax.numpy as jnp
+import numpy as np
 
 from apollo14.geometry import normalize
 from apollo14.projector import Projector, scan_directions
@@ -260,3 +261,26 @@ def test_normalized_channels_equal_peak_intensity():
         ray = proj.generate_rays(wavelength=peak_wl)
         peak_intensities.append(float(ray.intensity[0]))
     assert jnp.allclose(jnp.array(peak_intensities), 1.0)
+
+
+def _beam_offsets(cell_centered):
+    """Ray offsets along (width, height) for a 10 × 2 beam aimed down -y."""
+    projector = Projector.uniform(
+        position=jnp.zeros(3), direction=jnp.array([0.0, -1.0, 0.0]),
+        beam_width=10.0, beam_height=2.0, nx=5, ny=4, cell_centered=cell_centered)
+    rays = projector.generate_rays()
+    local_x, local_y = projector._compute_basis(rays.dir)
+    return np.asarray(rays.pos @ local_x), np.asarray(rays.pos @ local_y)
+
+
+def test_endpoint_sampling_puts_rays_on_the_beam_edges():
+    along_width, along_height = _beam_offsets(cell_centered=False)
+    np.testing.assert_allclose(np.unique(np.round(along_width, 6)), [-5, -2.5, 0, 2.5, 5], atol=1e-5)
+    np.testing.assert_allclose(np.abs(along_height).max(), 1.0, atol=1e-6)
+
+
+def test_cell_centered_sampling_insets_rays_half_a_cell():
+    along_width, along_height = _beam_offsets(cell_centered=True)
+    # 5 cells of 2.0 across the 10-wide beam, 4 cells of 0.5 across the 2-high beam.
+    np.testing.assert_allclose(np.unique(np.round(along_width, 6)), [-4, -2, 0, 2, 4], atol=1e-5)
+    np.testing.assert_allclose(np.unique(np.round(along_height, 6)), [-0.75, -0.25, 0.25, 0.75], atol=1e-5)

@@ -121,6 +121,11 @@ Y_FOV = PERSEUS_FOV_AROUND_PROJECTOR_Y
 # combiner), so its rays enter through the aperture the builder places on the
 # same axis — the exact projector the visualization uses.
 
+# Cell-centred beam sampling: endpoint-inclusive rows sit on the beam edges the
+# aperture clips, biasing throughput low (8.05% vs a converged ~9.5% at 25×5 on
+# the 0.75 mm / N-BASF2 geometry, 2026-11-15). Cell-centred is converged within
+# ±1% already at 25×5, so the optimizer keeps this cheap grid.
+PROJECTOR_CELL_CENTERED = True
 PROJECTOR_NX, PROJECTOR_NY = 25, 5
 ANGULAR_STEPS_X, ANGULAR_STEPS_Y = 8, 8
 
@@ -129,7 +134,7 @@ PROJECTOR_DIRECTION = PERSEUS_PROJECTOR_DIRECTION
 PROJECTOR = PlayNitrideLed.create_broadband(
     position=PERSEUS_LIGHT_POSITION, direction=PROJECTOR_DIRECTION,
     beam_width=PERSEUS_BEAM_WIDTH, beam_height=PERSEUS_BEAM_HEIGHT,
-    nx=PROJECTOR_NX, ny=PROJECTOR_NY,
+    nx=PROJECTOR_NX, ny=PROJECTOR_NY, cell_centered=PROJECTOR_CELL_CENTERED,
 )
 
 # ── Wavelength sampling ─────────────────────────────────────────────────────
@@ -166,7 +171,7 @@ LUMINANCE_TRACE_WEIGHTS = photopic_luminance_weights(TRACE_WAVELENGTHS)
 # ── Per-cell brightness target ─────────────────────────────────────────────
 
 NUM_EYEBOX_CELLS = EYEBOX_NX * EYEBOX_NY
-EYEBOX_TARGET = 0.14
+EYEBOX_TARGET = 0.10                 # photometric, in-band (420–680 nm) eyebox efficiency
 PER_CELL_TARGET = EYEBOX_TARGET / NUM_EYEBOX_CELLS
 
 
@@ -224,6 +229,7 @@ VALIDATION_PROJECTOR = PlayNitrideLed.create_broadband(
     position=PERSEUS_LIGHT_POSITION, direction=PROJECTOR_DIRECTION,
     beam_width=PERSEUS_BEAM_WIDTH, beam_height=PERSEUS_BEAM_HEIGHT,
     nx=VALIDATION_PROJECTOR_NX, ny=VALIDATION_PROJECTOR_NY,
+    cell_centered=PROJECTOR_CELL_CENTERED,
 )
 VALIDATION_FOV_GRID = FovGrid(
     PROJECTOR_DIRECTION, X_FOV, Y_FOV,
@@ -400,7 +406,7 @@ def _clip(params: CombinerParams) -> CombinerParams:
 
 # ── Adam optimizer ──────────────────────────────────────────────────────────
 
-PHASE1_STEPS = 150
+PHASE1_STEPS = 50
 PHASE2_STEPS = 100
 
 adam_cfg_phase1 = AdamConfig(peak_lr=3e-3, warmup_steps=20, num_steps=PHASE1_STEPS)
@@ -592,10 +598,9 @@ def main():
     best_phase1_loss = float(initial_breakdown["total"])
     best_phase1_step = 0
     best_phase1_params = params
-    best_path = _save_best_result(
-        run_dir, "phase1", 0, best_phase1_loss, params)
-    print(f"Saved initial best result: {best_path}")
 
+    # The best design of each phase is kept in memory and written to
+    # best_<phase>.json once, when the phase ends (not on every improvement).
     print("\n── Phase 1: target-focused (drive every cell to target) ──")
     for step in range(PHASE1_STEPS):
         loss, grad = value_and_grad_phase1(params)
@@ -604,9 +609,6 @@ def main():
             best_phase1_loss = loss_value
             best_phase1_step = step
             best_phase1_params = params
-            best_path = _save_best_result(
-                run_dir, "phase1", step, loss_value, params)
-            print(f"  new best: {loss_value:.8f} → {best_path}")
         params, state = adam_step(params, _freeze_spacings(grad), state,
                                   adam_cfg_phase1)
         params = _clip(params)
@@ -619,9 +621,10 @@ def main():
         best_phase1_loss = phase1_final_loss
         best_phase1_step = PHASE1_STEPS
         best_phase1_params = params
-        best_path = _save_best_result(
-            run_dir, "phase1", PHASE1_STEPS, phase1_final_loss, params)
-        print(f"  new best: {phase1_final_loss:.8f} → {best_path}")
+    best_path = _save_best_result(
+        run_dir, "phase1", best_phase1_step, best_phase1_loss, best_phase1_params)
+    print(f"Phase 1 best score: {best_phase1_loss:.8f} at step {best_phase1_step} "
+          f"→ {best_path}")
     # Continue and report from the best evaluated phase-1 design, not merely
     # Adam's final update (which may have stepped away from the minimum).
     params = best_phase1_params
@@ -646,9 +649,6 @@ def main():
                 best_phase2_loss = loss_value
                 best_phase2_step = step
                 best_phase2_params = params
-                best_path = _save_best_result(
-                    run_dir, "phase2", step, loss_value, params)
-                print(f"  new best: {loss_value:.8f} → {best_path}")
             params, state = adam_step(params, _freeze_spacings(grad), state,
                                       adam_cfg_phase2)
             params = _clip(params)
@@ -661,9 +661,10 @@ def main():
             best_phase2_loss = phase2_final_loss
             best_phase2_step = PHASE2_STEPS
             best_phase2_params = params
-            best_path = _save_best_result(
-                run_dir, "phase2", PHASE2_STEPS, phase2_final_loss, params)
-            print(f"  new best: {phase2_final_loss:.8f} → {best_path}")
+        best_path = _save_best_result(
+            run_dir, "phase2", best_phase2_step, best_phase2_loss, best_phase2_params)
+        print(f"Phase 2 best score: {best_phase2_loss:.8f} at step {best_phase2_step} "
+              f"→ {best_path}")
         params = best_phase2_params
         final_breakdown = breakdown_fn(params, final_merit_cfg)
 

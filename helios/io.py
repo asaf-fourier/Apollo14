@@ -73,6 +73,7 @@ def _serialize_projector(p: Projector) -> dict:
         "ny": int(p.ny),
         "falloff_x": _round_sig(float(p.falloff_x)),
         "falloff_y": _round_sig(float(p.falloff_y)),
+        "cell_centered": bool(getattr(p, "cell_centered", False)),
         "spectrum": None,
     }
     if p.spectrum is not None:
