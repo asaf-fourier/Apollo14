@@ -649,6 +649,35 @@ def validate_manufacturing_tolerance(result, *, seed: int) -> dict:
     }
 
 
+def _deposition_to_dict(film_layers) -> dict:
+    """Explicit layer ordering for the coater.
+
+    Atlas orders films from the incident medium toward the substrate, so
+    ``layers[0]`` is the film the design light meets first and ``layers[-1]``
+    touches the substrate. Coating grows *on* the substrate, so deposition runs
+    in reverse: ``layers[-1]`` is deposited first.
+    """
+    is_lossless = all(float(layer.index_at(REFERENCE_WAVELENGTH_NM).imag) == 0.0
+                      for layer in film_layers)
+    deposition_sequence = [
+        {"step": step,
+         "layer_index": layer_index,
+         "material": film_layers[layer_index].material.name,
+         "thickness_nm": float(film_layers[layer_index].thickness)}
+        for step, layer_index in enumerate(reversed(range(len(film_layers))))
+    ]
+    return {
+        "layer_order": ("layers[0] faces the incident medium (first film the "
+                        "design light hits); layers[-1] touches the substrate"),
+        "deposition_order": ("deposited on the substrate starting from "
+                             "layers[-1] and ending with layers[0]"),
+        # Lossless films between identical glass give the same R/T from either
+        # side, so which physical face meets the projector does not matter.
+        "orientation_sensitive": not is_lossless,
+        "deposition_sequence": deposition_sequence,
+    }
+
+
 def _result_to_dict(result) -> dict:
     return {
         "merit": float(result.merit),
@@ -662,6 +691,7 @@ def _result_to_dict(result) -> dict:
         "incident_medium": result.layers[0].material.name,
         "substrate": result.layers[-1].material.name,
         "layers": [_layer_to_dict(layer) for layer in result.film_layers],
+        "deposition": _deposition_to_dict(result.film_layers),
         "achieved_reflectance": {
             "wavelengths_nm": np.asarray(result.wavelengths_nm).tolist(),
             "angles_deg": np.asarray(result.angles_deg).tolist(),
