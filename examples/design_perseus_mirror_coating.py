@@ -57,6 +57,7 @@ Run::
 # ruff: noqa: I001
 import json
 import time
+from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -65,12 +66,14 @@ from pathlib import Path
 from atlas import Layer, Materials, MultiTarget, OpticalDesigner, Target, example_output_dir
 from atlas.core.stack import Stack
 from atlas.core.tmm import _precompute_fixed_nk_data, compute_rt_polarized
+from atlas.optimizers.lbfgs import LBFGSOptimizer
 import jax
 import jax.numpy as jnp
 import numpy as np
 import plotly.graph_objects as go
 from plotly.colors import sample_colorscale
 from plotly.subplots import make_subplots
+import scipy.optimize
 from scipy.stats import norm, qmc
 
 from apollo14.geometry import snell_refract
@@ -101,14 +104,10 @@ POLARIZATION = "s"                  # 100% s input; incident p power is zero
 NUM_WAVELENGTHS = 120               # target sample points across the band
 NUM_ANGLES = 5                      # AOI samples across the swept range
 
-# Alternating high/low-index films (DBR-style contrast) in AGC M-074 glass.
+# Alternating high/low-index films (DBR-style contrast) in GLASS.
 NUM_SEED_FILMS = 11                 # 11 films hold the display fit AND the suppression
 # NUM_SEED_FILMS = 15
 THICKNESS_BOUNDS_NM = (20.0, 200.0)
-TIO2_N_BOUNDS = (2.0, 2.525)        # PLD_TiO2 tunable index range
-AL2O3_N_BOUNDS = (1.47, 1.65)       # PLD_Al2O3 tunable index range
-SEED_N_HIGH = 2.50                  # QWOT seed indices for the PLD tunable stack
-SEED_N_LOW = 1.47
 # Fixed-dispersion films used by the active seed (see design_mirror).
 HIGH_INDEX_MATERIAL = Materials.balzers.Nb2O5
 # LOW_INDEX_MATERIAL = Materials.balzers.Al2O3
@@ -125,20 +124,37 @@ SEED_THICKNESS_HIGH_NM = 20.0
 # robust optimizer uses one third of that layer-specific hard limit.
 THICKNESS_TOLERANCE_PLUS_MINUS_FRACTION = 0.01
 ATLAS_TOLERANCE_SIGMA_DIVISOR = 3.0
+# Index 1σ — only applies to tunable-index films. The Balzers/MoveOn films are
+# fixed-dispersion, so neither the robust optimizer nor the Monte Carlo
+# perturbs their index (index error is not modeled for them).
 N_TOLERANCE = 0.005
-ROBUST_OPTIMIZATION_SAMPLES = 64
+# Robust polish samples. The ±1% thickness tolerance moves the merit by only
+# ~1% (2026-11-15 run: polish ended ~1% above the nominal basin merit on every
+# mirror), so 16 samples suffice; the Monte Carlo below checks robustness.
+ROBUST_OPTIMIZATION_SAMPLES = 16
 TOLERANCE_VALIDATION_SAMPLES = 1024
 TOLERANCE_VALIDATION_BATCH_SIZE = 64
 TOLERANCE_MAX_RS_ERROR = 0.01
 TOLERANCE_RANDOM_SEED = 42
 
-# Optimizer budget PER MIRROR. Modest defaults so a full stack runs in minutes;
-# bump for production recipes (BH max_iterations→100+, local_maxiter→500).
+# Optimizer budget PER MIRROR. BH_MAX_ITERATIONS is the display-only stage.
+# Local L-BFGS-B runs need 40–127 iterations (median ~50, 2026-11-16 probe);
+# 400 is never reached. A run cut off before converging makes scipy reject
+# the hop and discard its design, so never set this near that range.
 BH_MAX_ITERATIONS = 60
 BH_LOCAL_MAXITER = 400
-BH_STEPSIZE = 0.2
-BH_TEMPERATURE = 0.01
-POLISH_MAX_ITERATIONS = 500
+# Hop size in normalized [0, 1] thickness space. 0.2 explores widely, which
+# suits the display-only search (best 4.2e-5 vs 7.2e-5 at 0.05); once the
+# suppression terms are on, small steps refine the found basin instead of
+# jumping out of it (best 5.2e-4 at 0.05 vs 1.0e-3 at 0.2). Mirror 4, 2026-11-16.
+BH_STEPSIZE = 0.2                   # display-only stage
+RAMP_STEPSIZE = 0.05                # suppression ramp + final-weight stages
+# Metropolis temperature: a worse hop is accepted with probability
+# exp(-Δmerit / T). Merits here are ~1e-5 (display only) to ~3e-4 (with
+# suppression), so T must sit near that scale to be selective; at T = 0.01
+# exp(-Δ/T) ≈ 1 and every hop was accepted (a random walk, 2026-11-16).
+BH_TEMPERATURE = 1e-5
+POLISH_MAX_ITERATIONS = 100
 
 # ── Angular suppression (ghosts / see-through) ──────────────────────────────
 # Each mirror is a MultiTarget design:
@@ -174,6 +190,13 @@ ROBUST_BASIN_HOPPING = False
 # Print every basin-hopping hop and every suppression stage while a mirror is
 # optimized. Off: each mirror prints only its best score once it is done.
 VERBOSE_OPTIMIZATION = False
+# One detailed line per L-BFGS-B run — every basin-hopping local search and the
+# robust polish: iterations used, function evaluations, start → end merit,
+# projected-gradient norm, layers pinned at a thickness bound, wall time, why
+# it stopped, and (for basin hops) whether the hop was accepted.
+LBFGS_PROGRESS = True
+# >0: additionally print every N-th iteration inside each L-BFGS-B run.
+LBFGS_PRINT_EVERY = 0
 
 # Per-mirror angular report: R(λ, θ) for s, p and unpolarized on this grid.
 ANGULAR_WAVELENGTHS_NM = np.linspace(420.0, 680.0, 131)
@@ -371,47 +394,6 @@ def _atlas_thickness_sigma_nm(thickness_nm: float) -> float:
             / ATLAS_TOLERANCE_SIGMA_DIVISOR)
 
 
-def _seed_layers(glass, seed_thickness_high, seed_thickness_low) -> list:
-    """A fresh alternating PLD_TiO2 / PLD_Al2O3 seed stack in ``glass``."""
-    layers = [Layer(material=glass)]                       # medium = glass
-    for film_idx in range(NUM_SEED_FILMS):
-        is_high = film_idx % 2 == 0
-        layers.append(Layer(
-            material=Materials.pld.TiO2 if is_high else Materials.pld.Al2O3,
-            thickness=seed_thickness_high if is_high else seed_thickness_low,
-            refractive_index=SEED_N_HIGH if is_high else SEED_N_LOW,
-            vary_thickness=True, vary_n=True,
-            thickness_bounds=THICKNESS_BOUNDS_NM,
-            thickness_tolerance=_atlas_thickness_sigma_nm(
-                seed_thickness_high if is_high else seed_thickness_low),
-            n_tolerance=N_TOLERANCE,
-            n_bounds=TIO2_N_BOUNDS if is_high else AL2O3_N_BOUNDS,
-        ))
-    layers.append(Layer(material=glass))                   # substrate = glass
-    return layers
-
-def _seed_moveon_layers(moveon, seed_thickness_high, seed_thickness_low, glass=GLASS) -> list:
-    """moveon materials only."""
-    layers = [Layer(material=glass)]
-    # stack_materials = [moveon.SiO2, moveon.Ti3O5, moveon.SiO2, moveon.TiO2, moveon.Al2O3, moveon.TiO2, moveon.SiO2, moveon.Ti3O5, moveon.SiO2]
-    # stack_materials = [moveon.SiO2, moveon.TiO2, moveon.SiO2, moveon.TiO2, moveon.SiO2, moveon.TiO2, moveon.SiO2, moveon.TiO2, moveon.SiO2, moveon.TiO2, moveon.SiO2, moveon.TiO2, moveon.SiO2]
-    # stack_materials = [moveon.TiO2, moveon.SiO2, moveon.TiO2, moveon.SiO2, moveon.TiO2]
-    # for i, material in enumerate(stack_materials):
-    for i in range(NUM_SEED_FILMS):
-        is_tio2 = i % 2 == 1
-        layers.append(Layer(
-            # material=material,
-            material=moveon.TiO2 if is_tio2 else moveon.SiO2,
-            thickness=seed_thickness_high if is_tio2 else seed_thickness_low,
-            vary_thickness=True,
-            thickness_bounds=THICKNESS_BOUNDS_NM,
-            thickness_tolerance=_atlas_thickness_sigma_nm(
-                seed_thickness_high if is_tio2 else seed_thickness_low),
-        ))
-    layers.append(Layer(material=glass))
-
-    return layers
-
 def _seed_layers_2_materials(material_1, material_2, thickness_1, thickness_2, glass=GLASS) -> list:
     layers = [Layer(material=glass)]
     for i in range(NUM_SEED_FILMS):
@@ -460,6 +442,167 @@ def _rebase_tolerances(layers):
     return layers
 
 
+# ── L-BFGS-B progress reporting ──────────────────────────────────────────────
+
+def _stop_reason(message) -> str:
+    text = str(message).upper()
+    if "REDUCTION OF F" in text:
+        return "converged (relative Δmerit ≤ ftol)"
+    if "PROJECTED GRADIENT" in text:
+        return "converged (|projected gradient| ≤ gtol)"
+    if "ITERATIONS REACHED LIMIT" in text or "MAXITER" in text:
+        return "stopped: iteration limit"
+    if "FUNCTION EVALUATIONS" in text or "MAXFUN" in text:
+        return "stopped: evaluation limit"
+    return str(message).strip()
+
+
+def _projected_gradient(x, gradient, bounds):
+    """(norm of the projected gradient, number of variables at a bound)."""
+    x = np.asarray(x, dtype=float)
+    gradient = np.asarray(gradient, dtype=float)
+    if bounds is None:
+        return float(np.linalg.norm(gradient)), 0
+    if hasattr(bounds, "lb"):
+        lower, upper = np.asarray(bounds.lb, float), np.asarray(bounds.ub, float)
+    else:
+        lower = np.array([low for low, _ in bounds], dtype=float)
+        upper = np.array([high for _, high in bounds], dtype=float)
+    span = np.maximum(upper - lower, 1e-12)
+    at_lower = (x - lower) <= 1e-6 * span
+    at_upper = (upper - x) <= 1e-6 * span
+    # A bound blocks the descent direction -g: zero those components.
+    projected = np.where((at_lower & (gradient > 0)) | (at_upper & (gradient < 0)),
+                         0.0, gradient)
+    return float(np.linalg.norm(projected)), int(np.sum(at_lower | at_upper))
+
+
+class LbfgsProgressReporter:
+    """Detailed progress for every L-BFGS-B run of one mirror's design.
+
+    Basin hopping: Atlas builds its local L-BFGS-B searches internally with no
+    progress hook, so :func:`_report_basin_local_searches` swaps in
+    :meth:`minimize` — a scipy custom minimizer that runs the *same* L-BFGS-B
+    with the same options and only adds reporting. Its line is held until the
+    basin-hopping callback reports whether the hop was accepted.
+
+    Polish: Atlas forwards a per-iteration callback to scipy, so
+    :meth:`polish_callback` collects the iterations and :meth:`report_polish`
+    prints the run once it returns.
+    """
+
+    def __init__(self, mirror_index: int):
+        self.mirror_index = mirror_index
+        self.stage = ""
+        self.run_number = 0
+        self.stage_best = float("inf")
+        self.pending_line = None
+        self._polish = None
+
+    # ── shared ──────────────────────────────────────────────────────────────
+    def _prefix(self, run_label: str) -> str:
+        return f"      [mirror {self.mirror_index} | {self.stage:<12} | {run_label:>8}]"
+
+    def _iteration_callback(self, run_label: str, state: dict):
+        def on_iteration(intermediate_result):
+            state["iterations"] += 1
+            state["last_merit"] = float(intermediate_result.fun)
+            if LBFGS_PRINT_EVERY and state["iterations"] % LBFGS_PRINT_EVERY == 0:
+                print(f"{self._prefix(run_label)}   it {state['iterations']:>4}  "
+                      f"merit={state['last_merit']:.6e}", flush=True)
+        return on_iteration
+
+    # ── basin hopping local searches ────────────────────────────────────────
+    def start_stage(self, label: str) -> None:
+        self.flush()
+        self.stage, self.run_number, self.stage_best = label, 0, float("inf")
+
+    def minimize(self, fun, x0, args=(), jac=None, bounds=None, callback=None,
+                 maxiter=15000, ftol=2.220446049250313e-09, **unused):
+        """scipy custom-minimizer protocol; runs plain L-BFGS-B with reporting."""
+        self.flush()                       # a previous hop that got no verdict
+        run_label = "start" if self.run_number == 0 else f"hop {self.run_number}"
+        self.run_number += 1
+        start_time = time.perf_counter()
+        start_merit = float(fun(x0, *args))
+        result = scipy.optimize.minimize(
+            fun, x0, args=args, jac=jac, method="L-BFGS-B", bounds=bounds,
+            options={"maxiter": maxiter, "ftol": ftol},
+            callback=self._iteration_callback(run_label, {"iterations": 0}))
+        elapsed = time.perf_counter() - start_time
+        gradient = result.jac if getattr(result, "jac", None) is not None else jac(result.x)
+        gradient_norm, at_bounds = _projected_gradient(result.x, gradient, bounds)
+        end_merit = float(result.fun)
+        change = 100.0 * (end_merit - start_merit) / start_merit if start_merit else 0.0
+        self.pending_line = (
+            f"{self._prefix(run_label)} it {result.nit:>3}/{maxiter} nfev {result.nfev:>4}  "
+            f"merit {start_merit:.4e} → {end_merit:.4e} ({change:+6.1f}%)  "
+            f"|pg| {gradient_norm:.1e}  at-bound {at_bounds}/{len(np.asarray(x0))}  "
+            f"{elapsed:5.1f}s  {_stop_reason(result.message)}",
+            end_merit, bool(result.success))
+        if callback is not None:
+            callback(result.x)
+        return result
+
+    def hop_verdict(self, accepted) -> None:
+        """Basin-hopping callback: attach accept / reject to the pending line."""
+        if self.pending_line is None:
+            return
+        line, end_merit, converged = self.pending_line
+        self.pending_line = None
+        # scipy stores only accepted hops, so "best" means best design *kept*.
+        if accepted:
+            note = "  ★ best kept" if end_merit < self.stage_best else ""
+            self.stage_best = min(self.stage_best, end_merit)
+        elif end_merit < self.stage_best:
+            note = ("  (lower than best kept, discarded: local search did not converge)"
+                    if not converged else "  (lower than best kept, discarded)")
+        else:
+            note = ""
+        print(f"{line}  {'accepted' if accepted else 'rejected'}{note}", flush=True)
+
+    def flush(self) -> None:
+        if self.pending_line is not None:
+            print(self.pending_line[0], flush=True)
+            self.pending_line = None
+
+    # ── robust polish ───────────────────────────────────────────────────────
+    def polish_callback(self):
+        self.flush()
+        self.stage = "robust polish"
+        self._polish = {"iterations": 0, "last_merit": None, "start": time.perf_counter()}
+        return self._iteration_callback("polish", self._polish)
+
+    def report_polish(self, start_merit: float, result) -> None:
+        state = self._polish
+        end_merit = float(result.merit)
+        change = 100.0 * (end_merit - start_merit) / start_merit if start_merit else 0.0
+        stop = ("stopped: iteration limit" if state["iterations"] >= POLISH_MAX_ITERATIONS
+                else "converged" if result.converged else "stopped (see Atlas result)")
+        print(f"{self._prefix('polish')} it {state['iterations']:>3}/{POLISH_MAX_ITERATIONS}  "
+              f"robust merit {start_merit:.4e} → {end_merit:.4e} ({change:+6.1f}%)  "
+              f"nominal {float(result.nominal_merit):.4e}  "
+              f"{time.perf_counter() - state['start']:5.1f}s  {stop}", flush=True)
+
+
+@contextmanager
+def _report_basin_local_searches(reporter):
+    """Route Atlas's basin-hopping local L-BFGS-B through ``reporter.minimize``."""
+    original = LBFGSOptimizer.get_minimizer_kwargs
+
+    def with_reporting(self, objective, bounds):
+        minimizer_kwargs = original(self, objective, bounds)
+        minimizer_kwargs["method"] = reporter.minimize
+        return minimizer_kwargs
+
+    LBFGSOptimizer.get_minimizer_kwargs = with_reporting
+    try:
+        yield
+    finally:
+        LBFGSOptimizer.get_minimizer_kwargs = original
+        reporter.flush()
+
+
 # ── Design one mirror (display fit → suppression ramp → robust polish) ───────
 
 def design_mirror(mirror_index, target_wavelengths_nm, target_reflectance,
@@ -477,11 +620,14 @@ def design_mirror(mirror_index, target_wavelengths_nm, target_reflectance,
     layers = _seed_layers_2_materials(
         material_1=HIGH_INDEX_MATERIAL, material_2=LOW_INDEX_MATERIAL,
         thickness_1=seed_thickness_high, thickness_2=seed_thickness_low, glass=glass)
-    stages = ([(0.0, BH_MAX_ITERATIONS, "display only")]
-              + [(weight, RAMP_HOPS, f"ramp {weight:g}") for weight in SUPPRESSION_WEIGHT_RAMP]
-              + [(SUPPRESSION_WEIGHT, RAMP_HOPS, f"final {SUPPRESSION_WEIGHT:g}")])
+    stages = ([(0.0, BH_MAX_ITERATIONS, BH_STEPSIZE, "display only")]
+              + [(weight, RAMP_HOPS, RAMP_STEPSIZE, f"ramp {weight:g}")
+                 for weight in SUPPRESSION_WEIGHT_RAMP]
+              + [(SUPPRESSION_WEIGHT, RAMP_HOPS, RAMP_STEPSIZE,
+                  f"final {SUPPRESSION_WEIGHT:g}")])
     stage_log = []
-    for suppression_weight, hops, label in stages:
+    reporter = LbfgsProgressReporter(mirror_index)
+    for suppression_weight, hops, stepsize, label in stages:
         target = build_mirror_target(target_wavelengths_nm, target_reflectance,
                                      aoi_range, band_nm, sampling, suppression_weight)
         designer = OpticalDesigner(layers=layers, target=target)
@@ -492,18 +638,29 @@ def design_mirror(mirror_index, target_wavelengths_nm, target_reflectance,
             merit = float(merit)
             marker = "★" if merit < hop_state["best"] else " "
             hop_state["best"] = min(hop_state["best"], merit)
-            if VERBOSE_OPTIMIZATION and label == "display only":
+            if LBFGS_PROGRESS:
+                reporter.hop_verdict(accept)
+            elif VERBOSE_OPTIMIZATION and label == "display only":
                 print(f"    mirror {mirror_index}: {label} hop {hop_state['hop']:>3} "
                       f" merit={merit:.4e} best={hop_state['best']:.4e} {marker}", flush=True)
 
-        result_bh = designer.optimize(
-            method="basin_hopping", max_iterations=hops,
-            robust=ROBUST_BASIN_HOPPING, num_samples=ROBUST_OPTIMIZATION_SAMPLES,
-            stepsize=BH_STEPSIZE, temperature=BH_TEMPERATURE,
-            local_maxiter=BH_LOCAL_MAXITER, callback=hop_progress)
+        if LBFGS_PROGRESS:
+            reporter.start_stage(label)
+            print(f"    mirror {mirror_index}: stage '{label}' — suppression weight "
+                  f"{suppression_weight:g}, {hops} hops (step {stepsize:g}) × "
+                  f"L-BFGS-B ≤{BH_LOCAL_MAXITER} it",
+                  flush=True)
+        with (_report_basin_local_searches(reporter) if LBFGS_PROGRESS
+              else nullcontext()):
+            result_bh = designer.optimize(
+                method="basin_hopping", max_iterations=hops,
+                robust=ROBUST_BASIN_HOPPING, num_samples=ROBUST_OPTIMIZATION_SAMPLES,
+                stepsize=stepsize, temperature=BH_TEMPERATURE,
+                local_maxiter=BH_LOCAL_MAXITER, callback=hop_progress)
         regions = {region.name: region for region in result_bh.regions}
         stage_log.append(dict(
             stage=label, suppression_weight=suppression_weight, hops=hops,
+            stepsize=stepsize,
             merit=float(result_bh.merit),
             worst_violation={name: float(region.worst_violation)
                              for name, region in regions.items()}))
@@ -516,9 +673,21 @@ def design_mirror(mirror_index, target_wavelengths_nm, target_reflectance,
 
     final_target = designer.target
     polished_designer = OpticalDesigner(layers=layers, target=final_target)
+    polish_start_merit = None
+    if LBFGS_PROGRESS:
+        print(f"    mirror {mirror_index}: robust polish — L-BFGS-B ≤{POLISH_MAX_ITERATIONS} it, "
+              f"{ROBUST_OPTIMIZATION_SAMPLES} tolerance samples per evaluation", flush=True)
     result_polished = polished_designer.optimize(
         method="lbfgs", max_iterations=POLISH_MAX_ITERATIONS,
-        robust=True, num_samples=ROBUST_OPTIMIZATION_SAMPLES)
+        robust=True, num_samples=ROBUST_OPTIMIZATION_SAMPLES,
+        callback=reporter.polish_callback() if LBFGS_PROGRESS else None)
+    if LBFGS_PROGRESS:
+        # Atlas does not return the starting robust merit; the polish starts
+        # from the final basin design, so report its merit before the polish.
+        polish_start_merit = float(
+            polished_designer.optimize(method="lbfgs", max_iterations=0, robust=True,
+                                       num_samples=ROBUST_OPTIMIZATION_SAMPLES).merit)
+        reporter.report_polish(polish_start_merit, result_polished)
     if ROBUST_BASIN_HOPPING and result_bh.merit < result_polished.merit:
         # Both merits are robust, so they are comparable.
         result = result_bh
@@ -1105,9 +1274,10 @@ def main():
           + f", unpolarized, {band[0]:.0f}–{band[1]:.0f} nm, weight {SUPPRESSION_WEIGHT:g} "
             f"(ramp {', '.join(f'{w:g}' for w in SUPPRESSION_WEIGHT_RAMP)})")
     print(f"budget/mirror : basin_hopping {BH_MAX_ITERATIONS}×{BH_LOCAL_MAXITER} display-only"
-          f"{' (robust)' if ROBUST_BASIN_HOPPING else ' (nominal)'}, "
-          f"{len(SUPPRESSION_WEIGHT_RAMP) + 1}×{RAMP_HOPS} ramp hops, "
-          f"robust lbfgs polish {POLISH_MAX_ITERATIONS}\n")
+          f"{' (robust)' if ROBUST_BASIN_HOPPING else ' (nominal)'} step {BH_STEPSIZE:g}, "
+          f"{len(SUPPRESSION_WEIGHT_RAMP) + 1}×{RAMP_HOPS} ramp hops step {RAMP_STEPSIZE:g}, "
+          f"T={BH_TEMPERATURE:g}, robust lbfgs polish {POLISH_MAX_ITERATIONS} "
+          f"({ROBUST_OPTIMIZATION_SAMPLES} samples)\n")
 
     out_dir = Path(example_output_dir(__file__, root=OUTPUT_ROOT))
 
@@ -1248,9 +1418,11 @@ def main():
             "basin_hopping": {
                 "max_iterations": BH_MAX_ITERATIONS,
                 "local_maxiter": BH_LOCAL_MAXITER,
-                "stepsize": BH_STEPSIZE, "temperature": BH_TEMPERATURE,
+                "stepsize": BH_STEPSIZE, "ramp_stepsize": RAMP_STEPSIZE,
+                "temperature": BH_TEMPERATURE,
             },
-            "polish": {"method": "lbfgs", "max_iterations": POLISH_MAX_ITERATIONS},
+            "polish": {"method": "lbfgs", "max_iterations": POLISH_MAX_ITERATIONS,
+                       "robust_samples": ROBUST_OPTIMIZATION_SAMPLES},
         },
         "mirrors": mirror_records,
     }
