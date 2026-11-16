@@ -19,12 +19,30 @@ mirror in the stack**, hands Atlas everything it needs to find its coating:
 - **projector spectrum** — the PlayNitride panel's emission, used to weight the
   fit toward the wavelengths that actually carry light;
 - **substrate/medium** — the mirror is embedded in index-matched ophthalmic
-  glass (``Materials.AGC_M074``), so the coating sits glass-on-both-sides.
+  glass (``GLASS``, N-BASF2), so the coating sits glass-on-both-sides;
+- **angular suppression** — besides matching ``R(λ)`` for s light at the
+  display angles, each coating keeps Rp low there and keeps unpolarized
+  reflection low at ``SUPPRESSION_REGIONS`` (10–36° and 60–75° by default: the
+  angles at which ambient light reflects into TIR ghosts, from
+  ``visualize_perseus_sun.py``), via an Atlas ``MultiTarget``.
 
-Every mirror is designed exactly as in Atlas's ``two_step_basin_hopping.py``
-(basin-hopping global search → L-BFGS polish), and the whole run is written to a
-single consolidated JSON holding the **system + mirror state**, the **design
-parameters**, and the **per-mirror results** (coating recipes + achieved R).
+Each mirror is designed in stages: basin hopping on the display alone, then
+warm-started basin hopping through ``SUPPRESSION_WEIGHT_RAMP`` up to
+``SUPPRESSION_WEIGHT``, then a robust L-BFGS polish under the ±1% thickness
+tolerance. Each design then gets:
+
+- an **angular report** — R(λ, θ) over 0–85° for s, p and unpolarized light,
+  display Rs per LED color, worst / mean reflectance per suppression region
+  (and where it sits), the two-reflection ghost product, and the unconstrained
+  angles below the first region; printed, saved in the JSON, and plotted;
+- a **tolerance analysis** — scrambled-Sobol Monte Carlo of bounded ±1%
+  thickness and Gaussian index errors, scoring display Rs (yield) and the
+  worst suppressed reflectance (percentiles).
+
+The whole run is written to a single consolidated JSON holding the **system +
+mirror state**, the **design parameters**, and the **per-mirror results**
+(coating recipes, deposition order, achieved R, angular report, tolerance), plus
+one interactive HTML per mirror (display fit, angular map, angular profile).
 
 Prerequisite: run ``optimize_pupil_perseus.py`` first (this reads its latest
 report). ``atlas`` must be importable — added as an editable path dependency
@@ -44,7 +62,7 @@ from pathlib import Path
 
 # Import atlas BEFORE jax so its XLA multi-core flag takes effect (see
 # atlas/__init__.py). apollo14 (which imports jax) is imported after.
-from atlas import Layer, Materials, OpticalDesigner, Target, example_output_dir
+from atlas import Layer, Materials, MultiTarget, OpticalDesigner, Target, example_output_dir
 from atlas.core.stack import Stack
 from atlas.core.tmm import _precompute_fixed_nk_data, compute_rt_polarized
 import jax
@@ -52,6 +70,7 @@ import jax.numpy as jnp
 import numpy as np
 import plotly.graph_objects as go
 from plotly.colors import sample_colorscale
+from plotly.subplots import make_subplots
 from scipy.stats import norm, qmc
 
 from apollo14.geometry import snell_refract
@@ -83,7 +102,7 @@ NUM_WAVELENGTHS = 120               # target sample points across the band
 NUM_ANGLES = 5                      # AOI samples across the swept range
 
 # Alternating high/low-index films (DBR-style contrast) in AGC M-074 glass.
-NUM_SEED_FILMS = 7
+NUM_SEED_FILMS = 11                 # 11 films hold the display fit AND the suppression
 # NUM_SEED_FILMS = 15
 THICKNESS_BOUNDS_NM = (20.0, 200.0)
 TIO2_N_BOUNDS = (2.0, 2.525)        # PLD_TiO2 tunable index range
@@ -120,6 +139,49 @@ BH_LOCAL_MAXITER = 400
 BH_STEPSIZE = 0.2
 BH_TEMPERATURE = 0.01
 POLISH_MAX_ITERATIONS = 500
+
+# ── Angular suppression (ghosts / see-through) ──────────────────────────────
+# Each mirror is a MultiTarget design:
+#   display Rs  — match the optimizer's R(λ) for s light at the display AOI band;
+#   display Rp  — keep p low there (ambient in the FOV is unpolarized);
+#   suppression — unpolarized R as low as possible at SUPPRESSION_REGIONS.
+# The regions come from the sun-ray ghost trace (visualize_perseus_sun.py):
+# ghosts that TIR off a chassis face reach the eye via a last mirror reflection
+# at ~25–36° after a first one at ~66–73°. The angles between them and the
+# display band are unconstrained guard bands.
+DISPLAY_WAVELENGTHS = "led_bands"   # "led_bands" (emission bands only) | "full" (420–680)
+EMISSION_THRESHOLD = 0.10           # led_bands: radiance ≥ this fraction of peak…
+BAND_MARGIN_NM = 10.0               # …widened by this margin…
+DISPLAY_STEP_NM = 3                 # …sampled every this many nm
+DISPLAY_RP_WEIGHT = 0.3
+SUPPRESSION_REGIONS = [
+    dict(name="suppress 10-36°", angles_deg=(10.0, 36.0), num_angles=14),
+    dict(name="suppress 60-75°", angles_deg=(60.0, 75.0), num_angles=16),
+]
+SUPPRESSION_NUM_WAVELENGTHS = 40
+SUPPRESSION_AGGREGATE = "soft_max"  # a ghost is as visible as its worst angle
+# An unsuppressed region's loss (~R² ≈ 0.25) dwarfs the display loss (~5e-5),
+# so the weight is small; 1e-2 was chosen from the 2026-11-10 log sweep (best
+# 10–36° suppression and lowest ghost product, display Rs still ≈ target).
+SUPPRESSION_WEIGHT = 1e-2
+# Continuation: fit the display alone first, then raise the suppression weight
+# through these steps (warm-started, RAMP_HOPS hops each) up to the final one.
+SUPPRESSION_WEIGHT_RAMP = (1e-4, 3e-4, 1e-3, 3e-3)
+RAMP_HOPS = 8
+# Robust basin hopping with the multi-target merit is very slow (hours per
+# mirror); the global search runs nominal and the L-BFGS polish runs robust.
+ROBUST_BASIN_HOPPING = False
+# Print every basin-hopping hop and every suppression stage while a mirror is
+# optimized. Off: each mirror prints only its best score once it is done.
+VERBOSE_OPTIMIZATION = False
+
+# Per-mirror angular report: R(λ, θ) for s, p and unpolarized on this grid.
+ANGULAR_WAVELENGTHS_NM = np.linspace(420.0, 680.0, 131)
+ANGULAR_ANGLES_DEG = np.arange(0.0, 85.5, 1.0)
+SAVE_ANGULAR_MAPS = True            # store the maps in coating_design.json
+# Validated categorical slots (light surface): Rs, Rp, unpolarized.
+SERIES_COLORS = {"s": "#2a78d6", "p": "#eb6834", "unpolarized": "#1baf7a"}
+SERIES_NAMES = {"s": "Rs", "p": "Rp", "unpolarized": "R unpolarized"}
 
 SAVE_PER_MIRROR_PLOTS = True
 OUTPUT_ROOT = "examples/reports"
@@ -224,22 +286,66 @@ def incidence_angle_range(mirror_normal, num_mirrors, glass_index):
 
 # ── Projector spectrum → per-wavelength fit weights ──────────────────────────
 
+def projector_spectrum():
+    """(wavelengths_nm, radiance normalized to its peak) of the Perseus panel."""
+    projector = PlayNitrideLed.create_broadband(
+        position=PERSEUS_LIGHT_POSITION, direction=PERSEUS_PROJECTOR_DIRECTION,
+        beam_width=PERSEUS_BEAM_WIDTH, beam_height=PERSEUS_BEAM_HEIGHT,
+        nx=1, ny=1)
+    spec_wavelengths, spec_radiance = projector.spectrum
+    spec_radiance = np.asarray(spec_radiance)
+    return np.asarray(spec_wavelengths) / float(nm), spec_radiance / spec_radiance.max()
+
+
 def projector_weights(wavelength_grid_nm) -> list[float]:
     """Weight the fit toward wavelengths the panel actually emits.
 
     ``0.2 + 0.8·(radiance / peak)`` — every wavelength keeps a ≥0.2 floor so the
     coating stays sane out-of-peak, while the RGB emission bands dominate.
     """
-    projector = PlayNitrideLed.create_broadband(
-        position=PERSEUS_LIGHT_POSITION, direction=PERSEUS_PROJECTOR_DIRECTION,
-        beam_width=PERSEUS_BEAM_WIDTH, beam_height=PERSEUS_BEAM_HEIGHT,
-        nx=1, ny=1)
-    spec_wavelengths, spec_radiance = projector.spectrum
-    spec_wavelengths_nm = np.asarray(spec_wavelengths) / float(nm)
-    spec_radiance = np.asarray(spec_radiance)
+    spec_wavelengths_nm, spec_radiance = projector_spectrum()
     radiance_on_grid = np.interp(wavelength_grid_nm, spec_wavelengths_nm,
                                  spec_radiance)
     return (0.2 + 0.8 * radiance_on_grid / radiance_on_grid.max()).tolist()
+
+
+def emission_bands(band_nm):
+    """Projector emission bands (+ margin) as (start, end) nm, and samples in them."""
+    spec_wavelengths_nm, spec_radiance = projector_spectrum()
+    grid = np.arange(band_nm[0], band_nm[1] + 1e-9, 1.0)
+    emitting = np.interp(grid, spec_wavelengths_nm, spec_radiance) >= EMISSION_THRESHOLD
+    widened = np.zeros_like(emitting)
+    for center in grid[emitting]:
+        widened |= np.abs(grid - center) <= BAND_MARGIN_NM
+    bands, start, previous_wavelength = [], None, None
+    for wavelength, inside in zip(grid, widened, strict=True):
+        if inside and start is None:
+            start = wavelength
+        if not inside and start is not None:
+            bands.append((float(start), float(previous_wavelength)))
+            start = None
+        previous_wavelength = wavelength
+    if start is not None:
+        bands.append((float(start), float(grid[-1])))
+    return bands, grid[widened][::DISPLAY_STEP_NM]
+
+
+def band_color_name(band_nm) -> str:
+    center = 0.5 * (band_nm[0] + band_nm[1])
+    return "blue" if center < 500 else "green" if center < 590 else "red"
+
+
+def display_sampling(band_nm):
+    """Atlas sampling kwargs for the display-Rs region, per DISPLAY_WAVELENGTHS."""
+    if DISPLAY_WAVELENGTHS == "led_bands":
+        _, points = emission_bands(band_nm)
+        return dict(wavelength_points=points.tolist(),
+                    weights=projector_weights(points))
+    if DISPLAY_WAVELENGTHS == "full":
+        return dict(wavelengths=band_nm, num_wavelengths=NUM_WAVELENGTHS,
+                    weights=projector_weights(np.linspace(*band_nm, NUM_WAVELENGTHS)))
+    raise ValueError(f"DISPLAY_WAVELENGTHS must be 'led_bands' or 'full', "
+                     f"got {DISPLAY_WAVELENGTHS!r}")
 
 
 # ── QWOT seed thickness ──────────────────────────────────────────────────────
@@ -322,71 +428,110 @@ def _seed_layers_2_materials(material_1, material_2, thickness_1, thickness_2, g
 
     return layers
 
-# ── Design one mirror (basin hopping → L-BFGS polish) ────────────────────────
+# ── Multi-target spec for one mirror ─────────────────────────────────────────
+
+def build_mirror_target(target_wavelengths_nm, target_reflectance, aoi_range,
+                        band_nm, sampling, suppression_weight) -> MultiTarget:
+    """Display Rs (match R(λ)) + display Rp (≤ 0) + suppression regions (≤ 0)."""
+    def target_curve(wavelength_nm):
+        return float(np.interp(wavelength_nm, target_wavelengths_nm, target_reflectance))
+
+    regions = [
+        Target(angles=aoi_range, num_angles=NUM_ANGLES, polarization=POLARIZATION,
+               reflectance=target_curve, name="display Rs", **sampling),
+        Target(wavelengths=band_nm, num_wavelengths=SUPPRESSION_NUM_WAVELENGTHS,
+               angles=aoi_range, num_angles=3, polarization="p", reflectance=0.0,
+               goal="at_most", weight=DISPLAY_RP_WEIGHT, name="display Rp"),
+    ]
+    for region in SUPPRESSION_REGIONS:
+        regions.append(Target(
+            wavelengths=band_nm, num_wavelengths=SUPPRESSION_NUM_WAVELENGTHS,
+            angles=region["angles_deg"], num_angles=region["num_angles"],
+            polarization="both", reflectance=0.0, goal="at_most",
+            aggregate=SUPPRESSION_AGGREGATE, weight=suppression_weight,
+            name=region["name"]))
+    return MultiTarget(regions=regions)
+
+
+def _rebase_tolerances(layers):
+    """Rebase each film's ±1% sigma on its current thickness (in place)."""
+    for layer in layers[1:-1]:
+        layer.thickness_tolerance = _atlas_thickness_sigma_nm(layer.thickness)
+    return layers
+
+
+# ── Design one mirror (display fit → suppression ramp → robust polish) ───────
 
 def design_mirror(mirror_index, target_wavelengths_nm, target_reflectance,
-                  aoi_range, weights, glass, seed_thickness_high,
+                  aoi_range, band_nm, sampling, glass, seed_thickness_high,
                   seed_thickness_low):
-    """Run the two-step Atlas design for one mirror; return its result."""
-    target = Target(
-        wavelengths=(float(target_wavelengths_nm.min()),
-                     float(target_wavelengths_nm.max())),
-        angles=aoi_range,
-        reflectance=lambda wl: float(np.interp(wl, target_wavelengths_nm,
-                                               target_reflectance)),
-        polarization=POLARIZATION,
-        num_wavelengths=NUM_WAVELENGTHS,
-        num_angles=NUM_ANGLES,
-        weights=weights,
-    )
+    """Staged Atlas design for one mirror; return its (robust-polished) result.
 
-    designer = OpticalDesigner(
-        # layers=_seed_layers(glass, seed_thickness_high, seed_thickness_low),
-        layers=_seed_layers_2_materials(
-            material_1=HIGH_INDEX_MATERIAL,
-            material_2=LOW_INDEX_MATERIAL,
-            thickness_1=seed_thickness_high,
-            thickness_2=seed_thickness_low,
-            glass=glass,
-        ),
-        # layers=_seed_moveon_layers(Materials.moveon, seed_thickness_high, seed_thickness_low, glass),
-        target=target)
-    hop_state = {"hop": 0, "best": float("inf")}
+    1. basin hopping on the display alone (suppression weight 0);
+    2. warm-started basin hopping through ``SUPPRESSION_WEIGHT_RAMP`` up to
+       ``SUPPRESSION_WEIGHT`` — raising the weight gradually keeps the design in
+       the display-fitting basin instead of jumping straight to suppression;
+    3. robust L-BFGS polish of the final multi-target merit under the ±1%
+       thickness tolerance.
+    """
+    layers = _seed_layers_2_materials(
+        material_1=HIGH_INDEX_MATERIAL, material_2=LOW_INDEX_MATERIAL,
+        thickness_1=seed_thickness_high, thickness_2=seed_thickness_low, glass=glass)
+    stages = ([(0.0, BH_MAX_ITERATIONS, "display only")]
+              + [(weight, RAMP_HOPS, f"ramp {weight:g}") for weight in SUPPRESSION_WEIGHT_RAMP]
+              + [(SUPPRESSION_WEIGHT, RAMP_HOPS, f"final {SUPPRESSION_WEIGHT:g}")])
+    stage_log = []
+    for suppression_weight, hops, label in stages:
+        target = build_mirror_target(target_wavelengths_nm, target_reflectance,
+                                     aoi_range, band_nm, sampling, suppression_weight)
+        designer = OpticalDesigner(layers=layers, target=target)
+        hop_state = {"hop": 0, "best": float("inf")}
 
-    def hop_progress(x, merit, accept):
-        hop_state["hop"] += 1
-        merit = float(merit)
-        marker = "★" if merit < hop_state["best"] else " "
-        hop_state["best"] = min(hop_state["best"], merit)
-        print(f"    mirror {mirror_index}: hop {hop_state['hop']:>3}/{BH_MAX_ITERATIONS} "
-              f" merit={merit:.4e} best={hop_state['best']:.4e} {marker}", flush=True)
+        def hop_progress(x, merit, accept, hop_state=hop_state, label=label):
+            hop_state["hop"] += 1
+            merit = float(merit)
+            marker = "★" if merit < hop_state["best"] else " "
+            hop_state["best"] = min(hop_state["best"], merit)
+            if VERBOSE_OPTIMIZATION and label == "display only":
+                print(f"    mirror {mirror_index}: {label} hop {hop_state['hop']:>3} "
+                      f" merit={merit:.4e} best={hop_state['best']:.4e} {marker}", flush=True)
 
-    result_bh = designer.optimize(
-        method="basin_hopping", max_iterations=BH_MAX_ITERATIONS,
-        robust=True, num_samples=ROBUST_OPTIMIZATION_SAMPLES,
-        stepsize=BH_STEPSIZE, temperature=BH_TEMPERATURE,
-        local_maxiter=BH_LOCAL_MAXITER, callback=hop_progress)
+        result_bh = designer.optimize(
+            method="basin_hopping", max_iterations=hops,
+            robust=ROBUST_BASIN_HOPPING, num_samples=ROBUST_OPTIMIZATION_SAMPLES,
+            stepsize=BH_STEPSIZE, temperature=BH_TEMPERATURE,
+            local_maxiter=BH_LOCAL_MAXITER, callback=hop_progress)
+        regions = {region.name: region for region in result_bh.regions}
+        stage_log.append(dict(
+            stage=label, suppression_weight=suppression_weight, hops=hops,
+            merit=float(result_bh.merit),
+            worst_violation={name: float(region.worst_violation)
+                             for name, region in regions.items()}))
+        if VERBOSE_OPTIMIZATION:
+            print(f"    mirror {mirror_index}: {label:<12} merit={result_bh.merit:.4e}  "
+                  + "  ".join(f"{name} worst {100 * region.worst_violation:.2f}"
+                              + ("pp" if region.goal == "match" else "%")
+                              for name, region in regions.items()), flush=True)
+        layers = _rebase_tolerances(result_bh.layers)
 
-    # Rebase the percentage tolerance on the basin result before polishing.
-    # Atlas stores an absolute per-layer sigma rather than a relative tolerance.
-    for layer in result_bh.film_layers:
-        layer.thickness_tolerance = _atlas_thickness_sigma_nm(layer.thickness)
-    refined = [result_bh.layers[0], *result_bh.film_layers, result_bh.layers[-1]]
-    polished_designer = OpticalDesigner(layers=refined, target=target)
+    final_target = designer.target
+    polished_designer = OpticalDesigner(layers=layers, target=final_target)
     result_polished = polished_designer.optimize(
         method="lbfgs", max_iterations=POLISH_MAX_ITERATIONS,
         robust=True, num_samples=ROBUST_OPTIMIZATION_SAMPLES)
-    result = result_polished if result_polished.merit <= result_bh.merit else result_bh
+    if ROBUST_BASIN_HOPPING and result_bh.merit < result_polished.merit:
+        # Both merits are robust, so they are comparable.
+        result = result_bh
+    else:
+        # A nominal basin merit is not comparable with the robust polish:
+        # the robust design is the one meant for manufacture.
+        result = result_polished
     result.selected_stage = "polish" if result is result_polished else "basin_hopping"
     result.basin_merit = float(result_bh.merit)
     result.polish_merit = float(result_polished.merit)
-    # Ensure the exported recipe records ±1% relative to its final thickness,
-    # including when the basin result wins over the polished result.
-    for layer in result.film_layers:
-        layer.thickness_tolerance = _atlas_thickness_sigma_nm(layer.thickness)
-    if result is result_bh:
-        print(f"    polish merit {result_polished.merit:.4e} is worse than "
-              f"basin best {result_bh.merit:.4e}; retaining basin result")
+    result.stages = stage_log
+    # Ensure the exported recipe records ±1% relative to its final thickness.
+    _rebase_tolerances(result.layers)
 
     stack = Stack(layers=result.layers)
     reflectance, transmittance = compute_rt_polarized(
@@ -402,6 +547,102 @@ def design_mirror(mirror_index, target_wavelengths_nm, target_reflectance,
     result.s_transmittance = transmittance[..., 0]
     result.p_transmittance = transmittance[..., 1]
     return result
+
+
+# ── Per-mirror angular report ────────────────────────────────────────────────
+
+def _angle_mask(low_deg, high_deg):
+    return (low_deg <= ANGULAR_ANGLES_DEG) & (high_deg >= ANGULAR_ANGLES_DEG)
+
+
+def angular_report(result, aoi_range, bands) -> dict:
+    """R(λ, θ) over 0–85° for s, p and unpolarized, plus region metrics.
+
+    ``display`` — projector-weighted Rs over the FOV and per LED color, Rp and
+    unpolarized R at the display angles; ``regions`` — worst / mean
+    reflectance in each suppression region and where the worst sits;
+    ``ghost_product`` — product of the regions' worst (and mean) unpolarized R,
+    which is how a two-reflection TIR ghost scales; ``unconstrained_low`` —
+    reflectance below the first suppression region, which no target covers.
+    """
+    stack = Stack(layers=result.layers)
+    reflectance, _ = compute_rt_polarized(
+        stack, jnp.asarray(ANGULAR_WAVELENGTHS_NM) * 1e-9,
+        jnp.deg2rad(jnp.asarray(ANGULAR_ANGLES_DEG)),
+        stack.get_thickness_array(), stack.get_tunable_n_array(),
+        _precompute_fixed_nk_data(stack))
+    reflectance = np.asarray(reflectance)
+    maps = {"s": reflectance[..., 0], "p": reflectance[..., 1]}
+    maps["unpolarized"] = 0.5 * (maps["s"] + maps["p"])
+
+    spec_wavelengths_nm, spec_radiance = projector_spectrum()
+    spectrum_weights = np.interp(ANGULAR_WAVELENGTHS_NM, spec_wavelengths_nm, spec_radiance)
+    display = _angle_mask(*aoi_range)
+    weighted_rs = (spectrum_weights @ maps["s"][:, display]) / spectrum_weights.sum()
+    per_color = {}
+    for band in bands:
+        in_band = (band[0] <= ANGULAR_WAVELENGTHS_NM) & (band[1] >= ANGULAR_WAVELENGTHS_NM)
+        band_weights = spectrum_weights[in_band]
+        band_rs = maps["s"][in_band][:, display]
+        per_color[band_color_name(band)] = dict(
+            band_nm=list(band),
+            rs_weighted_mean=float((band_weights @ band_rs).mean() / band_weights.sum()),
+            rs_min=float(band_rs.min()), rs_max=float(band_rs.max()),
+            rp_mean=float(maps["p"][in_band][:, display].mean()))
+
+    regions = {}
+    for region in SUPPRESSION_REGIONS:
+        mask = _angle_mask(*region["angles_deg"])
+        unpolarized = maps["unpolarized"][:, mask]
+        worst_wl, worst_angle = np.unravel_index(unpolarized.argmax(), unpolarized.shape)
+        regions[region["name"]] = dict(
+            angles_deg=list(region["angles_deg"]),
+            worst_unpolarized=float(unpolarized.max()),
+            mean_unpolarized=float(unpolarized.mean()),
+            worst_at_nm=float(ANGULAR_WAVELENGTHS_NM[worst_wl]),
+            worst_at_deg=float(ANGULAR_ANGLES_DEG[mask][worst_angle]),
+            worst_s=float(maps["s"][:, mask].max()),
+            worst_p=float(maps["p"][:, mask].max()),
+            fraction_above_3pct=float(np.mean(unpolarized > 0.03)))
+    low_edge = min(region["angles_deg"][0] for region in SUPPRESSION_REGIONS)
+    below = low_edge > ANGULAR_ANGLES_DEG
+    metrics = dict(
+        display=dict(
+            rs_weighted_range=[float(weighted_rs.min()), float(weighted_rs.max())],
+            rs_weighted_mean=float(weighted_rs.mean()),
+            per_color=per_color,
+            rp_max=float(maps["p"][:, display].max()),
+            unpolarized_mean=float(maps["unpolarized"][:, display].mean())),
+        regions=regions,
+        ghost_product=dict(
+            worst=float(np.prod([value["worst_unpolarized"] for value in regions.values()])),
+            mean=float(np.prod([value["mean_unpolarized"] for value in regions.values()]))),
+        unconstrained_low=dict(
+            angles_deg=[0.0, float(low_edge)],
+            max_unpolarized=float(maps["unpolarized"][:, below].max()) if below.any() else None,
+            mean_unpolarized=float(maps["unpolarized"][:, below].mean()) if below.any() else None),
+    )
+    return dict(metrics=metrics, maps=maps)
+
+
+def _print_angular_summary(metrics) -> None:
+    display = metrics["display"]
+    print(f"    angular: display Rs {100 * display['rs_weighted_range'][0]:.2f}–"
+          f"{100 * display['rs_weighted_range'][1]:.2f}% ("
+          + ", ".join(f"{color} {100 * values['rs_weighted_mean']:.2f}%"
+                      for color, values in display["per_color"].items())
+          + f"), Rp max {100 * display['rp_max']:.2f}%, "
+            f"unpolarized {100 * display['unpolarized_mean']:.2f}%")
+    for name, values in metrics["regions"].items():
+        print(f"             {name}: worst {100 * values['worst_unpolarized']:.2f}% "
+              f"@ {values['worst_at_nm']:.0f} nm/{values['worst_at_deg']:.0f}°, "
+              f"mean {100 * values['mean_unpolarized']:.2f}% "
+              f"(Rs {100 * values['worst_s']:.2f}%, Rp {100 * values['worst_p']:.2f}%)")
+    low = metrics["unconstrained_low"]
+    if low["max_unpolarized"] is not None:
+        print(f"             unconstrained {low['angles_deg'][0]:.0f}–{low['angles_deg'][1]:.0f}°: "
+              f"max {100 * low['max_unpolarized']:.2f}%, mean {100 * low['mean_unpolarized']:.2f}%;"
+              f" ghost product worst {metrics['ghost_product']['worst']:.4f}")
 
 
 # ── Serialize one Atlas result ───────────────────────────────────────────────
@@ -429,13 +670,17 @@ def _layer_to_dict(layer) -> dict:
     }
 
 
-def save_mirror_plot_html(result, path: Path, config_text: str) -> None:
-    """Interactive target-vs-achieved plot for one mirror, as a Plotly HTML file.
+def save_mirror_plot_html(result, angular, aoi_range, path: Path,
+                          config_text: str) -> None:
+    """Interactive per-mirror report, as a Plotly HTML file.
 
-    Replaces Atlas's ``plot_per_angle`` PNG. These coatings sit near R≈3%, so a
-    static image over a fixed 0–1 axis buries the whole result on the axis line;
-    here the axes autoscale to the data and you can zoom into the per-angle
-    spread and the ripple between the projector's emission bands.
+    1. **Display fit** — Rs/Rp vs wavelength at each display angle against the
+       target (replaces Atlas's ``plot_per_angle`` PNG; axes autoscale, so the
+       ~2–16% curves are not buried on a 0–1 axis);
+    2. **Angular map** — unpolarized R(θ, λ) over 0–85°, with the display band
+       and the suppression regions marked;
+    3. **Angular profile** — Rs, Rp and unpolarized R vs AOI, weighted by the
+       projector spectrum.
     """
     wavelengths_nm = np.asarray(result.wavelengths_nm)
     target = np.asarray(result.target_reflectance)
@@ -445,55 +690,107 @@ def save_mirror_plot_html(result, path: Path, config_text: str) -> None:
         achieved_s = achieved_s[:, np.newaxis]
         achieved_p = achieved_p[:, np.newaxis]
     angles_deg = np.asarray(result.angles_deg)
-
-    figure = go.Figure()
-    # One trace per angle of incidence, coloured across the swept range.
-    colors = sample_colorscale(
-        "Viridis",
-        np.linspace(0.1, 0.9, achieved_s.shape[1]).tolist())
-    for angle_idx, (angle, color) in enumerate(
-            zip(angles_deg, colors, strict=True)):
-        figure.add_trace(go.Scatter(
-            x=wavelengths_nm, y=achieved_s[:, angle_idx],
-            mode="lines", name=f"S · {float(angle):.1f}°",
-            line=dict(color=color, width=1.5),
-            hovertemplate="%{x:.1f} nm<br>R=%{y:.4f}<extra>%{fullData.name}</extra>"))
-        figure.add_trace(go.Scatter(
-            x=wavelengths_nm, y=achieved_p[:, angle_idx],
-            mode="lines", name=f"P · {float(angle):.1f}°",
-            line=dict(color=color, width=1.5, dash="dot"),
-            hovertemplate="%{x:.1f} nm<br>R=%{y:.4f}<extra>%{fullData.name}</extra>"))
-    # Target last so it draws on top of the achieved family.
-    figure.add_trace(go.Scatter(
-        x=wavelengths_nm, y=target, mode="lines", name="S target",
-        line=dict(color="black", width=2.5, dash="dash"),
-        hovertemplate="%{x:.1f} nm<br>target R=%{y:.4f}<extra>Target</extra>"))
-
     if len(angles_deg) > 1:
         angle_span = (f"{float(angles_deg[0]):.1f}°–{float(angles_deg[-1]):.1f}° "
                       f"({len(angles_deg)} samples)")
     else:
         angle_span = f"{float(angles_deg[0]):.1f}°"
 
-    figure.update_layout(
-        title=(f"S/P reflectance vs target — angles {angle_span}, "
-               f"merit={result.merit:.3e}"),
-        xaxis_title="Wavelength (nm)",
-        yaxis_title="Reflectance",
-        hovermode="x unified",
-        legend=dict(title="Angle"),
-        template="plotly_white",
-    )
-    # Free y-axis: the point of the HTML version is that the reader zooms
-    # instead of the author guessing a range.
-    figure.update_yaxes(rangemode="normal", tickformat=".3f")
+    figure = make_subplots(
+        rows=3, cols=1, vertical_spacing=0.08, row_heights=[0.36, 0.36, 0.28],
+        subplot_titles=(
+            f"Display fit — S/P reflectance vs target at {angle_span}",
+            "Angular map — unpolarized R(θ, λ)",
+            "Angular profile — reflectance vs AOI (projector-weighted)"))
+
+    # 1. Display fit: one trace per angle of incidence, coloured across the range.
+    colors = sample_colorscale(
+        "Viridis", np.linspace(0.1, 0.9, achieved_s.shape[1]).tolist())
+    for angle_idx, (angle, color) in enumerate(zip(angles_deg, colors, strict=True)):
+        figure.add_trace(go.Scatter(
+            x=wavelengths_nm, y=achieved_s[:, angle_idx], mode="lines+markers",
+            marker=dict(size=3), name=f"S · {float(angle):.1f}°", legendgroup="display",
+            line=dict(color=color, width=1.5),
+            hovertemplate="%{x:.1f} nm<br>R=%{y:.4f}<extra>%{fullData.name}</extra>"),
+            row=1, col=1)
+        figure.add_trace(go.Scatter(
+            x=wavelengths_nm, y=achieved_p[:, angle_idx], mode="lines",
+            name=f"P · {float(angle):.1f}°", legendgroup="display",
+            line=dict(color=color, width=1.5, dash="dot"),
+            hovertemplate="%{x:.1f} nm<br>R=%{y:.4f}<extra>%{fullData.name}</extra>"),
+            row=1, col=1)
+    # Target last so it draws on top of the achieved family.
+    figure.add_trace(go.Scatter(
+        x=wavelengths_nm, y=target, mode="lines", name="S target", legendgroup="display",
+        line=dict(color="black", width=2.5, dash="dash"),
+        hovertemplate="%{x:.1f} nm<br>target R=%{y:.4f}<extra>Target</extra>"),
+        row=1, col=1)
+
+    # 2. Angular map — sequential single hue (magnitude).
+    maps = angular["maps"]
+    figure.add_trace(go.Heatmap(
+        x=ANGULAR_ANGLES_DEG, y=ANGULAR_WAVELENGTHS_NM, z=100 * maps["unpolarized"],
+        colorscale=[[0, "#fcfcfb"], [0.25, "#9ec5f4"], [0.5, "#3987e5"],
+                    [0.75, "#1c5cab"], [1, "#0d366b"]],
+        colorbar=dict(title="R %", len=0.33, y=0.5),
+        hovertemplate="AOI %{x:.0f}°<br>%{y:.0f} nm<br>R %{z:.2f}%<extra></extra>"),
+        row=2, col=1)
+
+    # 3. Angular profile, projector-weighted over wavelength.
+    spec_wavelengths_nm, spec_radiance = projector_spectrum()
+    spectrum_weights = np.interp(ANGULAR_WAVELENGTHS_NM, spec_wavelengths_nm, spec_radiance)
+    for polarization in ("s", "p", "unpolarized"):
+        curve = 100 * (spectrum_weights @ maps[polarization]) / spectrum_weights.sum()
+        figure.add_trace(go.Scatter(
+            x=ANGULAR_ANGLES_DEG, y=curve, mode="lines", legendgroup="angular",
+            line=dict(color=SERIES_COLORS[polarization], width=2),
+            name=SERIES_NAMES[polarization],
+            hovertemplate="AOI %{x:.0f}°<br>%{y:.2f}%<extra>"
+                          + SERIES_NAMES[polarization] + "</extra>"),
+            row=3, col=1)
+        # Direct label at the line end (identity is never color-alone).
+        figure.add_annotation(x=float(ANGULAR_ANGLES_DEG[-1]), y=float(curve[-1]),
+                              text=SERIES_NAMES[polarization], showarrow=False,
+                              xanchor="left", font=dict(color="#52514e", size=11),
+                              row=3, col=1)
+    for row in (2, 3):
+        figure.add_vrect(x0=aoi_range[0], x1=aoi_range[1], row=row, col=1,
+                         fillcolor="rgba(42,120,214,0.12)", line_width=0,
+                         annotation_text="display" if row == 3 else None,
+                         annotation_position="top left")
+        for region in SUPPRESSION_REGIONS:
+            figure.add_vrect(x0=region["angles_deg"][0], x1=region["angles_deg"][1],
+                             row=row, col=1, fillcolor="rgba(82,81,78,0.08)",
+                             line=dict(color="#52514e", width=1, dash="dot"),
+                             annotation_text="suppress" if row == 3 else None,
+                             annotation_position="top left")
+
+    metrics = angular["metrics"]
+    angular_text = "<br>".join(
+        [f"display Rs {100 * metrics['display']['rs_weighted_range'][0]:.2f}–"
+         f"{100 * metrics['display']['rs_weighted_range'][1]:.2f}%, "
+         f"Rp max {100 * metrics['display']['rp_max']:.2f}%"]
+        + [f"{name}: worst {100 * values['worst_unpolarized']:.2f}%, "
+           f"mean {100 * values['mean_unpolarized']:.2f}%"
+           for name, values in metrics["regions"].items()])
     figure.add_annotation(
-        text=config_text.replace("\n", "<br>"),
-        xref="paper", yref="paper", x=0.01, y=0.99,
-        showarrow=False, align="left",
-        font=dict(family="monospace", size=11),
+        text=config_text.replace("\n", "<br>") + "<br>" + angular_text,
+        xref="paper", yref="paper", x=0.01, y=1.0, yanchor="bottom",
+        showarrow=False, align="left", font=dict(family="monospace", size=11),
         bgcolor="rgba(255,255,255,0.85)", bordercolor="#bbbbbb", borderwidth=1)
 
+    figure.update_xaxes(title_text="Wavelength (nm)", row=1, col=1)
+    # Free y-axis: the point of the HTML version is that the reader zooms
+    # instead of the author guessing a range.
+    figure.update_yaxes(title_text="Reflectance", tickformat=".3f", row=1, col=1)
+    figure.update_xaxes(title_text="AOI in glass (°)", range=[0, 85], row=2, col=1)
+    figure.update_yaxes(title_text="Wavelength (nm)", row=2, col=1)
+    figure.update_xaxes(title_text="AOI in glass (°)", range=[0, 93], row=3, col=1)
+    figure.update_yaxes(title_text="Reflectance (%)", rangemode="tozero", row=3, col=1)
+    figure.update_layout(
+        title=f"Perseus mirror coating — merit={result.merit:.3e}",
+        height=1350, margin=dict(t=170), hovermode="closest", template="plotly_white",
+        paper_bgcolor="#fcfcfb", plot_bgcolor="#fcfcfb", font=dict(color="#0b0b0b"))
     figure.write_html(str(path), include_plotlyjs="cdn")
 
 
@@ -555,8 +852,13 @@ def _validation_metrics(result) -> dict:
     }
 
 
-def validate_manufacturing_tolerance(result, *, seed: int) -> dict:
-    """Evaluate bounded thickness and Gaussian index manufacturing errors."""
+def validate_manufacturing_tolerance(result, *, seed: int, band_nm) -> dict:
+    """Evaluate bounded thickness and Gaussian index manufacturing errors.
+
+    Every sample is scored on the display (max |Rs − target|, Rp) and on each
+    suppression region (worst unpolarized R), so the yield reflects the
+    display spec and the percentiles show how robust the suppression is.
+    """
     if TOLERANCE_VALIDATION_SAMPLES <= 0 or (
         TOLERANCE_VALIDATION_SAMPLES & (TOLERANCE_VALIDATION_SAMPLES - 1)
     ):
@@ -596,22 +898,37 @@ def validate_manufacturing_tolerance(result, *, seed: int) -> dict:
     fixed_nk_data = _precompute_fixed_nk_data(stack)
     target = np.asarray(result.target_reflectance)[:, None]
 
+    suppression_grids = [
+        (jnp.asarray(np.linspace(*band_nm, SUPPRESSION_NUM_WAVELENGTHS)) * 1e-9,
+         jnp.deg2rad(jnp.linspace(*region["angles_deg"], region["num_angles"])))
+        for region in SUPPRESSION_REGIONS]
+
     def evaluate_one(thicknesses, indices):
         reflectance, _ = compute_rt_polarized(
             stack, wavelengths, angles, thicknesses, indices, fixed_nk_data)
-        return reflectance
+        suppression_worst = []
+        for region_wavelengths, region_angles in suppression_grids:
+            region_reflectance, _ = compute_rt_polarized(
+                stack, region_wavelengths, region_angles, thicknesses, indices,
+                fixed_nk_data)
+            suppression_worst.append(jnp.max(
+                0.5 * (region_reflectance[..., 0] + region_reflectance[..., 1])))
+        return reflectance, jnp.stack(suppression_worst)
 
     evaluate_batch = jax.jit(jax.vmap(evaluate_one))
     sample_rmse = []
     sample_max_error = []
     sample_p_max = []
+    sample_suppression_worst = []
     for start in range(0, TOLERANCE_VALIDATION_SAMPLES,
                        TOLERANCE_VALIDATION_BATCH_SIZE):
         stop = min(start + TOLERANCE_VALIDATION_BATCH_SIZE,
                    TOLERANCE_VALIDATION_SAMPLES)
-        reflectance = np.asarray(evaluate_batch(
+        reflectance, suppression_worst = evaluate_batch(
             jnp.asarray(thickness_samples[start:stop]),
-            jnp.asarray(index_samples[start:stop])))
+            jnp.asarray(index_samples[start:stop]))
+        reflectance = np.asarray(reflectance)
+        sample_suppression_worst.append(np.asarray(suppression_worst))
         s_error = reflectance[..., 0] - target[None, :, :]
         sample_rmse.append(np.sqrt(np.mean(np.square(s_error), axis=(1, 2))))
         sample_max_error.append(np.max(np.abs(s_error), axis=(1, 2)))
@@ -620,6 +937,7 @@ def validate_manufacturing_tolerance(result, *, seed: int) -> dict:
     sample_rmse = np.concatenate(sample_rmse)
     sample_max_error = np.concatenate(sample_max_error)
     sample_p_max = np.concatenate(sample_p_max)
+    sample_suppression_worst = np.concatenate(sample_suppression_worst)
     percentiles = [50, 90, 95, 99, 100]
 
     return {
@@ -645,6 +963,12 @@ def validate_manufacturing_tolerance(result, *, seed: int) -> dict:
         },
         "rp_max_percentiles": {
             str(p): float(np.percentile(sample_p_max, p)) for p in percentiles
+        },
+        "suppression_worst_unpolarized_percentiles": {
+            region["name"]: {
+                str(p): float(np.percentile(sample_suppression_worst[:, region_idx], p))
+                for p in percentiles}
+            for region_idx, region in enumerate(SUPPRESSION_REGIONS)
         },
     }
 
@@ -705,6 +1029,17 @@ def _result_to_dict(result) -> dict:
         },
         "validation": _validation_metrics(result),
         "tolerance_validation": result.tolerance_validation,
+        "stages": result.stages,
+        "regions": [region.to_dict() for region in result.regions],
+        "angular": {
+            "metrics": result.angular["metrics"],
+            **({"maps": {
+                "wavelengths_nm": ANGULAR_WAVELENGTHS_NM.tolist(),
+                "angles_deg": ANGULAR_ANGLES_DEG.tolist(),
+                **{f"R_{polarization}": values.tolist()
+                   for polarization, values in result.angular["maps"].items()},
+            }} if SAVE_ANGULAR_MAPS else {}),
+        },
     }
 
 
@@ -739,7 +1074,9 @@ def main():
         REFERENCE_WAVELENGTH_NM, low_index, glass_index, aoi_design)
 
     band = (float(mirrors[0][1].min()), float(mirrors[0][1].max()))
-    weights = projector_weights(np.linspace(*band, NUM_WAVELENGTHS))
+    bands, _ = emission_bands(band)
+    sampling = display_sampling(band)
+    num_display_wavelengths = len(sampling.get("wavelength_points", ())) or NUM_WAVELENGTHS
 
     print("── Perseus mirror stack → Atlas coatings ──")
     print(f"source report : {report_dir}  (pupil-optimizer mode: {curve_mode})")
@@ -757,8 +1094,20 @@ def main():
           f"{HIGH_INDEX_MATERIAL.name}/{LOW_INDEX_MATERIAL.name}, "
           f"thin H={seed_thickness_high:.0f}nm, "
           f"L=QWOT@{aoi_design:.0f}° {seed_thickness_low:.0f}nm")
-    print(f"budget/mirror : basin_hopping {BH_MAX_ITERATIONS}×{BH_LOCAL_MAXITER}, "
-          f"lbfgs polish {POLISH_MAX_ITERATIONS}\n")
+    print(f"display λ     : {DISPLAY_WAVELENGTHS} — "
+          + (", ".join(f"{start:.0f}–{end:.0f} nm" for start, end in bands)
+             if DISPLAY_WAVELENGTHS == "led_bands" else f"{band[0]:.0f}–{band[1]:.0f} nm")
+          + f" ({num_display_wavelengths} samples, projector-weighted); Rp ≤ 0 "
+            f"(weight {DISPLAY_RP_WEIGHT:g})")
+    print("suppression   : " + ", ".join(
+        f"{region['angles_deg'][0]:.0f}–{region['angles_deg'][1]:.0f}°"
+        for region in SUPPRESSION_REGIONS)
+          + f", unpolarized, {band[0]:.0f}–{band[1]:.0f} nm, weight {SUPPRESSION_WEIGHT:g} "
+            f"(ramp {', '.join(f'{w:g}' for w in SUPPRESSION_WEIGHT_RAMP)})")
+    print(f"budget/mirror : basin_hopping {BH_MAX_ITERATIONS}×{BH_LOCAL_MAXITER} display-only"
+          f"{' (robust)' if ROBUST_BASIN_HOPPING else ' (nominal)'}, "
+          f"{len(SUPPRESSION_WEIGHT_RAMP) + 1}×{RAMP_HOPS} ramp hops, "
+          f"robust lbfgs polish {POLISH_MAX_ITERATIONS}\n")
 
     out_dir = Path(example_output_dir(__file__, root=OUTPUT_ROOT))
 
@@ -773,23 +1122,34 @@ def main():
             for wl, r in _sample_curve_for_print(wavelengths_nm, reflectance)))
         result = design_mirror(
             mirror_index, wavelengths_nm, reflectance, (aoi_min, aoi_max),
-            weights, glass, seed_thickness_high, seed_thickness_low)
+            band, sampling, glass, seed_thickness_high, seed_thickness_low)
+        result.angular = angular_report(result, (aoi_min, aoi_max), bands)
+        display_only, final_stage = result.stages[0], result.stages[-1]
+        print(f"    best score: {result.merit:.4e} ({result.selected_stage}; "
+              f"display-only basin best {display_only['merit']:.4e}, "
+              f"final-weight basin best {final_stage['merit']:.4e}, "
+              f"robust polish {result.polish_merit:.4e})", flush=True)
         validation = _validation_metrics(result)
         print(f"    → merit {result.merit:.4e}, {len(result.film_layers)} films, "
               f"Rs RMSE={validation['s_target_rmse']:.4e}, "
               f"worst={validation['s_target_max_abs_error']:.4e}, "
               f"Rp mean/max={validation['p_mean_reflectance']:.4f}/"
               f"{validation['p_max_reflectance']:.4f}")
+        _print_angular_summary(result.angular["metrics"])
         print(f"    tolerance validation: {TOLERANCE_VALIDATION_SAMPLES} samples")
         result.tolerance_validation = validate_manufacturing_tolerance(
-            result, seed=TOLERANCE_RANDOM_SEED + mirror_index)
+            result, seed=TOLERANCE_RANDOM_SEED + mirror_index, band_nm=band)
         print(f"    → tolerance yield="
               f"{result.tolerance_validation['yield_fraction']:.1%} "
-              f"at max |Rs-target| ≤ {TOLERANCE_MAX_RS_ERROR:.3f}")
+              f"at max |Rs-target| ≤ {TOLERANCE_MAX_RS_ERROR:.3f}; suppression worst R "
+              f"median / 95th percentile: "
+              + ", ".join(f"{name} {100 * values['50']:.2f}% / {100 * values['95']:.2f}%"
+                          for name, values in result.tolerance_validation[
+                              "suppression_worst_unpolarized_percentiles"].items()))
 
         if SAVE_PER_MIRROR_PLOTS:
             save_mirror_plot_html(
-                result,
+                result, result.angular, (aoi_min, aoi_max),
                 out_dir / f"coating_mirror_{mirror_index}.html",
                 config_text=(f"Perseus mirror #{mirror_index}/{num_mirrors}\n"
                              f"AOI {aoi_min:.1f}–{aoi_max:.1f}°  merit {result.merit:.3e}"))
@@ -833,9 +1193,30 @@ def main():
         },
         "design_params": {
             "polarization": POLARIZATION,
-            "num_wavelengths": NUM_WAVELENGTHS,
+            "display_wavelengths": DISPLAY_WAVELENGTHS,
+            "display_wavelength_bands_nm": bands,
+            "num_wavelengths": num_display_wavelengths,
             "num_angles": NUM_ANGLES,
             "fit_weights": "0.2 + 0.8·radiance/peak (projector-spectrum weighted)",
+            "angular_suppression": {
+                "display_rp": {"goal": "at_most 0", "weight": DISPLAY_RP_WEIGHT},
+                "regions": [dict(name=region["name"], angles_deg=list(region["angles_deg"]),
+                                 num_angles=region["num_angles"], polarization="both",
+                                 wavelengths_nm=list(band),
+                                 num_wavelengths=SUPPRESSION_NUM_WAVELENGTHS,
+                                 goal="at_most 0", aggregate=SUPPRESSION_AGGREGATE)
+                            for region in SUPPRESSION_REGIONS],
+                "weight": SUPPRESSION_WEIGHT,
+                "weight_ramp": list(SUPPRESSION_WEIGHT_RAMP),
+                "ramp_hops": RAMP_HOPS,
+                "robust_basin_hopping": ROBUST_BASIN_HOPPING,
+                "angular_report_grid": {
+                    "wavelengths_nm": [float(ANGULAR_WAVELENGTHS_NM[0]),
+                                       float(ANGULAR_WAVELENGTHS_NM[-1]),
+                                       len(ANGULAR_WAVELENGTHS_NM)],
+                    "angles_deg": [float(ANGULAR_ANGLES_DEG[0]),
+                                   float(ANGULAR_ANGLES_DEG[-1]), len(ANGULAR_ANGLES_DEG)]},
+            },
             "materials": {
                 "medium_substrate": glass.name,
                 "high_index": HIGH_INDEX_MATERIAL.name,
@@ -875,15 +1256,26 @@ def main():
     }
 
     design_path = out_dir / "coating_design.json"
-    design_path.write_text(json.dumps(design, indent=2))
+    design_path.write_text(json.dumps(design, indent=2, default=float))
 
     print(f"\n── Done ({elapsed:.0f}s) ──")
-    print(f"{'mirror':>6}  {'films':>5}  {'merit':>11}  target R")
+    region_names = [region["name"] for region in SUPPRESSION_REGIONS]
+    print(f"{'mirror':>6}  {'films':>5}  {'merit':>11}  {'target R':>12}  "
+          f"{'display Rs':>13}  {'Rp max':>6}  "
+          + "  ".join(f"{name + ' worst':>21}" for name in region_names)
+          + f"  {'yield':>6}")
     for record in mirror_records:
         target_values = record["target_reflectance"]["values"]
+        metrics = record["result"]["angular"]["metrics"]
+        rs_low, rs_high = metrics["display"]["rs_weighted_range"]
         print(f"{record['index']:>6}  {record['result']['num_films']:>5}  "
               f"{record['result']['merit']:>11.3e}  "
-              f"{min(target_values):.3f}..{max(target_values):.3f}")
+              f"{min(target_values):.3f}..{max(target_values):.3f}  "
+              f"{100 * rs_low:5.2f}–{100 * rs_high:5.2f}%  "
+              f"{100 * metrics['display']['rp_max']:5.2f}%  "
+              + "  ".join(f"{100 * metrics['regions'][name]['worst_unpolarized']:20.2f}%"
+                          for name in region_names)
+              + f"  {record['result']['tolerance_validation']['yield_fraction']:6.1%}")
     print(f"\nSaved consolidated design: {design_path}")
     if SAVE_PER_MIRROR_PLOTS:
         print(f"Per-mirror plots:          {out_dir}/coating_mirror_*.html")

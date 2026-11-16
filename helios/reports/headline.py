@@ -7,14 +7,18 @@ that goes at the top of the Summary page.
 
 All averages over wavelength are uniform (mean over the trace grid)
 unless noted — so users can read them as "spectrum-flat" quantities and
-apply their own weighting if needed. The eyebox efficiency is
-radiometric (energy-fraction reaching the eyebox), since ``response``
-already has the projector spectrum baked in.
+apply their own weighting if needed. The eyebox efficiency is reported
+twice: radiometric (energy fraction reaching the eyebox, since ``response``
+already has the projector spectrum baked in) and photometric (the same ratio
+weighted by the eye's V(λ) over the traced band) — the photometric one is the
+scale the pupil optimizer's ``EYEBOX_TARGET`` is set on.
 """
 
 from __future__ import annotations
 
 import numpy as np
+
+from helios.photometry import luminance_weights_np
 
 
 def _projector_spectrum_on(grid_nm: np.ndarray, manifest: dict) -> np.ndarray | None:
@@ -106,8 +110,17 @@ def compute_headline_numbers(
             100.0 * min_cell_radiance / per_direction_input)
         numbers["max_cell_brightness_pct"] = (
             100.0 * max_cell_radiance / per_direction_input)
+        # Photometric: weight both sides by V(λ)·K_m·Δλ (the constant cancels),
+        # matching the optimizer's photometric in-band input-flux normalization.
+        photometric_weights = luminance_weights_np(np.asarray(wavelengths_nm))
+        photometric_input = (num_directions * num_rays
+                             * float(np.sum(spectrum_on_trace * photometric_weights)))
+        photometric_eyebox = float(np.sum(response * photometric_weights))
+        numbers["eyebox_efficiency_photometric_pct"] = (
+            100.0 * photometric_eyebox / photometric_input)
     else:
         numbers["eyebox_efficiency_pct"] = None
+        numbers["eyebox_efficiency_photometric_pct"] = None
         numbers["mean_cell_brightness_pct"] = None
         numbers["min_cell_brightness_pct"] = None
         numbers["max_cell_brightness_pct"] = None
@@ -151,6 +164,7 @@ def _fmt_frac(x: float | None) -> str:
 def headline_numbers_html(numbers: dict) -> str:
     """Render the headline numbers dict as an HTML block."""
     eyebox = _fmt_pct(numbers.get("eyebox_efficiency_pct"))
+    eyebox_photometric = _fmt_pct(numbers.get("eyebox_efficiency_photometric_pct"))
     mean_b = _fmt_pct(numbers.get("mean_cell_brightness_pct"))
     min_b = _fmt_pct(numbers.get("min_cell_brightness_pct"))
     max_b = _fmt_pct(numbers.get("max_cell_brightness_pct"))
@@ -177,6 +191,8 @@ def headline_numbers_html(numbers: dict) -> str:
         "<div class='headline'>"
         "<h3 style='margin-top:0;'>Headline numbers</h3>"
         "<table class='headline-table'>"
+        "<tr><th>Eyebox efficiency (photometric, in-band — optimizer target scale)</th>"
+        f"<td>{eyebox_photometric}</td></tr>"
         "<tr><th>Eyebox efficiency (radiometric)</th>"
         f"<td>{eyebox}</td></tr>"
         "<tr><th>Mean cell brightness (per-direction flux)</th>"
