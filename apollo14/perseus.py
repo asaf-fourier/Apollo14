@@ -60,7 +60,7 @@ STRAIGHT_DOWN = jnp.array([0.0, -1.0, 0.0])  # untilted projector direction
 
 PERSEUS_BASE_LIGHT_POSITION = jnp.array([7.0 * mm, 31.0 * mm, 0.6 * mm])
 PERSEUS_PROJECTOR_TILT = 13.422 * deg        # CCW about world-x from straight down
-PERSEUS_BEAM_WIDTH = 10.0 * mm
+PERSEUS_BEAM_WIDTH = 12.0 * mm
 PERSEUS_BEAM_HEIGHT = 2.0 * mm
 
 # Emitted beam axis (CCW ⇒ negative angle into the right-handed rotation).
@@ -77,7 +77,7 @@ PERSEUS_PRISM_ANGLE = 10.578 * deg           # top-side wedge (chassis z-skew)
 PERSEUS_MIRROR_NORMAL_ANGLE = (90.0 - 50.289) * deg
 # The combiner is manufactured from 0.75 mm wafers cut at the mirror angle.
 # Projecting the wafer-normal pitch onto world y gives the mirror-center gap.
-PERSEUS_WAFER_THICKNESS = .75 * mm
+PERSEUS_WAFER_THICKNESS = 1 * mm
 PERSEUS_WAFER_ANGLE = 39.7 * deg
 PERSEUS_MIRROR_Y_SPACING = (
     PERSEUS_WAFER_THICKNESS / math.sin(float(PERSEUS_WAFER_ANGLE)))
@@ -86,8 +86,8 @@ PERSEUS_MIRROR_STACK_SPAN = (
 PERSEUS_CHASSIS_Z = 3.0 * mm                 # full chassis depth (z) — "COMBINER_DEPTH"
 PERSEUS_MIRROR_Z_EXTENT = 1.2 * mm           # mirror core, centered in the depth
 PERSEUS_COMBINER_CENTER = jnp.array([7.0 * mm, 24.0 * mm, 1.6 * mm])
-PERSEUS_COMBINER_WIDTH = 14.0 * mm           # chassis x
-PERSEUS_COMBINER_HEIGHT = 12.0 * mm          # chassis y (holds the stack)
+PERSEUS_COMBINER_WIDTH = 16.0 * mm           # chassis x
+PERSEUS_COMBINER_HEIGHT = 16.0 * mm          # chassis y (holds the stack)
 # Extra index-matched glass ahead of the mirror region, toward the projector.
 # The mirror stack and the downstream chassis face stay fixed; only the entry
 # side of the chassis is extended.
