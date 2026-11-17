@@ -141,7 +141,7 @@ TOLERANCE_RANDOM_SEED = 42
 # Local L-BFGS-B runs need 40–127 iterations (median ~50, 2026-11-16 probe);
 # 400 is never reached. A run cut off before converging makes scipy reject
 # the hop and discard its design, so never set this near that range.
-BH_MAX_ITERATIONS = 60
+BH_MAX_ITERATIONS = 120
 BH_LOCAL_MAXITER = 400
 # Hop size in normalized [0, 1] thickness space. 0.2 explores widely, which
 # suits the display-only search (best 4.2e-5 vs 7.2e-5 at 0.05); once the
