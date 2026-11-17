@@ -7,9 +7,10 @@ rather than the flat/Talos cascade:
 
 - **Tilted mirror stack** inside a 3.0 mm chassis, with the Perseus rigid-body
   tilts baked into the builder (pantoscopic tilt about the combiner center,
-  projector leaning ``PERSEUS_PROJECTOR_TILT`` ≈ 13.4° into it). The library
-  geometry matches ``examples/visualize_perseus.py`` exactly. Mirror spacing
-  follows the 0.75 mm wafer pitch projected at the 39.7° cut angle.
+  projector leaning ``PERSEUS_PROJECTOR_TILT`` ≈ 13.4° into it). Every system
+  is built by :func:`build_system`, which ``examples/visualize_perseus.py`` also
+  uses, so the visualization shows exactly this system. Mirror spacing follows
+  the ``PERSEUS_WAFER_THICKNESS`` wafer pitch projected at the 39.7° cut angle.
 - **Reflectance model** — ``CURVE_MODE`` selects ``"rgb"`` (per-mirror 5-band
   :class:`~apollo14.spectral.SumOfGaussiansCurve`, two phases, white-balanced)
   or ``"flat"`` (one wavelength-uniform
@@ -83,7 +84,7 @@ enable_jax_compilation_cache()
 # ── Perseus geometry (fixed; the builder holds the tilts/chassis) ───────────
 # num_mirrors, chassis depth and mirror spacing come from the Perseus library
 # constants, so this driver optimizes exactly the system build_perseus_system
-# builds — which now matches examples/visualize_perseus.py element-for-element.
+# builds (see build_system, shared with examples/visualize_perseus.py).
 # Spacing follows the manufactured wafer pitch and is frozen (not optimized).
 NUM_MIRRORS = PERSEUS_NUM_MIRRORS          # ← tune the mirror count here
 CHASSIS_Z = PERSEUS_CHASSIS_Z              # 3.0 mm full combiner depth
@@ -154,6 +155,20 @@ if _w_lo < float(_spec_wls[0]) or _w_hi > float(_spec_wls[-1]):
     raise ValueError(
         "Target wavelength interval must lie inside the measured panel spectrum")
 TRACE_WAVELENGTHS = jnp.linspace(_w_lo, _w_hi, SPECTRAL_SAMPLES)
+
+
+def build_system(params: CombinerParams, probe_wavelengths=None):
+    """The optimized Perseus system for ``params`` — the single place it is built.
+
+    Every system this script traces or saves comes from here, and
+    ``examples/visualize_perseus.py`` imports it, so the visualization always
+    shows exactly the system being optimized. ``probe_wavelengths`` is the grid
+    each mirror's curve is sampled on (default: the optimization grid).
+    """
+    return build_parametrized_perseus(
+        params, glass_material=COMBINER_MATERIAL, chassis_z=CHASSIS_Z,
+        probe_wavelengths=(TRACE_WAVELENGTHS if probe_wavelengths is None
+                           else probe_wavelengths))
 
 # ── Spectrum-preserving shape target ───────────────────────────────────────
 # Match the response to the projector's own (peak-normalized) emission shape —
@@ -255,10 +270,7 @@ VALIDATION_SHAPE_TARGET = _W_AT_VALIDATION / _W_AT_VALIDATION.sum()
 KERNEL_SIZE_CELLS = 3
 PADDING_CELLS = KERNEL_SIZE_CELLS // 2
 
-_ref_system = build_parametrized_perseus(
-    CombinerParams.initial(num_mirrors=NUM_MIRRORS),
-    glass_material=COMBINER_MATERIAL,
-    probe_wavelengths=TRACE_WAVELENGTHS, chassis_z=CHASSIS_Z)
+_ref_system = build_system(CombinerParams.initial(num_mirrors=NUM_MIRRORS))
 _pupil = next(e for e in _ref_system.elements if isinstance(e, RectangularPupil))
 
 # Cell-centered convention: NX × NY equal cells exactly tile the half-extent box.
@@ -328,10 +340,7 @@ def _compute_spectral_response_for(
     report both expect. Spacings are frozen, so bounded hard nearest-neighbor
     binning is used: hits beyond the padded sample grid contribute zero.
     """
-    system = build_parametrized_perseus(
-        params, probe_wavelengths=wavelengths,
-        glass_material=COMBINER_MATERIAL,
-        chassis_z=CHASSIS_Z)
+    system = build_system(params, probe_wavelengths=wavelengths)
     branch_routes = build_combiner_branch_routes(
         system, num_mirrors=NUM_MIRRORS,
     )
@@ -704,10 +713,7 @@ def main():
           f"max={float(relative_brightness.max()):.5f}  "
           f"std={float(relative_brightness.std()):.5f}")
 
-    final_system = build_parametrized_perseus(
-        params, probe_wavelengths=VALIDATION_WAVELENGTHS,
-        glass_material=COMBINER_MATERIAL,
-        chassis_z=CHASSIS_Z)
+    final_system = build_system(params, probe_wavelengths=VALIDATION_WAVELENGTHS)
 
     if is_flat:
         optimizer_config = {

@@ -2,13 +2,13 @@
 
 Perseus is a tilted, cascaded partial-mirror combiner. This module is the
 **single source of truth** for its geometry: the constants below and
-:func:`build_perseus_geometry` reproduce exactly the layout dialed in by
-``examples/visualize_perseus.py`` (projector tilt + placement, pantoscopic
-tilt about the combiner center, mirror core, tuned beam-defining aperture,
-and the eye-relief-centered pupil). Both the baked-reflectance reference
-:func:`build_perseus_system` and the differentiable
-:func:`helios.perseus_params.build_parametrized_perseus` build on it, so the
-optimizer and the visualization can never drift. ``apollo14`` never imports
+:func:`build_perseus_geometry` define the layout (projector tilt + placement,
+pantoscopic tilt about the combiner center, mirror core, tuned beam-defining
+aperture, and the eye-relief-centered pupil). Both the baked-reflectance
+reference :func:`build_perseus_system` and the differentiable
+:func:`helios.perseus_params.build_parametrized_perseus` build on it.
+``examples/visualize_perseus.py`` draws the system through the optimizer's own
+``build_system``, so the optimizer and the visualization can never drift. ``apollo14`` never imports
 ``helios``.
 
 Conventions (rotations are **counter-clockwise about world-x** ``[1,0,0]``;
@@ -58,7 +58,6 @@ STRAIGHT_DOWN = jnp.array([0.0, -1.0, 0.0])  # untilted projector direction
 
 # ── Projector ───────────────────────────────────────────────────────────────
 
-PERSEUS_BASE_LIGHT_POSITION = jnp.array([7.0 * mm, 31.0 * mm, 0.6 * mm])
 PERSEUS_PROJECTOR_TILT = 13.422 * deg        # CCW about world-x from straight down
 PERSEUS_BEAM_WIDTH = 12.0 * mm
 PERSEUS_BEAM_HEIGHT = 2.0 * mm
@@ -75,7 +74,8 @@ PERSEUS_PRISM_ANGLE = 10.578 * deg           # top-side wedge (chassis z-skew)
 # Mirror plane normal sits this far off the (untilted) combiner normal +z; the
 # equivalent mirror tilt from horizontal is 90° − this = 50.289°.
 PERSEUS_MIRROR_NORMAL_ANGLE = (90.0 - 50.289) * deg
-# The combiner is manufactured from 0.75 mm wafers cut at the mirror angle.
+# The combiner is manufactured from PERSEUS_WAFER_THICKNESS wafers cut at the
+# mirror angle.
 # Projecting the wafer-normal pitch onto world y gives the mirror-center gap.
 PERSEUS_WAFER_THICKNESS = 1 * mm
 PERSEUS_WAFER_ANGLE = 39.7 * deg
@@ -87,11 +87,47 @@ PERSEUS_CHASSIS_Z = 3.0 * mm                 # full chassis depth (z) — "COMBI
 PERSEUS_MIRROR_Z_EXTENT = 1.2 * mm           # mirror core, centered in the depth
 PERSEUS_COMBINER_CENTER = jnp.array([7.0 * mm, 24.0 * mm, 1.6 * mm])
 PERSEUS_COMBINER_WIDTH = 16.0 * mm           # chassis x
-PERSEUS_COMBINER_HEIGHT = 16.0 * mm          # chassis y (holds the stack)
 # Extra index-matched glass ahead of the mirror region, toward the projector.
 # The mirror stack and the downstream chassis face stay fixed; only the entry
 # side of the chassis is extended.
 PERSEUS_PROJECTOR_GLASS_LENGTH = 5.0 * mm
+# Perpendicular distance from the chassis top (entry) face — the prism-wedged
+# face the projector light enters through, including the extra entry glass —
+# to the nearest point of the first (top) mirror, i.e. its upper edge.
+PERSEUS_TOP_TO_FIRST_MIRROR = 5.0 * mm
+# Combiner (mirror-region) height, derived so the top face sits exactly
+# PERSEUS_TOP_TO_FIRST_MIRROR from the first mirror. In the untilted frame the
+# top face has outward normal (0, cos p, sin p) (p = prism angle) and passes
+# through y = cy + H/2 + L_glass at the rear edge z = cz − Z/2; the first
+# mirror is centred at y = cy + span/2 and its upper edge lies a further
+# (h_mirror/2)·|cos(p + a)| toward that face (a = mirror normal angle). Hence
+#   D = cos p·(H/2 + L_glass − span/2) − sin p·Z/2 − (h_mirror/2)·|cos(p + a)|
+# solved for H. The pantoscopic tilt rotates chassis and mirrors together, so it
+# does not change D. (tests/test_geometry.py checks D on the built geometry.)
+_PRISM_COS = math.cos(float(PERSEUS_PRISM_ANGLE))
+_PRISM_SIN = math.sin(float(PERSEUS_PRISM_ANGLE))
+_MIRROR_HALF_HEIGHT = (float(PERSEUS_MIRROR_Z_EXTENT)
+                       / (2.0 * math.sin(float(PERSEUS_MIRROR_NORMAL_ANGLE))))
+_MIRROR_EDGE_REACH = _MIRROR_HALF_HEIGHT * abs(
+    math.cos(float(PERSEUS_PRISM_ANGLE) + float(PERSEUS_MIRROR_NORMAL_ANGLE)))
+PERSEUS_COMBINER_HEIGHT = float(               # chassis y (holds the stack)
+    2.0 * ((PERSEUS_TOP_TO_FIRST_MIRROR
+            + _PRISM_SIN * PERSEUS_CHASSIS_Z / 2.0
+            + _MIRROR_EDGE_REACH) / _PRISM_COS
+           - PERSEUS_PROJECTOR_GLASS_LENGTH)
+    + PERSEUS_MIRROR_STACK_SPAN)
+# The projector (and its aperture) were laid out at y = 31 mm — 1 mm of air
+# above the top face — for a 12 mm-tall combiner. The combiner is centred on
+# PERSEUS_COMBINER_CENTER and tilted with it, so a taller combiner raises its
+# top face by half the extra height along the tilted axis; move the projector
+# by the same vector so it keeps exactly that air clearance. (A fixed y left
+# the projector 0.66 mm inside the glass when the height went 12 → 16 mm.)
+_PROJECTOR_LAYOUT_COMBINER_HEIGHT = 12.0 * mm
+_PROJECTOR_LAYOUT_POSITION = jnp.array([7.0 * mm, 31.0 * mm, 0.6 * mm])
+PERSEUS_BASE_LIGHT_POSITION = _PROJECTOR_LAYOUT_POSITION + rotate_vectors(
+    jnp.array([0.0, (PERSEUS_COMBINER_HEIGHT - _PROJECTOR_LAYOUT_COMBINER_HEIGHT) / 2.0, 0.0]),
+    X_AXIS, -PERSEUS_PANTOSCOPIC_TILT,
+)
 # The projector and its attached aperture move with the extended entry side,
 # retaining exactly the same air clearance they had before the chassis resize.
 PERSEUS_PROJECTOR_SIDE_EXTENSION = rotate_vectors(
@@ -108,7 +144,9 @@ PERSEUS_BASE_RATIO = 0.05 * 6 / PERSEUS_NUM_MIRRORS   # per-mirror pick-off
 # ── Beam-defining aperture (opaque frame with a clear opening) ──────────────
 # Oriented parallel to the combiner prism (entry) face; its opening is sized to
 # pass every mirror-hitting ray and recentred along its height axis so a tight
-# 2 mm opening sits over the densest band (see examples/visualize_perseus.py).
+# opening sits over the densest band of mirror-hitting rays. Re-checked
+# 2026-11-17 for the 12 mm beam: widening the opening from 12 to 14 mm changes
+# the eye-plane throughput by < 0.01% (cell-centred rays sit inside the edges).
 
 PERSEUS_APERTURE_OFFSET = 0.2 * mm           # downstream of the projector along the beam
 PERSEUS_APERTURE_DROP_Y = 0.6 * mm           # extra drop, straight down the y axis

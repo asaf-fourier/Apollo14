@@ -1,48 +1,37 @@
-"""Perseus visualization — full system, ray-traced.
+"""Perseus visualization — the exact system ``optimize_pupil_perseus.py`` optimizes.
 
-Perseus is a new combiner layout built up incrementally. The scene holds
-the **projector** (housing box), the beam-defining **aperture** (opaque
-frame with a clear opening), the **combiner** (a glass chassis with a
-cascade of tilted partial mirrors), and the **target pupil** (the eyebox
-detector plane where the eye samples the image).
+The scene is built by the optimizer's own :func:`build_system` (which wraps
+:func:`helios.perseus_params.build_parametrized_perseus` with the optimizer's
+glass, chassis depth and wavelength grid), and the beam comes from the
+optimizer's own ``PROJECTOR`` — so geometry, glass, AR coating, aperture,
+mirrors, pupil, beam size and ray-placement mode are always identical to what
+is being optimized. Nothing about the system is configured here; change
+``apollo14/perseus.py`` or ``optimize_pupil_perseus.py`` and this follows.
 
-The projector beam is **ray-traced** through the system: the main
-transmitted path (aperture → chassis back → mirror cascade → chassis
-front) plus one reflected branch per mirror (reflect → out the eye-side
-face → onto the pupil). Traced rays are drawn in place of the beam.
+Mirror reflectances (``REFLECTANCE_SOURCE``):
 
-The projector also **scans its emission direction across the field of
-view** — ``FOV_AROUND_X`` about the world-x axis and
-``FOV_AROUND_PROJECTOR_Y`` about the beam's other axis — and every scan
-angle is traced, so the figure carries a slider to step through them.
+- ``"latest_report"`` (default) — the final design of the newest
+  ``optimize_pupil_perseus`` run, used only if that run's saved system matches
+  the current geometry element by element (mirror placement and size, chassis
+  glass); otherwise it falls back to the optimizer's starting design and says
+  why;
+- ``"initial"`` — the optimizer's warm-start (Talos cascade-compensated) design.
 
-Everything tunable lives in the PARAMS block at the top of this file.
-
-Rotations are **counter-clockwise about the world-x axis** (``+`` swings
-toward +z, the eye side; ``0`` is straight down / untilted, matching the
-flat / Talos system):
-
-- the projector leans ``PROJECTOR_TILT`` from straight down;
-- the aperture is oriented parallel to the combiner's prism (top / entry)
-  face, sitting ``APERTURE_OFFSET`` downstream of the projector plus
-  ``APERTURE_DROP_Y`` lower in y;
-- the combiner has a ``COMBINER_PANTOSCOPIC_TILT`` — its normal (the
-  eye-facing +z slab face, untilted) leans that far CCW, and the whole
-  chassis + mirror stack rotate with it.
-
-The mirror normals sit ``MIRROR_TO_COMBINER_NORMAL_ANGLE`` off the
-combiner normal; a top-side ``COMBINER_PRISM_ANGLE`` wedge is baked in as
-a chassis z-skew. The chassis is ``COMBINER_DEPTH`` thick, but the mirror
-core spans only the central ``MIRROR_Z_EXTENT`` — the outer glass is
-index-matched cover, so the whole thing is one block (no internal
-interface to refract). Each element's normal is drawn as a short line.
+The beam is ray-traced along the optimizer's routes — the main transmitted
+path plus one reflected branch per mirror onto the pupil — and the projector
+scans the optimizer's FOV, with a slider to step through scan angles. Only the
+*drawing* density is chosen here (``DRAW_RAYS_*``, ``SCAN_STEPS_*``): the
+drawn beam is the optimizer's projector with fewer rays, so it has the same
+position, direction, cross-section and sampling mode.
 
 Run::
 
     python examples/visualize_perseus.py
 """
 
-import math
+import dataclasses
+import json
+import sys
 from pathlib import Path
 
 import jax
@@ -50,302 +39,163 @@ import jax.numpy as jnp
 import numpy as np
 import plotly.graph_objects as go
 
+sys.path.insert(0, str(Path(__file__).parent))
+import optimize_pupil_perseus as optimizer  # the system's single source
+
 from apollo14.elements.aperture import RectangularAperture
 from apollo14.elements.glass_block import GlassBlock
 from apollo14.elements.partial_mirror import PartialMirror
 from apollo14.elements.pupil import RectangularPupil
-from apollo14.geometry import compute_local_axes, normalize, rotate_points, rotate_vectors
-from apollo14.materials import agc_m074, air
-from apollo14.perseus import (
-    PERSEUS_LIGHT_POSITION,
-    PERSEUS_MIRROR_STACK_SPAN,
-    PERSEUS_NUM_MIRRORS,
-    PERSEUS_PROJECTOR_GLASS_LENGTH,
-)
-from apollo14.projector import FovGrid, PlayNitrideLed
+from apollo14.projector import FovGrid
 from apollo14.route import combiner_main_path
-from apollo14.system import OpticalSystem
+from apollo14.spectral import ConstantCurve, SumOfGaussiansCurve
 from apollo14.trace import prepare_route, trace_rays
 from apollo14.units import deg, mm, nm
 from apollo14.visualizer import eyebox_overlay_traces, plot_system
+from helios.combiner_params import CombinerParams
 from helios.merit import build_combiner_branch_routes
 
-# One JIT compile per distinct route structure (main + one per mirror branch),
-# reused across every scan direction.
+# One JIT compile per distinct route structure, reused across scan directions.
 _trace_rays_jit = jax.jit(trace_rays)
 
-# ── PARAMS ───────────────────────────────────────────────────────────────────
-# Projector placement & orientation
-PROJECTOR_POSITION = PERSEUS_LIGHT_POSITION
-PROJECTOR_TILT = 13.422 * deg    # CCW tilt about world-x from straight down
-
-# Emitted beam
-BEAM_WIDTH = 10.0 * mm           # beam cross-section, local x
-BEAM_HEIGHT = 2.0 * mm           # beam cross-section, local y
-BEAM_RAYS_X = 9                  # ray-grid columns (drawing density)
-BEAM_RAYS_Y = 10                 # ray-grid rows (samples the beam-height / z depth)
-
-# FOV scan — the projector sweeps its emission direction across the field of
-# view, and the figure gets a slider to step through the scan angles.
-# FOV_AROUND_X tilts the beam about the world-x axis; FOV_AROUND_PROJECTOR_Y
-# tilts it about the projector's other axis (perpendicular to both the beam and
-# world-x). Each value is the *full* angular range — the scan spans ±half.
-FOV_AROUND_X = 10.0 * deg              # scan range about the world-x axis
-FOV_AROUND_PROJECTOR_Y = 12.0 * deg    # scan range about the beam's other axis
-SCAN_STEPS_X = 5                       # slider steps across FOV_AROUND_X
-SCAN_STEPS_Y = 5                       # slider steps across FOV_AROUND_PROJECTOR_Y
-
-# Aperture (beam-defining stop) — opaque frame with a clear opening.
-# Its normal follows the combiner's prism face (see COMBINER_PRISM_ANGLE).
-# Its job is to trim stray light that would otherwise total-internal-reflect off
-# the combiner's side walls, WITHOUT clipping any ray that reaches the mirrors.
-# The opening spans the mirror-hitting rays' crossings on this plane over the
-# full FOV scan: width covers their 10.24 mm spread (centred on x=7). The height
-# is a tight 2.0 mm — narrower than the 2.17 mm mirror-hitting span — so the
-# opening is recentred APERTURE_HEIGHT_SHIFT along its height axis to sit over
-# the densest band, passing the most mirror-hitting rays (scanned-sweep peak).
-# Recompute if the projector, mirror angle, tilts, or FOV change.
-INCLUDE_APERTURE = True
-APERTURE_OFFSET = 0.2 * mm        # downstream of the projector along the beam
-APERTURE_DROP_Y = 0.6 * mm        # extra drop, straight down the y axis
-APERTURE_HEIGHT_SHIFT = 0.15 * mm  # recentre along the opening's height axis (max throughput)
-APERTURE_OUTER_WIDTH = 14.0 * mm
-APERTURE_OUTER_HEIGHT = 6.0 * mm
-APERTURE_INNER_WIDTH = 11.0 * mm   # clear opening — width passes every mirror-hitting ray
-APERTURE_INNER_HEIGHT = 2.0 * mm   # tight height; center shifted to pass the most rays
-
-# Combiner (glass chassis + cascade of tilted partial mirrors)
-COMBINER_PANTOSCOPIC_TILT = 7.0 * deg          # CCW about world-x (normal tilt)
-COMBINER_NUM_MIRRORS = PERSEUS_NUM_MIRRORS      # the single count knob (in the library)
-COMBINER_PRISM_ANGLE = 10.578 * deg            # top-side wedge (chassis z-skew)
-MIRROR_TO_COMBINER_NORMAL_ANGLE = (90 - 50.289) * deg  # mirror normal vs combiner normal
-# Per-mirror gap derived from the shared manufactured-wafer stack span.
-MIRROR_Y_SPACING = PERSEUS_MIRROR_STACK_SPAN / (COMBINER_NUM_MIRRORS - 1)
-COMBINER_DEPTH = 3.0 * mm                      # full chassis thickness (z)
-MIRROR_Z_EXTENT = 1.2 * mm                     # mirror core, centered in the depth
-COMBINER_MATERIAL = agc_m074                   # glass; env outside is air
-# The mirror core (MIRROR_Z_EXTENT) sits at the center of the COMBINER_DEPTH
-# block, so the outer (COMBINER_DEPTH - MIRROR_Z_EXTENT)/2 = 0.9 mm on each side
-# is index-matched cover glass — modeled as part of the one block (no interface).
-# Placement / chassis extent — NOT given in the spec, sensible defaults:
-COMBINER_CENTER = jnp.array([7.0 * mm, 24.0 * mm, 1.6 * mm])
-COMBINER_WIDTH = 14.0 * mm                     # chassis x
-COMBINER_HEIGHT = 12.0 * mm                    # chassis y (holds the stack)
-PROJECTOR_GLASS_LENGTH = PERSEUS_PROJECTOR_GLASS_LENGTH
-
-# Target pupil (eyebox detector) — the plane where the eye samples the image.
-# z is the EYE_RELIEF measured from the combiner's (untilted) eye-side edge:
-#   pupil_z = combiner_center_z + depth/2 + eye_relief = 1.6 + 1.5 + 16 = 19.1 mm.
-# x/y centres the reflected light over the FULL FOV scan: across all scan angles
-# the eye-relief-plane crossings fill x -0.63..14.63, y 14.67..27.59 mm, whose
-# bounding-box centre (7.00, 21.13) frames the spread as symmetrically as the
-# pupil allows. Recompute by aggregating the scan's plane crossings if the
-# projector, mirror angle, tilts, or FOV range change.
-EYE_RELIEF = 16.0 * mm
-PUPIL_CENTER = jnp.array([
-    7.0 * mm,
-    21.13 * mm,
-    COMBINER_CENTER[2] + COMBINER_DEPTH / 2 + EYE_RELIEF,
-])
-PUPIL_NORMAL = jnp.array([0.0, 0.0, -1.0])     # faces back toward the combiner
-PUPIL_WIDTH = 14.0 * mm
-PUPIL_HEIGHT = 18.0 * mm
-EYEBOX_SIZE = 8.0 * mm           # target eyebox — square box drawn at the pupil center
-
-# Visualization
-NORMAL_DRAW_LENGTH = 2.0 * mm    # length of each normal line
+# ── Drawing choices only (the system itself comes from the optimizer) ───────
+REFLECTANCE_SOURCE = "latest_report"   # "latest_report" | "initial"
+DRAW_RAYS_X = 9                        # drawn rays across the beam width
+DRAW_RAYS_Y = 5                        # drawn rays across the beam height
+SCAN_STEPS_X = 5                       # slider steps across the optimizer's FOV
+SCAN_STEPS_Y = 5
+NORMAL_DRAW_LENGTH = 2.0 * mm          # length of each drawn normal
 REPORT_PATH = Path("examples/reports/visualize_perseus.html")
 
-# ── Derived ──────────────────────────────────────────────────────────────────
-WORLD_X = jnp.array([1.0, 0.0, 0.0])
-STRAIGHT_DOWN = jnp.array([0.0, -1.0, 0.0])
-# The tilts are CCW about world-x — the opposite sense of rotate_vectors'
-# right-handed rotation (whose positive angle swings toward -z), so apply the
-# negative angle. The results lean toward +z (the eye side).
-PROJECTOR_DIRECTION = normalize(rotate_vectors(STRAIGHT_DOWN, WORLD_X, -PROJECTOR_TILT))
-# The aperture is oriented parallel to the combiner's prism (top / entry) face,
-# with its normal pointing downstream (-y, into the combiner): the prism face's
-# inward normal [0, -cos(prism), -sin(prism)] before the combiner's pantoscopic
-# tilt, so apply the same tilt to it.
-APERTURE_NORMAL = normalize(rotate_vectors(
-    jnp.array([0.0, -math.cos(float(COMBINER_PRISM_ANGLE)),
-               -math.sin(float(COMBINER_PRISM_ANGLE))]),
-    WORLD_X, -COMBINER_PANTOSCOPIC_TILT))
-# The aperture sits APERTURE_OFFSET downstream of the projector along the beam,
-# dropped APERTURE_DROP_Y lower in y, then recentred APERTURE_HEIGHT_SHIFT along
-# its opening's height axis (local-y, from the aperture normal) so the tight
-# 2 mm opening sits over the densest band of mirror-hitting rays.
-APERTURE_HEIGHT_AXIS = compute_local_axes(APERTURE_NORMAL)[1]
-APERTURE_POSITION = (PROJECTOR_POSITION
-                     + APERTURE_OFFSET * PROJECTOR_DIRECTION
-                     - jnp.array([0.0, APERTURE_DROP_Y, 0.0])
-                     + APERTURE_HEIGHT_SHIFT * APERTURE_HEIGHT_AXIS)
 
-# Combiner normal: the eye-facing +z slab face, leaned CCW by the pantoscopic
-# tilt. The mirror normals sit MIRROR_TO_COMBINER_NORMAL_ANGLE off this.
-COMBINER_NORMAL_UNTILTED = jnp.array([0.0, 0.0, 1.0])
-COMBINER_NORMAL = normalize(
-    rotate_vectors(COMBINER_NORMAL_UNTILTED, WORLD_X, -COMBINER_PANTOSCOPIC_TILT))
+# ── Which design to show ─────────────────────────────────────────────────────
+
+def _params_from_report(report: dict) -> CombinerParams:
+    """Rebuild the optimizer's final ``CombinerParams`` from a saved report."""
+    final = report["final_params"]
+    curve = final["curve"]
+    amplitude = jnp.asarray(curve["amplitude"], dtype=jnp.float32)
+    if curve["type"] == "ConstantCurve":
+        curves = ConstantCurve(amplitude=amplitude)
+    elif curve["type"] == "SumOfGaussiansCurve":
+        curves = SumOfGaussiansCurve(
+            amplitude=amplitude,
+            sigma=jnp.asarray(curve["sigma_nm"]) * nm,
+            centers=jnp.asarray(curve["centers_nm"]) * nm)
+    else:
+        raise ValueError(f"unsupported curve type {curve['type']!r}")
+    return CombinerParams(spacings=jnp.asarray(final["spacings"]) * mm, curves=curves)
 
 
-def build_projector() -> PlayNitrideLed:
-    """The Perseus projector, from the PARAMS above."""
-    return PlayNitrideLed.create_broadband(
-        position=PROJECTOR_POSITION, direction=PROJECTOR_DIRECTION,
-        beam_width=BEAM_WIDTH, beam_height=BEAM_HEIGHT,
-        nx=BEAM_RAYS_X, ny=BEAM_RAYS_Y,
-    )
+def _geometry_mismatches(saved_system: dict, current_system) -> list[str]:
+    """Differences between a report's saved system and the current geometry."""
+    saved_mirrors = [element for element in saved_system["elements"]
+                     if element["type"] == "PartialMirror"]
+    current_mirrors = [element for element in current_system.elements
+                       if isinstance(element, PartialMirror)]
+    if len(saved_mirrors) != len(current_mirrors):
+        return [f"{len(saved_mirrors)} mirrors saved vs {len(current_mirrors)} now"]
+    problems = []
+    for saved, current in zip(saved_mirrors, current_mirrors, strict=True):
+        for field in ("position", "normal"):
+            if not np.allclose(saved[field], np.asarray(getattr(current, field)), atol=1e-3):
+                problems.append(f"{saved['name']} {field} differs")
+        for field in ("width", "height"):
+            if not np.isclose(saved[field], float(getattr(current, field)), atol=1e-3):
+                problems.append(f"{saved['name']} {field} {saved[field]:.3f} vs "
+                                f"{float(getattr(current, field)):.3f}")
+    saved_glass = [element.get("material") for element in saved_system["elements"]
+                   if element["type"] == "GlassBlock"]
+    current_glass = [element.material.name for element in current_system.elements
+                     if isinstance(element, GlassBlock)]
+    if [name.lower() for name in saved_glass] != [name.lower() for name in current_glass]:
+        problems.append(f"chassis glass {saved_glass} vs {current_glass}")
+    return problems
 
+
+def design_to_show() -> tuple[CombinerParams, str]:
+    """(params, description) per ``REFLECTANCE_SOURCE``, verified against geometry."""
+    initial = optimizer._build_initial_params()
+    if REFLECTANCE_SOURCE == "initial":
+        return initial, "optimizer warm start (REFLECTANCE_SOURCE='initial')"
+    reports = sorted(optimizer.RUNS_ROOT.glob("*/optimization_report.json"))
+    if not reports:
+        return initial, "optimizer warm start (no optimize_pupil_perseus report yet)"
+    report = json.loads(reports[-1].read_text())
+    run_name = reports[-1].parent.name
+    if report["optimizer"].get("curve_mode") != optimizer.CURVE_MODE:
+        return initial, (f"optimizer warm start (report {run_name} is "
+                         f"{report['optimizer'].get('curve_mode')!r}, optimizer is "
+                         f"{optimizer.CURVE_MODE!r})")
+    params = _params_from_report(report)
+    problems = _geometry_mismatches(report["system"], optimizer.build_system(params))
+    if problems:
+        return initial, (f"optimizer warm start (report {run_name} was optimized on a "
+                         f"different geometry: {'; '.join(problems[:3])}"
+                         f"{' …' if len(problems) > 3 else ''})")
+    return params, f"final design of optimizer run {run_name}"
+
+
+# ── Tracing ──────────────────────────────────────────────────────────────────
 
 def build_routes(system, wavelength) -> list:
-    """Build and wavelength-resolve the traced optical paths.
-
-    The main transmitted path (aperture → chassis back → the mirror cascade
-    → chassis front) plus one reflected branch per mirror (reflect off
-    mirror i → out the eye-side face → onto the pupil). The route structure
-    is fixed across scan angles, so it is built once and reused for every
-    direction.
-    """
+    """The optimizer's routes: main transmitted path + one branch per mirror."""
     main_route = prepare_route(combiner_main_path(system), wavelength)
-    branch_routes = [
-        prepare_route(route, wavelength)
-        for route in build_combiner_branch_routes(
-            system, num_mirrors=COMBINER_NUM_MIRRORS, chassis_name="combiner",
-            include_aperture=INCLUDE_APERTURE)
-    ]
+    branch_routes = [prepare_route(route, wavelength)
+                     for route in build_combiner_branch_routes(
+                         system, num_mirrors=optimizer.NUM_MIRRORS)]
     return [main_route, *branch_routes]
 
 
 def trace_scan(routes, projector, wavelength, fov_grid) -> list:
-    """Trace every route at every scan direction, in angle-major order.
-
-    Returns a flat list of ``TraceResult`` laid out as all routes for scan
-    angle 0, then all routes for angle 1, … — the grouping that
-    ``plot_system``'s per-angle slider expects (paired with
-    ``fov_grid.angles_grid``).
-    """
+    """All routes at every scan direction, angle-major (``plot_system`` order)."""
     results = []
     for direction in fov_grid.flat_directions:
-        beam = projector.generate_rays(direction=direction,
-                                       wavelength=wavelength)
+        beam = projector.generate_rays(direction=direction, wavelength=wavelength)
         for route in routes:
             results.append(_trace_rays_jit(route, beam))
     return results
 
 
-def build_aperture() -> RectangularAperture:
-    """The beam-defining aperture, from the PARAMS above."""
-    return RectangularAperture(
-        name="aperture", position=APERTURE_POSITION, normal=APERTURE_NORMAL,
-        width=APERTURE_OUTER_WIDTH, height=APERTURE_OUTER_HEIGHT,
-        inner_width=APERTURE_INNER_WIDTH, inner_height=APERTURE_INNER_HEIGHT,
-    )
+# ── Drawing helpers ──────────────────────────────────────────────────────────
+
+def _unit(vector) -> np.ndarray:
+    vector = np.asarray(vector, dtype=float)
+    return vector / np.linalg.norm(vector)
 
 
-def build_combiner() -> tuple[GlassBlock, list[PartialMirror]]:
-    """The combiner chassis + cascaded partial mirrors, from the PARAMS.
-
-    Built in the untilted frame (combiner normal = +z), then the whole
-    assembly is rotated CCW by ``COMBINER_PANTOSCOPIC_TILT`` about world-x
-    through the combiner center. Returns ``(chassis, mirrors)``.
-    """
-    # Mirror plane orientation: its normal sits the given angle off the
-    # combiner normal (+z, untilted). Mirrors span the full chassis width in
-    # x and only the MIRROR_Z_EXTENT core in z (height = extent / sin(angle)).
-    angle = float(MIRROR_TO_COMBINER_NORMAL_ANGLE)
-    mirror_normal = jnp.array([0.0, math.sin(angle), math.cos(angle)])
-    mirror_width = float(COMBINER_WIDTH)
-    mirror_height = float(MIRROR_Z_EXTENT / math.sin(angle))
-
-    # Keep the mirror-holding region centered at COMBINER_CENTER and extend
-    # only the projector-facing (+y) side with the shared Perseus input glass.
-    z_skew = float(COMBINER_DEPTH * math.tan(float(COMBINER_PRISM_ANGLE)))
-    chassis_center = (COMBINER_CENTER
-                      + jnp.array([0.0, PROJECTOR_GLASS_LENGTH / 2.0, 0.0]))
-    chassis = GlassBlock.create_chassis(
-        name="combiner", x=float(COMBINER_WIDTH),
-        y=float(COMBINER_HEIGHT + PROJECTOR_GLASS_LENGTH),
-        z=float(COMBINER_DEPTH), material=COMBINER_MATERIAL, z_skew=z_skew,
-    ).translate(chassis_center)
-
-    # Mirror centers: equal MIRROR_Y_SPACING gaps in y, stack centered on the
-    # chassis; all share the chassis x/z center (they only step down in y).
-    stack_span = (COMBINER_NUM_MIRRORS - 1) * MIRROR_Y_SPACING
-    top_y = COMBINER_CENTER[1] + stack_span / 2
-    mirror_y = top_y - jnp.arange(COMBINER_NUM_MIRRORS) * MIRROR_Y_SPACING
-    mirror_positions = jnp.stack([
-        jnp.full((COMBINER_NUM_MIRRORS,), COMBINER_CENTER[0]),
-        mirror_y,
-        jnp.full((COMBINER_NUM_MIRRORS,), COMBINER_CENTER[2]),
-    ], axis=1)  # (M, 3)
-
-    # Apply the pantoscopic tilt (CCW about world-x) about the combiner center.
-    tilt = -COMBINER_PANTOSCOPIC_TILT
-    chassis = chassis.rotate(WORLD_X, tilt, COMBINER_CENTER)
-    mirror_positions = rotate_points(mirror_positions, WORLD_X, tilt, COMBINER_CENTER)
-    mirror_normal = normalize(rotate_vectors(mirror_normal, WORLD_X, tilt))
-
-    mirrors = [
-        PartialMirror(
-            name=f"mirror_{mirror_idx}",
-            position=mirror_positions[mirror_idx],
-            normal=mirror_normal.copy(),
-            width=mirror_width, height=mirror_height,
-        )
-        for mirror_idx in range(COMBINER_NUM_MIRRORS)
-    ]
-    return chassis, mirrors
-
-
-def build_pupil() -> RectangularPupil:
-    """The target pupil (eyebox detector), from the PARAMS above."""
-    return RectangularPupil(
-        name="pupil", position=PUPIL_CENTER, normal=PUPIL_NORMAL,
-        width=PUPIL_WIDTH, height=PUPIL_HEIGHT,
-    )
+def eye_face_normal(chassis: GlassBlock) -> np.ndarray:
+    """Outward normal of the chassis's eye-side slab face (the combiner normal)."""
+    center = np.mean([np.asarray(face.position) for face in chassis.faces], axis=0)
+    outward = []
+    for face in chassis.faces:
+        normal = _unit(face.normal)
+        if np.dot(np.asarray(face.position) - center, normal) < 0:
+            normal = -normal
+        outward.append(normal)
+    return max(outward, key=lambda normal: normal[2])
 
 
 def normal_trace(position, direction, name, color) -> go.Scatter3d:
-    """A short line along ``direction`` from ``position`` (an element normal).
-
-    Length is ``NORMAL_DRAW_LENGTH``.
-    """
+    """A short line along ``direction`` from ``position`` (an element normal)."""
     start = np.asarray(position)
-    end = start + NORMAL_DRAW_LENGTH * np.asarray(direction)
+    end = start + NORMAL_DRAW_LENGTH * _unit(direction)
     return go.Scatter3d(
-        x=[float(start[0]), float(end[0])],
-        y=[float(start[1]), float(end[1])],
-        z=[float(start[2]), float(end[2])],
-        mode="lines",
-        line=dict(color=color, width=6),
-        name=name, hoverinfo="name",
-    )
+        x=[float(start[0]), float(end[0])], y=[float(start[1]), float(end[1])],
+        z=[float(start[2]), float(end[2])], mode="lines",
+        line=dict(color=color, width=6), name=name, hoverinfo="name")
 
 
 def angle_arc_traces(apex, dir_a, dir_b, *, radius=1.3 * mm,
                      line_length=2.0 * mm, color="magenta",
                      num_points=48) -> list:
-    """Mark the angle between directions ``dir_a`` and ``dir_b`` at ``apex``.
-
-    Draws the two directions as radial lines from ``apex``, a great-circle arc
-    sweeping between them at ``radius``, and a text label at the bisector giving
-    the angle between the two directions in degrees. Returns a list of
-    ``go.Scatter3d`` traces ready for ``fig.add_traces``.
-    """
+    """Arc + label marking the angle between ``dir_a`` and ``dir_b`` at ``apex``."""
     apex = np.asarray(apex, dtype=float)
-    unit_a = np.asarray(dir_a, dtype=float)
-    unit_a = unit_a / np.linalg.norm(unit_a)
-    unit_b = np.asarray(dir_b, dtype=float)
-    unit_b = unit_b / np.linalg.norm(unit_b)
-
+    unit_a, unit_b = _unit(dir_a), _unit(dir_b)
     theta = float(np.arccos(np.clip(np.dot(unit_a, unit_b), -1.0, 1.0)))
-    sin_theta = np.sin(theta)
-
-    # Slerp from unit_a to unit_b for a true great-circle arc between them.
     fractions = np.linspace(0.0, 1.0, num_points)[:, None]
-    arc_dirs = (np.sin((1.0 - fractions) * theta) * unit_a
-                + np.sin(fractions * theta) * unit_b) / sin_theta
-    arc = apex[None, :] + radius * arc_dirs
+    arc = apex[None, :] + radius * (np.sin((1.0 - fractions) * theta) * unit_a
+                                    + np.sin(fractions * theta) * unit_b) / np.sin(theta)
 
     def _radial(direction, **line_kw):
         end = apex + line_length * direction
@@ -353,142 +203,105 @@ def angle_arc_traces(apex, dir_a, dir_b, *, radius=1.3 * mm,
             x=[apex[0], end[0]], y=[apex[1], end[1]], z=[apex[2], end[2]],
             mode="lines", line=line_kw, hoverinfo="skip", showlegend=False)
 
-    bisector = unit_a + unit_b
-    bisector = bisector / np.linalg.norm(bisector)
-    label_pos = apex + radius * 1.45 * bisector
-
+    label_pos = apex + radius * 1.45 * _unit(unit_a + unit_b)
     return [
         _radial(unit_a, color=color, width=3),
         _radial(unit_b, color=color, width=3, dash="dot"),
-        go.Scatter3d(
-            x=arc[:, 0], y=arc[:, 1], z=arc[:, 2], mode="lines",
-            line=dict(color=color, width=5),
-            name="mirror↔combiner normal angle", hoverinfo="name"),
-        go.Scatter3d(
-            x=[label_pos[0]], y=[label_pos[1]], z=[label_pos[2]],
-            mode="text", text=[f"{np.degrees(theta):.1f}°"],
-            textfont=dict(size=15, color=color),
-            hoverinfo="skip", showlegend=False),
+        go.Scatter3d(x=arc[:, 0], y=arc[:, 1], z=arc[:, 2], mode="lines",
+                     line=dict(color=color, width=5),
+                     name="mirror↔combiner normal angle", hoverinfo="name"),
+        go.Scatter3d(x=[label_pos[0]], y=[label_pos[1]], z=[label_pos[2]],
+                     mode="text", text=[f"{np.degrees(theta):.1f}°"],
+                     textfont=dict(size=15, color=color),
+                     hoverinfo="skip", showlegend=False),
     ]
 
 
+# ── Main ─────────────────────────────────────────────────────────────────────
+
 def main():
-    projector = build_projector()
+    params, design_description = design_to_show()
+    system = optimizer.build_system(params)
+    chassis = next(element for element in system.elements if isinstance(element, GlassBlock))
+    aperture = next((element for element in system.elements
+                     if isinstance(element, RectangularAperture)), None)
+    mirrors = [element for element in system.elements if isinstance(element, PartialMirror)]
+    pupil = next(element for element in system.elements if isinstance(element, RectangularPupil))
+    projector = dataclasses.replace(optimizer.PROJECTOR, nx=DRAW_RAYS_X, ny=DRAW_RAYS_Y)
+    combiner_normal = eye_face_normal(chassis)
 
-    print("── Perseus projector ──")
-    print(f"position : {np.round(np.asarray(PROJECTOR_POSITION) / mm, 2)} mm")
-    print(f"tilt     : {float(PROJECTOR_TILT) / deg:.3f} deg CCW (about world-x)")
-    print(f"normal   : {np.round(np.asarray(PROJECTOR_DIRECTION), 4)}")
-    print(f"beam     : {BEAM_WIDTH / mm:.1f} x {BEAM_HEIGHT / mm:.1f} mm, "
-          f"{BEAM_RAYS_X} x {BEAM_RAYS_Y} rays")
-    if INCLUDE_APERTURE:
-        print("── Perseus aperture ──")
-        print(f"position : {np.round(np.asarray(APERTURE_POSITION) / mm, 3)} mm")
-        print(f"normal   : {np.round(np.asarray(APERTURE_NORMAL), 4)}  "
-              f"(parallel to the combiner prism face)")
-        print(f"frame    : {APERTURE_OUTER_WIDTH / mm:.1f} x {APERTURE_OUTER_HEIGHT / mm:.1f} mm, "
-              f"opening {APERTURE_INNER_WIDTH / mm:.1f} x {APERTURE_INNER_HEIGHT / mm:.1f} mm")
-    else:
-        print("── Perseus aperture ── DISABLED (removed from the system)")
-
-    chassis, mirrors = build_combiner()
-    print("── Perseus combiner ──")
-    print(f"center   : {np.round(np.asarray(COMBINER_CENTER) / mm, 2)} mm")
-    print(f"pantoscopic tilt : {float(COMBINER_PANTOSCOPIC_TILT) / deg:.3f} deg CCW")
-    print(f"normal   : {np.round(np.asarray(COMBINER_NORMAL), 4)}")
-    print(f"mirrors  : {COMBINER_NUM_MIRRORS}, "
-          f"{MIRROR_Y_SPACING / mm:.2f} mm y-spacing, "
-          f"normal {float(MIRROR_TO_COMBINER_NORMAL_ANGLE) / deg:.3f} deg off combiner normal")
-    print(f"prism    : {float(COMBINER_PRISM_ANGLE) / deg:.3f} deg  "
-          f"depth {COMBINER_DEPTH / mm:.2f} mm (mirror core {MIRROR_Z_EXTENT / mm:.2f} mm, "
-          f"cover {(COMBINER_DEPTH - MIRROR_Z_EXTENT) / 2 / mm:.2f} mm/side)  "
-          f"material {COMBINER_MATERIAL.name}")
-    print(f"input glass: {PROJECTOR_GLASS_LENGTH / mm:.1f} mm added toward projector")
-    print(f"mirror normal: {np.round(np.asarray(mirrors[0].normal), 4)}  "
-          f"size {float(mirrors[0].width) / mm:.1f} x {float(mirrors[0].height) / mm:.2f} mm")
-
-    pupil = build_pupil()
-    print("── Perseus target pupil (eyebox detector) ──")
-    print(f"center   : {np.round(np.asarray(PUPIL_CENTER) / mm, 2)} mm")
-    print(f"normal   : {np.round(np.asarray(PUPIL_NORMAL), 4)}")
-    print(f"size     : {PUPIL_WIDTH / mm:.1f} x {PUPIL_HEIGHT / mm:.1f} mm")
-    print(f"eyebox   : {EYEBOX_SIZE / mm:.0f} x {EYEBOX_SIZE / mm:.0f} mm (target box at pupil center)")
-
-    # System holds the combiner + pupil (+ aperture when enabled); the projector
-    # draws its own box.
-    system = OpticalSystem(env_material=air)
-    if INCLUDE_APERTURE:
-        system.add(build_aperture())
-    system.add(chassis)
-    for mirror in mirrors:
-        system.add(mirror)
-    system.add(pupil)
-
-    # Ray-trace the beam through the combiner (main path + reflected branches)
-    # at every FOV scan direction. Flat mirrors → geometry is wavelength-
-    # independent; trace at the projector spectral peak (the glass adds only
-    # negligible dispersion).
     spec_wls, spec_rad = projector.spectrum
     trace_wavelength = float(spec_wls[int(jnp.argmax(spec_rad))])
 
+    print("── Perseus — the system optimize_pupil_perseus.py optimizes ──")
+    print(f"design     : {design_description}")
+    print(f"projector  : {np.round(np.asarray(projector.position) / mm, 3)} mm, "
+          f"direction {np.round(np.asarray(projector.direction), 4)}, beam "
+          f"{projector.beam_width / mm:.1f} x {projector.beam_height / mm:.1f} mm "
+          f"({'cell-centred' if projector.cell_centered else 'endpoint'} sampling; "
+          f"optimizer {optimizer.PROJECTOR.nx}×{optimizer.PROJECTOR.ny} rays, "
+          f"drawn {DRAW_RAYS_X}×{DRAW_RAYS_Y})")
+    if aperture is not None:
+        print(f"aperture   : {np.round(np.asarray(aperture.position) / mm, 3)} mm, frame "
+              f"{aperture.width / mm:.1f} x {aperture.height / mm:.1f} mm, opening "
+              f"{aperture.inner_width / mm:.1f} x {aperture.inner_height / mm:.1f} mm")
+    print(f"chassis    : {chassis.material.name}, AR "
+          f"{100 * float(np.mean(np.asarray(chassis.faces[0].coating_reflectance.values))):.2f}% "
+          f"per face, eye-face normal {np.round(combiner_normal, 4)}")
+    print(f"mirrors    : {len(mirrors)}, {float(mirrors[0].width) / mm:.1f} x "
+          f"{float(mirrors[0].height) / mm:.2f} mm, normal {np.round(np.asarray(mirrors[0].normal), 4)}")
+    print("reflectance: " + ", ".join(
+        f"{100 * float(np.mean(np.asarray(mirror.reflectance))):.2f}%" for mirror in mirrors))
+    print(f"pupil      : centre {np.round(np.asarray(pupil.position) / mm, 2)} mm, "
+          f"{pupil.width / mm:.1f} x {pupil.height / mm:.1f} mm; eyebox "
+          f"{2 * optimizer.EYEBOX_HALF_X / mm:.0f} x {2 * optimizer.EYEBOX_HALF_Y / mm:.0f} mm")
+
     routes = build_routes(system, trace_wavelength)
-    fov_grid = FovGrid(PROJECTOR_DIRECTION, FOV_AROUND_X, FOV_AROUND_PROJECTOR_Y,
+    fov_grid = FovGrid(optimizer.PROJECTOR_DIRECTION, optimizer.X_FOV, optimizer.Y_FOV,
                        num_x=SCAN_STEPS_X, num_y=SCAN_STEPS_Y)
     trace_results = trace_scan(routes, projector, trace_wavelength, fov_grid)
+    rays_per_beam = DRAW_RAYS_X * DRAW_RAYS_Y
+    branch_results = [result for index, result in enumerate(trace_results)
+                      if index % len(routes) != 0]
+    pupil_rays = sum(int(np.asarray(result.valids[:, -1]).sum()) for result in branch_results)
+    print(f"ray trace  : {trace_wavelength / nm:.0f} nm, {SCAN_STEPS_X} x {SCAN_STEPS_Y} angles "
+          f"over the optimizer FOV (±{optimizer.X_FOV / deg / 2:.1f}° × "
+          f"±{optimizer.Y_FOV / deg / 2:.1f}°); branch rays on the pupil "
+          f"{pupil_rays} / {len(fov_grid) * len(mirrors) * rays_per_beam}")
 
-    rays_per_beam = BEAM_RAYS_X * BEAM_RAYS_Y
-    branch_results = [tr for idx, tr in enumerate(trace_results)
-                      if idx % len(routes) != 0]     # per angle, drop the main path
-    pupil_rays = sum(int(np.asarray(tr.valids[:, -1]).sum())
-                     for tr in branch_results)       # branches end on the pupil
-    print("── Ray trace (FOV scan) ──")
-    print(f"wavelength : {trace_wavelength / nm:.0f} nm (projector peak)")
-    print(f"scan       : {SCAN_STEPS_X} x {SCAN_STEPS_Y} angles  "
-          f"(±{FOV_AROUND_X / deg / 2:.1f} deg about x, "
-          f"±{FOV_AROUND_PROJECTOR_Y / deg / 2:.1f} deg about the other axis)")
-    print(f"routes     : main + {COMBINER_NUM_MIRRORS} reflected branches "
-          f"per angle, {rays_per_beam} rays each")
-    print(f"branch rays reaching the pupil (all angles): {pupil_rays} / "
-          f"{len(fov_grid) * COMBINER_NUM_MIRRORS * rays_per_beam}")
+    figure = plot_system(system, trace_results=trace_results,
+                         scan_angles=np.asarray(fov_grid.angles_grid),
+                         projector=projector, show=False)
+    figure.add_trace(normal_trace(projector.position, projector.direction,
+                                  "projector normal", "red"))
+    if aperture is not None:
+        figure.add_trace(normal_trace(aperture.position, aperture.normal,
+                                      "aperture normal", "orange"))
+    stack_center = np.mean([np.asarray(mirror.position) for mirror in mirrors], axis=0)
+    figure.add_trace(normal_trace(stack_center, combiner_normal, "combiner normal", "lime"))
 
-    fig = plot_system(system, trace_results=trace_results,
-                      scan_angles=np.asarray(fov_grid.angles_grid),
-                      projector=projector, show=False)
-    fig.add_trace(normal_trace(
-        PROJECTOR_POSITION, PROJECTOR_DIRECTION, "projector normal", "red"))
-    if INCLUDE_APERTURE:
-        fig.add_trace(normal_trace(
-            APERTURE_POSITION, APERTURE_NORMAL, "aperture normal", "orange"))
-    fig.add_trace(normal_trace(
-        COMBINER_CENTER, COMBINER_NORMAL, "combiner normal", "lime"))
+    # Angle between the 4th mirror's normal and the combiner normal (all
+    # mirrors share it), drawn at the 4th mirror.
+    fourth_mirror = mirrors[min(3, len(mirrors) - 1)]
+    print(f"mirror normal vs combiner normal: "
+          f"{np.degrees(np.arccos(np.clip(abs(np.dot(_unit(fourth_mirror.normal), combiner_normal)), -1, 1))):.3f} deg")
+    figure.add_traces(angle_arc_traces(fourth_mirror.position, fourth_mirror.normal,
+                                       combiner_normal))
 
-    # Arc + label marking the angle between the 4th mirror's normal and the
-    # combiner normal (drawn at the 4th mirror; all mirrors share this angle).
-    fourth_mirror = mirrors[3]           # the 4th mirror (0-indexed mirror_3)
-    normal_angle_deg = float(np.degrees(np.arccos(np.clip(np.dot(
-        np.asarray(fourth_mirror.normal) / np.linalg.norm(fourth_mirror.normal),
-        np.asarray(COMBINER_NORMAL) / np.linalg.norm(COMBINER_NORMAL)),
-        -1.0, 1.0))))
-    print(f"4th-mirror normal vs combiner normal: {normal_angle_deg:.3f} deg")
-    fig.add_traces(angle_arc_traces(
-        fourth_mirror.position, fourth_mirror.normal, COMBINER_NORMAL))
-
-    # Target eyebox — an EYEBOX_SIZE square drawn on the pupil plane, centered
-    # on the pupil center, so you can see how the ray landing sits inside it.
     for overlay in eyebox_overlay_traces(
-            np.asarray(PUPIL_CENTER),
-            float(EYEBOX_SIZE) / 2, float(EYEBOX_SIZE) / 2,
-            np.asarray(PUPIL_NORMAL),
-            box_label=f"target eyebox ({EYEBOX_SIZE / mm:.0f}x{EYEBOX_SIZE / mm:.0f} mm)",
+            np.asarray(pupil.position),
+            float(optimizer.EYEBOX_HALF_X), float(optimizer.EYEBOX_HALF_Y),
+            np.asarray(pupil.normal),
+            box_label=(f"target eyebox ({2 * optimizer.EYEBOX_HALF_X / mm:.0f}x"
+                       f"{2 * optimizer.EYEBOX_HALF_Y / mm:.0f} mm)"),
             marker_label="pupil center"):
-        fig.add_trace(overlay)
+        figure.add_trace(overlay)
 
-    fig.update_layout(title="Perseus — ray trace")
-
+    figure.update_layout(title=f"Perseus — ray trace ({design_description})")
     REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    fig.write_html(str(REPORT_PATH))
+    figure.write_html(str(REPORT_PATH))
     print(f"\nSaved: {REPORT_PATH}")
-    fig.show()
+    figure.show()
 
 
 if __name__ == "__main__":

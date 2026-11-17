@@ -269,3 +269,36 @@ def test_chassis_coating_range_is_validated_outside_jit_but_is_jit_safe():
         return chassis.get_face("back").coating_reflectance.values
 
     assert jnp.allclose(build_and_read(0.005), 0.005)
+
+
+def test_perseus_top_face_is_the_specified_distance_from_the_first_mirror():
+    """PERSEUS_COMBINER_HEIGHT is derived so the chassis top (entry) face sits
+    exactly PERSEUS_TOP_TO_FIRST_MIRROR from the nearest point of mirror 0."""
+    import numpy as np
+    from atlas import Materials
+
+    from apollo14.geometry import compute_local_axes
+    from apollo14.perseus import (
+        PERSEUS_NUM_MIRRORS,
+        PERSEUS_TOP_TO_FIRST_MIRROR,
+        build_perseus_geometry,
+        spacings_for_count,
+    )
+
+    geometry = build_perseus_geometry(
+        spacings=spacings_for_count(PERSEUS_NUM_MIRRORS),
+        glass_material=Materials.schott.BASF2)
+    chassis_center = np.mean(
+        [np.asarray(face.position) for face in geometry.chassis.faces], axis=0)
+    top_face = geometry.chassis.get_face("back")
+    inward = -np.asarray(top_face.normal) / np.linalg.norm(top_face.normal)
+    if np.dot(np.asarray(top_face.position) - chassis_center, inward) > 0:
+        inward = -inward
+    local_x, local_y = (np.asarray(axis) for axis in compute_local_axes(geometry.mirror_normal))
+    first_mirror = np.asarray(geometry.mirror_positions[0])
+    corners = [first_mirror + sign_x * geometry.mirror_width / 2 * local_x
+               + sign_y * geometry.mirror_height / 2 * local_y
+               for sign_x in (-1, 1) for sign_y in (-1, 1)]
+    nearest = min(float(np.dot(corner - np.asarray(top_face.position), inward))
+                  for corner in corners)
+    assert np.isclose(nearest, PERSEUS_TOP_TO_FIRST_MIRROR, atol=1e-4)
