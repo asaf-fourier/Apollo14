@@ -23,7 +23,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "atlas", editable = "../Atlas" },
+    { name = "atlas", path = "../Atlas/dist/atlas-0.1.0-py3-none-any.whl" },
     { name = "jax", extras = ["cpu"] },
     { name = "jaxlib" },
     { name = "numpy" },
@@ -37,13 +37,16 @@ provides-extras = ["dev"]
 [[package]]
 name = "atlas"
 version = "0.1.0"
-source = { editable = "../Atlas" }
+source = { path = "../Atlas/dist/atlas-0.1.0-py3-none-any.whl" }
 dependencies = [
     { name = "jax" },
     { name = "jaxlib" },
     { name = "matplotlib" },
     { name = "scipy" },
     { name = "scipy-stubs" },
+]
+wheels = [
+    { filename = "atlas-0.1.0-py3-none-any.whl", hash = "sha256:59e5f6bf1ba7e7f21ed47e1d199c2bc9431c82c15c81ecf0a32dab0893ba18a9" },
 ]
 
 [package.metadata]
@@ -54,9 +57,6 @@ requires-dist = [
     { name = "scipy" },
     { name = "scipy-stubs", specifier = "~=1.17.1" },
 ]
-
-[package.metadata.requires-dev]
-dev = [{ name = "pytest" }]
 
 [[package]]
 name = "colorama"
