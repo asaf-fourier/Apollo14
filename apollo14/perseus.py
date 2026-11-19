@@ -84,7 +84,7 @@ PERSEUS_MIRROR_Y_SPACING = (
 PERSEUS_MIRROR_STACK_SPAN = (
     (PERSEUS_NUM_MIRRORS - 1) * PERSEUS_MIRROR_Y_SPACING)
 PERSEUS_CHASSIS_Z = 3.0 * mm                 # full chassis depth (z) — "COMBINER_DEPTH"
-PERSEUS_MIRROR_Z_EXTENT = 1.2 * mm           # mirror core, centered in the depth
+PERSEUS_MIRROR_Z_EXTENT = 1.5 * mm           # mirror core, centered in the depth
 PERSEUS_COMBINER_CENTER = jnp.array([7.0 * mm, 24.0 * mm, 1.6 * mm])
 PERSEUS_COMBINER_WIDTH = 16.0 * mm           # chassis x
 # Extra index-matched glass ahead of the mirror region, toward the projector.

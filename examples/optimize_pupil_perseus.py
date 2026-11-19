@@ -35,6 +35,7 @@ Run::
     python examples/optimize_pupil_perseus.py
 """
 
+import dataclasses
 import json
 from datetime import datetime
 from pathlib import Path
@@ -74,6 +75,7 @@ from helios.merit import build_combiner_branch_routes
 from helios.perseus_params import build_parametrized_perseus
 from helios.photometry import luminance_weights as photopic_luminance_weights
 from helios.pupil_merit import PupilMeritConfig, merit_breakdown, pupil_merit
+from helios.reports.eyebox_coverage import render_eyebox_coverage_report, trace_eyebox_hits
 from helios.reports.pupil_report import render_pupil_report
 
 # Persistent JIT cache survives across runs so successive optimizations
@@ -527,6 +529,43 @@ def _print_breakdown(label, bd):
 
 RUNS_ROOT = Path("examples/reports/optimize_pupil_perseus")
 
+# ── Eyebox beam-coverage report ─────────────────────────────────────────────
+# Where every ray of the final design lands on the pupil, per FOV angle, to spot
+# gaps between mirror footprints. Traced with a denser copy of PROJECTOR (same
+# beam, placement and sampling mode) so both ray spacings on the pupil stay
+# below a coverage cell; the report measures them and warns otherwise.
+COVERAGE_RAYS_X, COVERAGE_RAYS_Y = 41, 15
+COVERAGE_CELL_MM = 0.5
+COVERAGE_WAVELENGTH = 550.0 * nm
+
+
+def write_eyebox_coverage_report(run_dir: Path, params: CombinerParams) -> Path:
+    """Trace ``params``' system over FOV_GRID and write eyebox_coverage.html."""
+    system = build_system(params)
+    pupil = next(element for element in system.elements
+                 if isinstance(element, RectangularPupil))
+    projector = dataclasses.replace(PROJECTOR, nx=COVERAGE_RAYS_X, ny=COVERAGE_RAYS_Y)
+    hits = trace_eyebox_hits(
+        projector, FOV_GRID,
+        build_combiner_branch_routes(system, num_mirrors=NUM_MIRRORS),
+        pupil, COVERAGE_WAVELENGTH)
+    path = run_dir / "eyebox_coverage.html"
+    stats = render_eyebox_coverage_report(
+        path, hits, num_mirrors=NUM_MIRRORS,
+        eyebox_half_u_mm=float(EYEBOX_HALF_X / mm),
+        eyebox_half_v_mm=float(EYEBOX_HALF_Y / mm),
+        cell_size_mm=COVERAGE_CELL_MM,
+        description=(f"{NUM_MIRRORS} mirrors, {COVERAGE_RAYS_X}×{COVERAGE_RAYS_Y} rays per "
+                     f"FOV angle ({'cell-centred' if projector.cell_centered else 'endpoint'}), "
+                     f"{COVERAGE_WAVELENGTH / nm:.0f} nm, run {run_dir.name}."))
+    covered = stats["covered_fraction"]
+    column_step, row_step = stats["ray_steps_mm"]
+    print(f"Eyebox coverage ({COVERAGE_CELL_MM:g} mm cells, ray spacing "
+          f"{column_step:.3f} × {row_step:.3f} mm): worst {100 * covered.min():.1f}%, "
+          f"mean {100 * covered.mean():.1f}%, {int((covered < 1).sum())}/{len(covered)} "
+          f"FOV angles with gaps")
+    return path
+
 
 def _save_best_result(run_dir: Path, phase: str, step: int, loss: float,
                       params: CombinerParams) -> Path:
@@ -817,6 +856,8 @@ def main():
 
     pupil_report_path = render_pupil_report(run_dir)
     print(f"Saved pupil report: {pupil_report_path}")
+    coverage_report_path = write_eyebox_coverage_report(run_dir, params)
+    print(f"Saved eyebox coverage report: {coverage_report_path}")
 
 
 if __name__ == "__main__":
